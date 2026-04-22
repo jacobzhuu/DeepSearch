@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools==75.8.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepresearch"
+version = "0.1.0"
+description = "Phase 0 scaffold for the Deep Research orchestrator."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi==0.115.12",
+  "pydantic-settings==2.8.1",
+  "uvicorn[standard]==0.34.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black==25.1.0",
+  "httpx==0.28.1",
+  "mypy==1.15.0",
+  "pre-commit==4.2.0",
+  "pytest==8.3.5",
+  "ruff==0.11.8",
+]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["services*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+src = ["services", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["services"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["services/orchestrator/tests"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["services/orchestrator/app", "services/orchestrator/tests"]
+disallow_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+warn_redundant_casts = true
+warn_unused_ignores = true

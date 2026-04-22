@@ -18,7 +18,10 @@ repos:
     rev: v1.15.0
     hooks:
       - id: mypy
-        args: ["services/orchestrator/app", "services/orchestrator/tests"]
+        args: ["packages/db", "services/orchestrator/app", "services/orchestrator/tests", "tests/unit"]
         additional_dependencies:
+          - alembic==1.15.2
           - fastapi==0.115.12
           - pydantic-settings==2.8.1
+          - pytest==8.3.5
+          - sqlalchemy==2.0.40

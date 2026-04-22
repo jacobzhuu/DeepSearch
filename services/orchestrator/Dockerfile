@@ -10,6 +10,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./pyproject.toml
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
+COPY packages ./packages
 COPY services ./services
 
 RUN python -m pip install --upgrade pip==25.0.1 \

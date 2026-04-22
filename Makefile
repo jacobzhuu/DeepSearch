@@ -1,7 +1,8 @@
 PYTHON ?= python3
 APP_MODULE = services.orchestrator.app.main:app
+ALEMBIC = $(PYTHON) -m alembic -c alembic.ini
 
-.PHONY: install lint format test run precommit-install
+.PHONY: install lint format test run precommit-install db-upgrade db-downgrade
 
 install:
 	$(PYTHON) -m pip install --upgrade pip==25.0.1
@@ -10,7 +11,7 @@ install:
 lint:
 	$(PYTHON) -m ruff check .
 	$(PYTHON) -m black --check .
-	$(PYTHON) -m mypy services/orchestrator/app services/orchestrator/tests
+	$(PYTHON) -m mypy packages/db services/orchestrator/app services/orchestrator/tests tests/unit
 
 format:
 	$(PYTHON) -m ruff check --fix .
@@ -24,3 +25,9 @@ run:
 
 precommit-install:
 	$(PYTHON) -m pre_commit install
+
+db-upgrade:
+	$(ALEMBIC) upgrade head
+
+db-downgrade:
+	$(ALEMBIC) downgrade base

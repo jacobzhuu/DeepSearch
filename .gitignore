@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+data/*.db
 
 data/reports/*
 !data/reports/.gitkeep

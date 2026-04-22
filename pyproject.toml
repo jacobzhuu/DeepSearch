@@ -8,8 +8,11 @@ version = "0.1.0"
 description = "Phase 0 scaffold for the Deep Research orchestrator."
 requires-python = ">=3.11,<3.13"
 dependencies = [
+  "alembic==1.15.2",
   "fastapi==0.115.12",
   "pydantic-settings==2.8.1",
+  "psycopg[binary]==3.2.6",
+  "sqlalchemy==2.0.40",
   "uvicorn[standard]==0.34.2",
 ]
 
@@ -27,7 +30,7 @@ dev = [
 include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["services*"]
+include = ["packages*", "services*"]
 
 [tool.black]
 line-length = 100
@@ -35,22 +38,22 @@ target-version = ["py311"]
 
 [tool.ruff]
 line-length = 100
-src = ["services", "tests"]
+src = ["packages", "services", "tests"]
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "UP"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["services"]
+known-first-party = ["packages", "services"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
-testpaths = ["services/orchestrator/tests"]
+testpaths = ["services/orchestrator/tests", "tests/unit"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["services/orchestrator/app", "services/orchestrator/tests"]
+files = ["packages/db", "services/orchestrator/app", "services/orchestrator/tests", "tests/unit"]
 disallow_untyped_defs = true
 no_implicit_optional = true
 strict_equality = true

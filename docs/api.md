@@ -1,8 +1,8 @@
 # API
 
-## Phase 0 endpoints
+## Phase 1 endpoints
 
-Only system health endpoints are implemented in this phase.
+Only system health endpoints are implemented in this phase. Phase 1 adds the persistence layer behind the scenes, but it intentionally does not expose new research task APIs yet.
 
 ### `GET /healthz`
 
@@ -30,6 +30,6 @@ Response `200 OK`:
 }
 ```
 
-## Out of scope in Phase 0
+## Out of scope in Phase 1
 
-The research task API surface described in the product spec is intentionally not implemented yet.
+The research task API surface described in the product spec is still intentionally not implemented yet.

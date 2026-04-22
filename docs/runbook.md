@@ -35,7 +35,7 @@ python3 -m alembic -c alembic.ini downgrade base
 
 ## Database migration commands
 
-The repository defaults to a local SQLite database for Phase 1 validation:
+The repository defaults to a local SQLite database for Phase 2 validation:
 
 ```bash
 echo "$DATABASE_URL"
@@ -51,8 +51,39 @@ python3 -m alembic -c alembic.ini downgrade base
 For isolated validation without touching `data/dev.db`, use a temporary URL:
 
 ```bash
-DATABASE_URL=sqlite:////tmp/deepresearch_phase1.db python3 -m alembic -c alembic.ini upgrade head
-DATABASE_URL=sqlite:////tmp/deepresearch_phase1.db python3 -m alembic -c alembic.ini downgrade base
+DATABASE_URL=sqlite:////tmp/deepresearch_phase2.db python3 -m alembic -c alembic.ini upgrade head
+DATABASE_URL=sqlite:////tmp/deepresearch_phase2.db python3 -m alembic -c alembic.ini downgrade base
+```
+
+## Phase 2 API validation
+
+Start the service:
+
+```bash
+DATABASE_URL=sqlite:////tmp/deepresearch_phase2.db python3 -m alembic -c alembic.ini upgrade head
+DATABASE_URL=sqlite:////tmp/deepresearch_phase2.db python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 8000
+```
+
+Create a task:
+
+```bash
+curl -fsS \
+  -X POST http://127.0.0.1:8000/api/v1/research/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"近30天 NVIDIA 在开源模型生态上的关键发布与影响","constraints":{"language":"zh-CN"}}'
+```
+
+Pause, resume, revise, and cancel it:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/pause
+curl -fsS -X POST http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/resume
+curl -fsS -X POST http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/revise \
+  -H 'Content-Type: application/json' \
+  -d '{"constraints":{"max_rounds":2}}'
+curl -fsS -X POST http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/cancel
+curl -fsS http://127.0.0.1:8000/api/v1/research/tasks/<task_id>
+curl -fsS http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/events
 ```
 
 ## Health validation
@@ -77,8 +108,9 @@ cp .env.example .env
 docker compose -f docker-compose.dev.yml up --build
 ```
 
-The dev compose stack currently starts only the orchestrator service. Phase 0 deliberately excludes databases and other backing services.
-The dev compose stack currently starts only the orchestrator service. Phase 1 adds the persistence code and migrations, but backing database services are still intentionally deferred.
-## Phase 1 scope reminder
+The dev compose stack currently starts only the orchestrator service. Phase 2 adds task APIs on top of the persistence code, but backing database services are still intentionally deferred.
 
-The persistence layer exists, but no public research task API, worker behavior, search, fetch, parse, or reporting logic has been implemented yet.
+## Phase 2 scope reminder
+
+- task creation, lookup, event retrieval, pause, resume, cancel, and revise now exist
+- no worker behavior, search, fetch, parse, index, verification, or reporting logic has been implemented yet

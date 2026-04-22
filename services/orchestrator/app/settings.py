@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     app_host: str = Field(default="0.0.0.0", validation_alias="APP_HOST")
     app_port: int = Field(default=8000, validation_alias="APP_PORT")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+    database_url: str = Field(default="sqlite:///./data/dev.db", validation_alias="DATABASE_URL")
 
 
 @lru_cache

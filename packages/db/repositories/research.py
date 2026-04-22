@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -18,6 +20,39 @@ class ResearchTaskRepository(SQLAlchemyRepository[ResearchTask]):
             .order_by(ResearchTask.created_at.desc())
         )
         return list(self.session.scalars(statement))
+
+    def set_status(
+        self,
+        task: ResearchTask,
+        status: str,
+        *,
+        ended_at: datetime | None,
+    ) -> ResearchTask:
+        task.status = status
+        task.updated_at = datetime.now(UTC)
+        task.ended_at = ended_at
+        self.session.flush()
+        return task
+
+    def apply_revision(
+        self,
+        task: ResearchTask,
+        *,
+        query: str | None,
+        constraints_patch: dict[str, Any] | None,
+        status: str,
+    ) -> ResearchTask:
+        if query is not None:
+            task.query = query
+        if constraints_patch is not None:
+            merged_constraints = dict(task.constraints_json)
+            merged_constraints.update(constraints_patch)
+            task.constraints_json = merged_constraints
+        task.status = status
+        task.updated_at = datetime.now(UTC)
+        task.ended_at = None
+        self.session.flush()
+        return task
 
 
 class ResearchRunRepository(SQLAlchemyRepository[ResearchRun]):
@@ -41,6 +76,23 @@ class ResearchRunRepository(SQLAlchemyRepository[ResearchRun]):
 
 class TaskEventRepository(SQLAlchemyRepository[TaskEvent]):
     model = TaskEvent
+
+    def record(
+        self,
+        *,
+        task_id: UUID,
+        event_type: str,
+        payload_json: dict[str, Any],
+        run_id: UUID | None = None,
+    ) -> TaskEvent:
+        event = TaskEvent(
+            task_id=task_id,
+            run_id=run_id,
+            event_type=event_type,
+            payload_json=payload_json,
+            created_at=datetime.now(UTC),
+        )
+        return self.add(event)
 
     def list_for_task(self, task_id: UUID) -> list[TaskEvent]:
         statement = (

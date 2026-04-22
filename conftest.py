@@ -7,18 +7,18 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from packages.db.session import build_engine, build_session_factory
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parent
 
 
 @pytest.fixture()
 def database_url(tmp_path: Path) -> str:
-    return f"sqlite:///{tmp_path / 'phase1.db'}"
+    return f"sqlite:///{tmp_path / 'deepresearch.db'}"
 
 
 @pytest.fixture()
@@ -38,11 +38,16 @@ def upgraded_engine(alembic_config: Config, database_url: str) -> Generator[Engi
         yield engine
     finally:
         engine.dispose()
+        command.downgrade(alembic_config, "base")
 
 
 @pytest.fixture()
-def db_session(upgraded_engine: Engine) -> Generator[Session, None, None]:
-    session_factory = build_session_factory(upgraded_engine)
+def session_factory(upgraded_engine: Engine) -> sessionmaker[Session]:
+    return build_session_factory(upgraded_engine)
+
+
+@pytest.fixture()
+def db_session(session_factory: sessionmaker[Session]) -> Generator[Session, None, None]:
     with session_factory() as session:
         yield session
         session.rollback()

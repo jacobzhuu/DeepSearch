@@ -2,12 +2,12 @@
 
 ## Current phase
 
-This repository is in Phase 1. The minimal orchestrator service scaffold from Phase 0 remains in place, and the initial persistence layer now exists through Alembic migrations, SQLAlchemy models, and thin repositories. No task workflow, queue, search, crawling, parsing, indexing, verification, or reporting runtime logic exists yet.
+This repository is in Phase 2. The service now exposes a thin research task API backed by the Phase 1 persistence layer. Task creation, lookup, event retrieval, and pause, resume, cancel, and revise transitions exist as database-only state changes. No worker, queue, search, crawling, parsing, indexing, verification, or reporting runtime logic exists yet.
 
 ## Layer boundaries
 
 - UI / gateway layer: not implemented yet
-- orchestrator / workflow layer: `services/orchestrator/app/` contains only the FastAPI service shell and system endpoints
+- orchestrator / workflow layer: `services/orchestrator/app/` now contains the thin research task API, request and response schemas, database dependencies, and the task service layer
 - persistence / ledger layer: `migrations/` and `packages/db/` hold the schema, ORM, session helpers, and repositories
 - acquisition / parsing / indexing layer: placeholder directories only, with ledger tables ready for later phases
 - reporting / delivery layer: placeholder directories only
@@ -15,6 +15,7 @@ This repository is in Phase 1. The minimal orchestrator service scaffold from Ph
 ## Repository shape
 
 - `services/orchestrator/`: runnable FastAPI service skeleton for future research task APIs
+- `services/orchestrator/app/services/`: thin task state transition logic for Phase 2
 - `packages/db/`: SQLAlchemy models, session helpers, and repository skeletons for the research ledger
 - `migrations/`: Alembic environment and the initial reversible schema migration
 - `services/crawler/`, `services/reporter/`, `services/openclaw/`: directory placeholders only
@@ -22,10 +23,12 @@ This repository is in Phase 1. The minimal orchestrator service scaffold from Ph
 - `infra/`: reserved for infrastructure configuration introduced incrementally
 - `docs/phases/phase-0.md`: current phase scope and deliverables
 - `docs/phases/phase-1.md`: current schema-phase scope and deliverables
+- `docs/phases/phase-2.md`: task API and event-stream scope and deliverables
 
-## Phase 1 design constraints
+## Phase 2 design constraints
 
-- keep the product centered on `research_task`, but do not implement task APIs or workflow execution yet
-- keep migration, ORM, and repository definitions aligned
-- keep repository code persistence-focused and free of scheduling, search, or claim-generation behavior
+- keep the product centered on `research_task`, but do not start background execution yet
+- keep the task API limited to creation, lookup, event retrieval, and database-only pause, resume, cancel, and revise transitions
+- keep migration, ORM, repository, and service behavior aligned
+- keep repository and service code free of scheduling, search, fetch, and claim-generation behavior
 - keep health and readiness endpoints free of external dependency checks until backing services are introduced

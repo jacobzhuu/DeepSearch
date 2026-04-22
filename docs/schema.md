@@ -1,8 +1,7 @@
 # Schema
 
 ## Phase 1 status
-
-Phase 1 introduces the first reversible research ledger schema through Alembic and SQLAlchemy 2.x. The current implementation covers the following entities:
+Phase 2 uses the Phase 1 reversible research ledger schema through Alembic and SQLAlchemy 2.x. The current implementation covers the following entities:
 
 - `research_task`
 - `research_run`
@@ -55,8 +54,24 @@ Phase 1 introduces the first reversible research ledger schema through Alembic a
   - `report_artifact(task_id, version, format)`
 - supporting indexes exist on common lookup paths such as task status, event ordering, fetch scheduling, source ranking, and claim/report retrieval
 
-## Deferred beyond Phase 1
+## Phase 2 task-event usage
+
+- Phase 2 uses the `research_task` status subset `PLANNED`, `PAUSED`, and `CANCELLED`
+- Phase 2 emits these stable `task_event.event_type` values:
+  - `task.created`
+  - `task.paused`
+  - `task.resumed`
+  - `task.cancelled`
+  - `task.revised`
+- Phase 2 event payloads use a stable minimum JSON structure:
+  - `event_version`
+  - `source`
+  - `from_status`
+  - `to_status`
+  - `changes`
+
+## Deferred beyond Phase 2
 
 - `research_plan`, `attachment`, and `domain_policy`
-- task API endpoints and event-stream delivery
+- additional task APIs beyond the thin Phase 2 surface and any push-based event delivery
 - runtime task orchestration and fetch/search behavior

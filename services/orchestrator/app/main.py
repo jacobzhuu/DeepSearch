@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from services.orchestrator.app.api.routes.health import router as health_router
+from services.orchestrator.app.api.routes.research_tasks import router as research_tasks_router
 from services.orchestrator.app.settings import get_settings
 
 
@@ -11,6 +12,7 @@ def create_app() -> FastAPI:
         version="0.1.0",
     )
     application.include_router(health_router)
+    application.include_router(research_tasks_router)
     return application
 
 

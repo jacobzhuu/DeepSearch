@@ -54,6 +54,7 @@ Response `201 Created`:
 {
   "task_id": "uuid",
   "status": "PLANNED",
+  "revision_no": 1,
   "updated_at": "2026-04-22T12:00:00Z"
 }
 ```
@@ -73,6 +74,7 @@ Response `200 OK`:
     "domains_allow": ["nvidia.com", "github.com"],
     "language": "zh-CN"
   },
+  "revision_no": 1,
   "created_at": "2026-04-22T12:00:00Z",
   "updated_at": "2026-04-22T12:00:00Z",
   "started_at": null,
@@ -89,6 +91,17 @@ Response `200 OK`:
 
 Purpose: return the ordered task event stream.
 
+Query parameters:
+
+- `after_sequence_no`: optional exclusive lower bound for polling
+- `limit`: optional page size cap, `1..500`
+
+Read contract:
+
+- events are always returned in ascending `sequence_no`
+- when query parameters are omitted, the endpoint remains backward compatible and returns the full ordered stream
+- `created_at` remains informational; clients should use `sequence_no` for stable per-task ordering
+
 Response `200 OK`:
 
 ```json
@@ -99,6 +112,7 @@ Response `200 OK`:
       "event_id": "uuid",
       "run_id": null,
       "event_type": "task.created",
+      "sequence_no": 1,
       "payload": {
         "event_version": 1,
         "source": "api",
@@ -106,6 +120,7 @@ Response `200 OK`:
         "to_status": "PLANNED",
         "changes": {
           "query": "近30天 NVIDIA 在开源模型生态上的关键发布与影响",
+          "revision_no": 1,
           "constraints": {
             "domains_allow": ["nvidia.com", "github.com"],
             "language": "zh-CN"
@@ -126,13 +141,21 @@ Purpose: perform the minimal Phase 2 transition `PLANNED -> PAUSED` and emit `ta
 
 Purpose: perform the minimal Phase 2 transition `PAUSED -> PLANNED` and emit `task.resumed`.
 
+Semantics: `resume` currently means “return to the executable-candidate status” only. It does not enqueue work, start a worker, or imply `QUEUED` or `RUNNING`.
+
 ### `POST /api/v1/research/tasks/{task_id}/cancel`
 
 Purpose: perform the minimal Phase 2 transition `PLANNED|PAUSED -> CANCELLED` and emit `task.cancelled`.
 
 ### `POST /api/v1/research/tasks/{task_id}/revise`
 
-Purpose: update the persisted task query and or constraints, return the task to `PLANNED`, and emit `task.revised`.
+Purpose: update the persisted task query and or constraints, increment `revision_no`, return the task to `PLANNED`, and emit `task.revised`.
+
+Revision semantics:
+
+- `query`, if present, replaces the stored query
+- `constraints`, if present, is a shallow top-level merge into the stored `constraints`
+- constraint deletion and deep merge are not supported in the current phase
 
 Request:
 
@@ -151,6 +174,7 @@ Command responses use the same shape:
 {
   "task_id": "uuid",
   "status": "PLANNED",
+  "revision_no": 2,
   "updated_at": "2026-04-22T12:05:00Z"
 }
 ```
@@ -163,6 +187,18 @@ Command responses use the same shape:
 - `revise`: allowed from `PLANNED` and `PAUSED`, and always results in `PLANNED`
 - invalid transitions return `409 Conflict`
 - unknown task ids return `404 Not Found`
+
+## Reserved runtime statuses
+
+The schema and code now reserve these later-phase runtime-facing statuses:
+
+- `QUEUED`
+- `RUNNING`
+- `FAILED`
+- `COMPLETED`
+- `NEEDS_REVISION`
+
+They are not user-writable through the current Phase 2 API.
 
 ## Out of scope in Phase 2
 

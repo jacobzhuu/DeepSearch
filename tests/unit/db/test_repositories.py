@@ -20,7 +20,6 @@ from packages.db.models import (
     SearchQuery,
     SourceChunk,
     SourceDocument,
-    TaskEvent,
 )
 from packages.db.repositories import (
     CandidateUrlRepository,
@@ -77,13 +76,17 @@ def test_repositories_round_trip_for_task_search_and_fetch_ledgers(db_session: S
             checkpoint_json={"cursor": None},
         )
     )
-    event = event_repo.add(
-        TaskEvent(
-            task_id=task.id,
-            run_id=run.id,
-            event_type="TASK_PLANNED",
-            payload_json={"status": "PLANNED"},
-        )
+    event = event_repo.record(
+        task_id=task.id,
+        run_id=run.id,
+        event_type="TASK_PLANNED",
+        payload_json={
+            "event_version": 1,
+            "source": "test",
+            "from_status": None,
+            "to_status": "PLANNED",
+            "changes": {},
+        },
     )
     search_query = search_query_repo.add(
         SearchQuery(
@@ -142,6 +145,7 @@ def test_repositories_round_trip_for_task_search_and_fetch_ledgers(db_session: S
     assert run_repo.get_for_task_round(task.id, 1) is not None
     assert [item.id for item in run_repo.list_for_task(task.id)] == [run.id]
     assert [item.id for item in event_repo.list_for_task(task.id)] == [event.id]
+    assert event.sequence_no == 1
     assert [item.id for item in search_query_repo.list_for_run(run.id)] == [search_query.id]
     assert [item.id for item in candidate_url_repo.list_for_search_query(search_query.id)] == [
         candidate_url.id

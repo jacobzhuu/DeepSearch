@@ -4,8 +4,10 @@ from sqlalchemy.orm import Session
 
 from packages.db.repositories import ResearchTaskRepository, TaskEventRepository
 from services.orchestrator.app.services.research_tasks import (
+    FUTURE_RUNTIME_STATUS_VALUES,
     PHASE2_ACTIVE_STATUS,
     PHASE2_CANCELLED_STATUS,
+    PHASE2_EXECUTABLE_CANDIDATE_STATUS,
     PHASE2_PAUSED_STATUS,
     TASK_CANCELLED_EVENT,
     TASK_CREATED_EVENT,
@@ -32,9 +34,12 @@ def test_create_task_persists_created_event_and_initial_status(db_session: Sessi
     events = TaskEventRepository(db_session).list_for_task(task.id)
 
     assert task.status == PHASE2_ACTIVE_STATUS
+    assert task.revision_no == 1
     assert len(events) == 1
     assert events[0].event_type == TASK_CREATED_EVENT
+    assert events[0].sequence_no == 1
     assert events[0].payload_json["to_status"] == PHASE2_ACTIVE_STATUS
+    assert events[0].payload_json["changes"]["revision_no"] == 1
 
 
 def test_pause_resume_and_cancel_transitions_record_events(db_session: Session) -> None:
@@ -50,6 +55,7 @@ def test_pause_resume_and_cancel_transitions_record_events(db_session: Session) 
     assert resumed_status == PHASE2_ACTIVE_STATUS
     assert cancelled.status == PHASE2_CANCELLED_STATUS
     assert cancelled.ended_at is not None
+    assert [event.sequence_no for event in events] == [1, 2, 3, 4]
     assert [event.event_type for event in events] == [
         TASK_CREATED_EVENT,
         TASK_PAUSED_EVENT,
@@ -71,11 +77,41 @@ def test_revise_updates_task_fields_and_returns_to_planned(db_session: Session) 
     events = TaskEventRepository(db_session).list_for_task(task.id)
 
     assert revised.status == PHASE2_ACTIVE_STATUS
+    assert revised.revision_no == 2
     assert revised.query == "Revised task query"
     assert revised.constraints_json == {"language": "en", "max_rounds": 2}
     assert events[-1].event_type == TASK_REVISED_EVENT
+    assert events[-1].sequence_no == 3
     assert events[-1].payload_json["from_status"] == PHASE2_PAUSED_STATUS
     assert events[-1].payload_json["to_status"] == PHASE2_ACTIVE_STATUS
+    assert events[-1].payload_json["changes"]["revision_no"] == 2
+
+
+def test_get_events_supports_after_sequence_no_and_limit(db_session: Session) -> None:
+    service = _create_service(db_session)
+    task = service.create_task(query="Filtered event task", constraints={})
+    service.pause_task(task.id)
+    service.resume_task(task.id)
+    service.cancel_task(task.id)
+
+    filtered_events = service.get_events(task.id, after_sequence_no=2, limit=2)
+
+    assert [event.sequence_no for event in filtered_events] == [3, 4]
+    assert [event.event_type for event in filtered_events] == [
+        TASK_RESUMED_EVENT,
+        TASK_CANCELLED_EVENT,
+    ]
+
+
+def test_runtime_status_placeholders_do_not_change_current_resume_target() -> None:
+    assert FUTURE_RUNTIME_STATUS_VALUES == (
+        "QUEUED",
+        "RUNNING",
+        "FAILED",
+        "COMPLETED",
+        "NEEDS_REVISION",
+    )
+    assert PHASE2_EXECUTABLE_CANDIDATE_STATUS == "PLANNED"
 
 
 def test_invalid_transition_raises_conflict_error(db_session: Session) -> None:

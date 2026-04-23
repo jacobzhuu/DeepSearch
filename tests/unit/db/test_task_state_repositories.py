@@ -25,6 +25,8 @@ def test_research_task_repository_can_apply_status_and_revision_updates(
     repository = ResearchTaskRepository(db_session)
     task = _create_task(db_session)
 
+    assert task.revision_no == 1
+
     paused_task = repository.set_status(task, "PAUSED", ended_at=None)
     db_session.commit()
 
@@ -41,6 +43,7 @@ def test_research_task_repository_can_apply_status_and_revision_updates(
 
     assert revised_task.query == "Phase 2 revised task"
     assert revised_task.status == "PLANNED"
+    assert revised_task.revision_no == 2
     assert revised_task.constraints_json == {"language": "en", "max_rounds": 2}
 
 
@@ -73,10 +76,18 @@ def test_task_event_repository_records_stable_payloads_in_order(db_session: Sess
     db_session.commit()
 
     ordered_events = event_repository.list_for_task(task.id)
+    filtered_events = event_repository.list_for_task(task.id, after_sequence_no=1)
+    limited_events = event_repository.list_for_task(task.id, limit=1)
 
     assert [event.id for event in ordered_events] == [first_event.id, second_event.id]
+    assert [event.sequence_no for event in ordered_events] == [1, 2]
+    assert [event.id for event in filtered_events] == [second_event.id]
+    assert [event.id for event in limited_events] == [first_event.id]
     assert ordered_events[0].payload_json["event_version"] == 1
     assert ordered_events[1].payload_json["to_status"] == "PAUSED"
+    stored_task = ResearchTaskRepository(db_session).get(task.id)
+    assert stored_task is not None
+    assert stored_task.last_event_sequence_no == 2
 
     cancelled_task = ResearchTaskRepository(db_session).set_status(
         task,

@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from packages.db.models import ResearchTask
@@ -53,6 +53,7 @@ def create_research_task(
     return ResearchTaskMutationResponse(
         task_id=task.id,
         status=task.status,
+        revision_no=task.revision_no,
         updated_at=task.updated_at,
     )
 
@@ -64,9 +65,18 @@ def get_research_task(task_id: UUID, service: ServiceDep) -> ResearchTaskDetailR
 
 
 @router.get("/{task_id}/events", response_model=TaskEventListResponse)
-def get_research_task_events(task_id: UUID, service: ServiceDep) -> TaskEventListResponse:
+def get_research_task_events(
+    task_id: UUID,
+    service: ServiceDep,
+    after_sequence_no: Annotated[int | None, Query(ge=0)] = None,
+    limit: Annotated[int | None, Query(ge=1, le=500)] = None,
+) -> TaskEventListResponse:
     try:
-        events = service.get_events(task_id)
+        events = service.get_events(
+            task_id,
+            after_sequence_no=after_sequence_no,
+            limit=limit,
+        )
     except TaskNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
@@ -77,6 +87,7 @@ def get_research_task_events(task_id: UUID, service: ServiceDep) -> TaskEventLis
                 event_id=event.id,
                 run_id=event.run_id,
                 event_type=event.event_type,
+                sequence_no=event.sequence_no,
                 payload=event.payload_json,
                 created_at=event.created_at,
             )
@@ -116,6 +127,7 @@ def revise_research_task(
     return ResearchTaskMutationResponse(
         task_id=task.id,
         status=task.status,
+        revision_no=task.revision_no,
         updated_at=task.updated_at,
     )
 
@@ -134,6 +146,7 @@ def _run_task_mutation(
     return ResearchTaskMutationResponse(
         task_id=task.id,
         status=task.status,
+        revision_no=task.revision_no,
         updated_at=task.updated_at,
     )
 
@@ -152,6 +165,7 @@ def _serialize_task_snapshot(snapshot: TaskSnapshot) -> ResearchTaskDetailRespon
         query=snapshot.task.query,
         status=snapshot.task.status,
         constraints=snapshot.task.constraints_json,
+        revision_no=snapshot.task.revision_no,
         created_at=snapshot.task.created_at,
         updated_at=snapshot.task.updated_at,
         started_at=snapshot.task.started_at,

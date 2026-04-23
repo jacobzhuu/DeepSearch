@@ -84,7 +84,15 @@ curl -fsS -X POST http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/revise \
 curl -fsS -X POST http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/cancel
 curl -fsS http://127.0.0.1:8000/api/v1/research/tasks/<task_id>
 curl -fsS http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/events
+curl -fsS "http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/events?after_sequence_no=2&limit=2"
 ```
+
+Expected Phase 2 contract details:
+
+- create, mutate, and detail responses now include `revision_no`
+- event items now include `sequence_no`
+- `resume` returns the task to `PLANNED`; it does not queue or start execution
+- `revise` increments `revision_no` and shallow-merges top-level `constraints`
 
 ## Health validation
 
@@ -113,4 +121,6 @@ The dev compose stack currently starts only the orchestrator service. Phase 2 ad
 ## Phase 2 scope reminder
 
 - task creation, lookup, event retrieval, pause, resume, cancel, and revise now exist
+- the ledger now records stable per-task event ordering and task revision numbers
+- future runtime statuses such as `QUEUED` and `RUNNING` are reserved in schema and code only
 - no worker behavior, search, fetch, parse, index, verification, or reporting logic has been implemented yet

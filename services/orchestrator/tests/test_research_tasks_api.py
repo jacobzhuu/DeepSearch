@@ -40,6 +40,7 @@ def test_create_task_and_fetch_detail_and_events(client: TestClient) -> None:
     payload = create_response.json()
     task_id = payload["task_id"]
     assert payload["status"] == "PLANNED"
+    assert payload["revision_no"] == 1
 
     detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
     events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
@@ -47,9 +48,11 @@ def test_create_task_and_fetch_detail_and_events(client: TestClient) -> None:
     assert detail_response.status_code == 200
     assert detail_response.json()["progress"]["events_total"] == 1
     assert detail_response.json()["constraints"] == {"language": "zh-CN"}
+    assert detail_response.json()["revision_no"] == 1
 
     assert events_response.status_code == 200
     assert events_response.json()["events"][0]["event_type"] == "task.created"
+    assert events_response.json()["events"][0]["sequence_no"] == 1
     assert events_response.json()["events"][0]["payload"]["to_status"] == "PLANNED"
 
 
@@ -73,6 +76,7 @@ def test_pause_resume_and_cancel_endpoints_change_status(client: TestClient) -> 
     assert cancel_response.status_code == 200
     assert cancel_response.json()["status"] == "CANCELLED"
     assert detail_response.json()["ended_at"] is not None
+    assert [event["sequence_no"] for event in events_response.json()["events"]] == [1, 2, 3, 4]
     assert [event["event_type"] for event in events_response.json()["events"]] == [
         "task.created",
         "task.paused",
@@ -98,10 +102,13 @@ def test_revise_endpoint_updates_query_and_constraints(client: TestClient) -> No
 
     assert revise_response.status_code == 200
     assert revise_response.json()["status"] == "PLANNED"
+    assert revise_response.json()["revision_no"] == 2
     assert detail_response.json()["query"] == "Revised task"
     assert detail_response.json()["constraints"] == {"language": "en", "max_rounds": 2}
+    assert detail_response.json()["revision_no"] == 2
     assert events_response.json()["events"][-1]["event_type"] == "task.revised"
     assert events_response.json()["events"][-1]["payload"]["from_status"] == "PAUSED"
+    assert events_response.json()["events"][-1]["payload"]["changes"]["revision_no"] == 2
 
 
 def test_invalid_transition_and_not_found_responses(client: TestClient) -> None:
@@ -117,3 +124,30 @@ def test_invalid_transition_and_not_found_responses(client: TestClient) -> None:
     assert invalid_resume_response.status_code == 409
     assert "cannot resume task" in invalid_resume_response.json()["detail"]
     assert not_found_response.status_code == 404
+
+
+def test_events_endpoint_supports_after_sequence_no_and_limit(client: TestClient) -> None:
+    create_response = client.post(
+        "/api/v1/research/tasks",
+        json={"query": "Polling task", "constraints": {}},
+    )
+    task_id = create_response.json()["task_id"]
+
+    client.post(f"/api/v1/research/tasks/{task_id}/pause")
+    client.post(f"/api/v1/research/tasks/{task_id}/resume")
+    client.post(
+        f"/api/v1/research/tasks/{task_id}/revise",
+        json={"constraints": {"max_rounds": 2}},
+    )
+
+    events_response = client.get(
+        f"/api/v1/research/tasks/{task_id}/events",
+        params={"after_sequence_no": 2, "limit": 2},
+    )
+
+    assert events_response.status_code == 200
+    assert [event["sequence_no"] for event in events_response.json()["events"]] == [3, 4]
+    assert [event["event_type"] for event in events_response.json()["events"]] == [
+        "task.resumed",
+        "task.revised",
+    ]

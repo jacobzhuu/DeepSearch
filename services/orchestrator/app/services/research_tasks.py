@@ -8,6 +8,10 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from packages.db.models import ResearchTask, TaskEvent
+from packages.db.models.constants import CURRENT_TASK_STATUS_VALUES
+from packages.db.models.constants import (
+    FUTURE_RUNTIME_STATUS_VALUES as MODEL_FUTURE_RUNTIME_STATUS_VALUES,
+)
 from packages.db.repositories import ResearchTaskRepository, TaskEventRepository
 
 TASK_EVENT_VERSION = 1
@@ -17,9 +21,12 @@ TASK_RESUMED_EVENT = "task.resumed"
 TASK_CANCELLED_EVENT = "task.cancelled"
 TASK_REVISED_EVENT = "task.revised"
 
-PHASE2_ACTIVE_STATUS = "PLANNED"
+PHASE2_EXECUTABLE_CANDIDATE_STATUS = "PLANNED"
+PHASE2_ACTIVE_STATUS = PHASE2_EXECUTABLE_CANDIDATE_STATUS
 PHASE2_PAUSED_STATUS = "PAUSED"
 PHASE2_CANCELLED_STATUS = "CANCELLED"
+PHASE2_STABLE_STATUS_VALUES = CURRENT_TASK_STATUS_VALUES
+FUTURE_RUNTIME_STATUS_VALUES = MODEL_FUTURE_RUNTIME_STATUS_VALUES
 
 ACTION_TRANSITIONS = {
     "pause": {PHASE2_ACTIVE_STATUS: PHASE2_PAUSED_STATUS},
@@ -85,7 +92,7 @@ class ResearchTaskService:
         task = self.task_repository.add(
             ResearchTask(
                 query=query,
-                status=PHASE2_ACTIVE_STATUS,
+                status=PHASE2_EXECUTABLE_CANDIDATE_STATUS,
                 constraints_json=constraints,
             )
         )
@@ -94,8 +101,12 @@ class ResearchTaskService:
             event_type=TASK_CREATED_EVENT,
             payload_json=build_task_event_payload(
                 from_status=None,
-                to_status=PHASE2_ACTIVE_STATUS,
-                changes={"query": query, "constraints": constraints},
+                to_status=PHASE2_EXECUTABLE_CANDIDATE_STATUS,
+                changes={
+                    "query": query,
+                    "constraints": constraints,
+                    "revision_no": task.revision_no,
+                },
             ),
         )
         self.session.commit()
@@ -107,9 +118,19 @@ class ResearchTaskService:
         events = self.event_repository.list_for_task(task_id)
         return TaskSnapshot(task=task, events=events)
 
-    def get_events(self, task_id: UUID) -> list[TaskEvent]:
+    def get_events(
+        self,
+        task_id: UUID,
+        *,
+        after_sequence_no: int | None = None,
+        limit: int | None = None,
+    ) -> list[TaskEvent]:
         self._get_task(task_id)
-        return self.event_repository.list_for_task(task_id)
+        return self.event_repository.list_for_task(
+            task_id,
+            after_sequence_no=after_sequence_no,
+            limit=limit,
+        )
 
     def pause_task(self, task_id: UUID) -> ResearchTask:
         return self._transition_task(
@@ -163,7 +184,7 @@ class ResearchTaskService:
             payload_json=build_task_event_payload(
                 from_status=current_status,
                 to_status=next_status,
-                changes=changed_fields,
+                changes={**changed_fields, "revision_no": task.revision_no},
             ),
         )
         self.session.commit()

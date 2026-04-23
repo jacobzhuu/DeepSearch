@@ -48,6 +48,7 @@ class ReviseResearchTaskRequest(BaseModel):
 class ResearchTaskMutationResponse(BaseModel):
     task_id: UUID
     status: str
+    revision_no: int
     updated_at: datetime
 
 
@@ -62,6 +63,7 @@ class ResearchTaskDetailResponse(BaseModel):
     query: str
     status: str
     constraints: dict[str, Any]
+    revision_no: int
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None
@@ -73,6 +75,7 @@ class TaskEventResponse(BaseModel):
     event_id: UUID
     run_id: UUID | None
     event_type: str
+    sequence_no: int
     payload: dict[str, Any]
     created_at: datetime
 

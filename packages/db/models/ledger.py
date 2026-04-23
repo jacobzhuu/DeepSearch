@@ -20,6 +20,11 @@ class ResearchTask(TimestampMixin, Base):
             name="research_task_status_valid",
         ),
         sa.CheckConstraint("priority >= 0", name="research_task_priority_non_negative"),
+        sa.CheckConstraint("revision_no > 0", name="ck_research_task_revision_no_positive"),
+        sa.CheckConstraint(
+            "last_event_sequence_no >= 0",
+            name="ck_research_task_last_event_sequence_no_non_negative",
+        ),
         sa.Index("ix_research_task_status_created_at", "status", "created_at"),
     )
 
@@ -43,6 +48,18 @@ class ResearchTask(TimestampMixin, Base):
         nullable=False,
         default=dict,
         server_default=sa.text("'{}'"),
+    )
+    revision_no: Mapped[int] = mapped_column(
+        sa.Integer(),
+        nullable=False,
+        default=1,
+        server_default=sa.text("1"),
+    )
+    last_event_sequence_no: Mapped[int] = mapped_column(
+        sa.Integer(),
+        nullable=False,
+        default=0,
+        server_default=sa.text("0"),
     )
     started_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
@@ -129,6 +146,9 @@ class TaskEvent(Base):
     __tablename__ = "task_event"
     __table_args__ = (
         sa.CheckConstraint("length(trim(event_type)) > 0", name="task_event_event_type_non_empty"),
+        sa.CheckConstraint("sequence_no > 0", name="ck_task_event_sequence_no_positive"),
+        sa.UniqueConstraint("task_id", "sequence_no", name="uq_task_event_task_id_sequence_no"),
+        sa.Index("ix_task_event_task_id_sequence_no", "task_id", "sequence_no"),
         sa.Index("ix_task_event_task_id_created_at", "task_id", "created_at"),
         sa.Index("ix_task_event_run_id_created_at", "run_id", "created_at"),
     )
@@ -142,6 +162,7 @@ class TaskEvent(Base):
         sa.ForeignKey("research_run.id", ondelete="CASCADE"),
     )
     event_type: Mapped[str] = mapped_column(sa.String(length=64), nullable=False)
+    sequence_no: Mapped[int] = mapped_column(sa.Integer(), nullable=False)
     payload_json: Mapped[dict[str, Any]] = mapped_column(
         sa.JSON(),
         nullable=False,

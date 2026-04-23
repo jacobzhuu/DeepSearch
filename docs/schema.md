@@ -21,9 +21,9 @@ Phase 2 uses the Phase 1 reversible research ledger schema through Alembic and S
 ## Current schema shape
 
 - task lifecycle foundation:
-  - `research_task` stores query, status, priority, constraints, and task timing
+  - `research_task` stores query, status, priority, constraints, `revision_no`, `last_event_sequence_no`, and task timing
   - `research_run` stores round number, current state, and checkpoint payload
-  - `task_event` stores auditable task and run events
+  - `task_event` stores auditable task and run events, including per-task `sequence_no`
 - search and fetch ledger:
   - `search_query` stores issued queries per task run
   - `candidate_url` stores canonicalized search candidates per search query
@@ -52,17 +52,27 @@ Phase 2 uses the Phase 1 reversible research ledger schema through Alembic and S
   - `citation_span(source_chunk_id, start_offset, end_offset)`
   - `claim_evidence(claim_id, citation_span_id, relation_type)`
   - `report_artifact(task_id, version, format)`
+- `task_event` now has a stable per-task uniqueness boundary:
+  - `task_event(task_id, sequence_no)`
 - supporting indexes exist on common lookup paths such as task status, event ordering, fetch scheduling, source ranking, and claim/report retrieval
 
 ## Phase 2 task-event usage
 
-- Phase 2 uses the `research_task` status subset `PLANNED`, `PAUSED`, and `CANCELLED`
+- Phase 2 still uses the writable `research_task` status subset `PLANNED`, `PAUSED`, and `CANCELLED`
+- the schema and code now reserve these later runtime-facing statuses for future phases:
+  - `QUEUED`
+  - `RUNNING`
+  - `FAILED`
+  - `COMPLETED`
+  - `NEEDS_REVISION`
 - Phase 2 emits these stable `task_event.event_type` values:
   - `task.created`
   - `task.paused`
   - `task.resumed`
   - `task.cancelled`
   - `task.revised`
+- `research_task.revision_no` starts at `1` and increments only on `revise`
+- `task_event.sequence_no` starts at `1` per task and defines the stable `/events` ordering contract
 - Phase 2 event payloads use a stable minimum JSON structure:
   - `event_version`
   - `source`

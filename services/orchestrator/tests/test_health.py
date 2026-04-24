@@ -16,3 +16,14 @@ def test_readyz_returns_service_metadata() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
     assert response.json()["service"] == "deepresearch-orchestrator"
+
+
+def test_metrics_returns_prometheus_payload() -> None:
+    client = TestClient(app)
+    client.get("/healthz")
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "deepresearch_http_requests_total" in response.text

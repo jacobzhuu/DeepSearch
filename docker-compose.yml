@@ -1,0 +1,156 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.13-bookworm}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deepresearch}
+      POSTGRES_USER: ${POSTGRES_USER:-deepresearch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deepresearch}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1 -p 5432",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z}
+    restart: unless-stopped
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+
+  opensearch:
+    image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:2.19.0}
+    restart: unless-stopped
+    environment:
+      cluster.name: ${OPENSEARCH_CLUSTER_NAME:-deepresearch-single-node}
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: ${OPENSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_PASSWORD:-ChangeMe123!}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsSk -u admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD} https://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=1s >/dev/null",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    ports:
+      - "${OPENSEARCH_PORT:-9200}:9200"
+      - "${OPENSEARCH_PERF_PORT:-9600}:9600"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    environment:
+      APP_NAME: ${APP_NAME:-deepresearch-orchestrator}
+      APP_ENV: ${APP_ENV:-production}
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: json
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-deepresearch}:${POSTGRES_PASSWORD:-deepresearch}@postgres:5432/${POSTGRES_DB:-deepresearch}
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
+      SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-10}
+      SEARCH_MAX_RESULTS_PER_QUERY: ${SEARCH_MAX_RESULTS_PER_QUERY:-10}
+      QUERY_EXPANSION_MAX_DOMAINS: ${QUERY_EXPANSION_MAX_DOMAINS:-3}
+      ACQUISITION_TIMEOUT_SECONDS: ${ACQUISITION_TIMEOUT_SECONDS:-10}
+      ACQUISITION_MAX_REDIRECTS: ${ACQUISITION_MAX_REDIRECTS:-3}
+      ACQUISITION_MAX_RESPONSE_BYTES: ${ACQUISITION_MAX_RESPONSE_BYTES:-1048576}
+      ACQUISITION_MAX_CANDIDATES_PER_REQUEST: ${ACQUISITION_MAX_CANDIDATES_PER_REQUEST:-5}
+      ACQUISITION_USER_AGENT: ${ACQUISITION_USER_AGENT:-deepresearch-orchestrator/0.1}
+      SNAPSHOT_STORAGE_BACKEND: ${SNAPSHOT_STORAGE_BACKEND:-minio}
+      SNAPSHOT_STORAGE_ROOT: ${SNAPSHOT_STORAGE_ROOT:-/workspace/data/snapshots}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MINIO_REGION: ${MINIO_REGION:-}
+      SNAPSHOT_STORAGE_BUCKET: ${SNAPSHOT_STORAGE_BUCKET:-snapshots}
+      REPORT_STORAGE_BUCKET: ${REPORT_STORAGE_BUCKET:-reports}
+      INDEX_BACKEND: ${INDEX_BACKEND:-opensearch}
+      OPENSEARCH_BASE_URL: ${OPENSEARCH_BASE_URL:-https://opensearch:9200}
+      OPENSEARCH_INDEX_NAME: ${OPENSEARCH_INDEX_NAME:-source-chunks-v1}
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-ChangeMe123!}
+      OPENSEARCH_VERIFY_TLS: ${OPENSEARCH_VERIFY_TLS:-true}
+      OPENSEARCH_CA_BUNDLE_PATH: ${OPENSEARCH_CA_BUNDLE_PATH:-/run/opensearch-certs/root-ca.pem}
+      OPENSEARCH_TIMEOUT_SECONDS: ${OPENSEARCH_TIMEOUT_SECONDS:-10}
+      OPENSEARCH_VALIDATE_CONNECTIVITY_ON_STARTUP: ${OPENSEARCH_VALIDATE_CONNECTIVITY_ON_STARTUP:-true}
+      INDEXING_MAX_CHUNKS_PER_REQUEST: ${INDEXING_MAX_CHUNKS_PER_REQUEST:-20}
+      RETRIEVAL_MAX_RESULTS_PER_REQUEST: ${RETRIEVAL_MAX_RESULTS_PER_REQUEST:-20}
+      CLAIM_DRAFTING_MAX_CANDIDATES_PER_REQUEST: ${CLAIM_DRAFTING_MAX_CANDIDATES_PER_REQUEST:-5}
+      CLAIM_VERIFICATION_MAX_CLAIMS_PER_REQUEST: ${CLAIM_VERIFICATION_MAX_CLAIMS_PER_REQUEST:-5}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/workspace/data
+      - ./infra/opensearch/certs:/run/opensearch-certs:ro
+
+  searxng:
+    image: ${SEARXNG_IMAGE:-searxng/searxng:2026.4.13-ee66b070a}
+    profiles: ["search"]
+    restart: unless-stopped
+    ports:
+      - "${SEARXNG_PORT:-8080}:8080"
+
+  tika:
+    image: ${TIKA_IMAGE:-apache/tika:3.3.0.0-full}
+    profiles: ["tika"]
+    restart: unless-stopped
+    ports:
+      - "${TIKA_PORT:-9998}:9998"
+
+volumes:
+  postgres-data:
+  minio-data:
+  opensearch-data:

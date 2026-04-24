@@ -160,6 +160,11 @@ def _get_task_snapshot_or_404(service: ResearchTaskService, task_id: UUID) -> Ta
 
 def _serialize_task_snapshot(snapshot: TaskSnapshot) -> ResearchTaskDetailResponse:
     latest_event_at = snapshot.events[-1].created_at if snapshot.events else None
+    current_state = snapshot.task.status
+    if snapshot.events and snapshot.task.status not in {"COMPLETED", "FAILED", "CANCELLED"}:
+        latest_stage = snapshot.events[-1].payload_json.get("stage")
+        if isinstance(latest_stage, str) and latest_stage.strip():
+            current_state = latest_stage.strip()
     return ResearchTaskDetailResponse(
         task_id=snapshot.task.id,
         query=snapshot.task.query,
@@ -171,7 +176,7 @@ def _serialize_task_snapshot(snapshot: TaskSnapshot) -> ResearchTaskDetailRespon
         started_at=snapshot.task.started_at,
         ended_at=snapshot.task.ended_at,
         progress=ResearchTaskProgressResponse(
-            current_state=snapshot.task.status,
+            current_state=current_state,
             events_total=len(snapshot.events),
             latest_event_at=latest_event_at,
         ),

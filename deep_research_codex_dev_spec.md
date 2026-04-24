@@ -4,6 +4,18 @@
 
 本文件用于指导 Codex 在 Linux 服务器环境下，按阶段、可回滚、可验收地实现一个接近 GPT / Gemini Deep Research 能力的开源情报研究平台。
 
+### 0.1 当前路线说明
+
+当前项目路线已收敛为：
+
+- 主要服务单一操作者 / 项目作者本人
+- 以 host-local / self-hosted Linux 运行路径为主
+- Docker / compose 仅作为可选部署包装，不再是主交付目标或主验收标准
+- 当前收尾标准优先是：自用、稳定、可维护、可恢复
+- 不再继续主动扩展 OpenClaw、HTML/PDF、planner / gap analyzer、复杂 verifier、复杂检索优化
+
+本文件中出现的更大范围基础设施或交付形态，应理解为长期参考边界，而不是当前阶段必须完成的主路径。
+
 本项目不是普通聊天应用，也不是简单的 RAG 系统。系统主语义必须是：
 
 - 异步 research task
@@ -36,6 +48,12 @@
 - 大规模 plugin marketplace
 - 高级多代理协作
 
+### 1.3 当前部署路线
+
+- 推荐路径：host-local / self-hosted Linux 直接运行
+- 推荐验收：以 Python 环境、PostgreSQL、MinIO 或 filesystem backend、OpenSearch、orchestrator 启动与 smoke path 为主
+- Docker / compose：保留为可选部署包装，不作为当前成功标准
+
 ---
 
 ## 2. 总体架构
@@ -62,6 +80,12 @@
 4. **交付层**
    - report service：Markdown / HTML / PDF 报告生成
 
+当前执行约束：
+
+- 以上是总体参考架构，不代表当前阶段必须把所有层或所有可选包装都做成完整交付
+- 当前主交付路径仍以单机 / 自托管 Linux 的 host-local 运行方式为准
+- Docker / compose 只作为可选包装，不应成为唯一依赖
+
 核心原则：
 
 - 先 research kernel，后交互壳
@@ -76,7 +100,7 @@
 ```text
 /opt/deepresearch/
 ├── .env
-├── docker-compose.yml
+├── docker-compose.yml          # optional deployment packaging
 ├── Makefile
 ├── README.md
 ├── docs/
@@ -180,6 +204,12 @@
 - MinIO 固定版本镜像
 - Open WebUI 固定版本镜像
 - Caddy 2
+
+说明：
+
+- 上述基础设施清单描述的是总体能力边界
+- 当前收尾阶段的主路径是 host-local / self-hosted Linux 上直接联调已实现依赖
+- Docker 镜像与 compose 仅作为可选包装，不再是必须完成的主目标
 
 ### 4.3 任务执行
 
@@ -936,4 +966,3 @@ Codex 应把它实现成：
 - 一个可恢复、可审计、可逐步增强的工程骨架
 
 文档到此为止。
-

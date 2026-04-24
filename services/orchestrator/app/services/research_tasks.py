@@ -13,6 +13,7 @@ from packages.db.models.constants import (
     FUTURE_RUNTIME_STATUS_VALUES as MODEL_FUTURE_RUNTIME_STATUS_VALUES,
 )
 from packages.db.repositories import ResearchTaskRepository, TaskEventRepository
+from packages.observability import get_logger, record_task_command
 
 TASK_EVENT_VERSION = 1
 TASK_CREATED_EVENT = "task.created"
@@ -40,6 +41,8 @@ ACTION_TRANSITIONS = {
         PHASE2_PAUSED_STATUS: PHASE2_ACTIVE_STATUS,
     },
 }
+
+logger = get_logger(__name__)
 
 
 class TaskNotFoundError(Exception):
@@ -111,6 +114,16 @@ class ResearchTaskService:
         )
         self.session.commit()
         self.session.refresh(task)
+        record_task_command(action="create", status=task.status)
+        logger.info(
+            "task.command.completed",
+            extra={
+                "task_id": str(task.id),
+                "action": "create",
+                "status": task.status,
+                "revision_no": task.revision_no,
+            },
+        )
         return task
 
     def get_task_snapshot(self, task_id: UUID) -> TaskSnapshot:
@@ -189,6 +202,16 @@ class ResearchTaskService:
         )
         self.session.commit()
         self.session.refresh(task)
+        record_task_command(action="revise", status=task.status)
+        logger.info(
+            "task.command.completed",
+            extra={
+                "task_id": str(task.id),
+                "action": "revise",
+                "status": task.status,
+                "revision_no": task.revision_no,
+            },
+        )
         return task
 
     def _transition_task(self, *, task_id: UUID, action: str, event_type: str) -> ResearchTask:
@@ -210,6 +233,16 @@ class ResearchTaskService:
         )
         self.session.commit()
         self.session.refresh(task)
+        record_task_command(action=action, status=task.status)
+        logger.info(
+            "task.command.completed",
+            extra={
+                "task_id": str(task.id),
+                "action": action,
+                "status": task.status,
+                "revision_no": task.revision_no,
+            },
+        )
         return task
 
     def _get_task(self, task_id: UUID) -> ResearchTask:

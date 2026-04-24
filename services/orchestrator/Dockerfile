@@ -13,6 +13,7 @@ COPY pyproject.toml ./pyproject.toml
 COPY alembic.ini ./alembic.ini
 COPY migrations ./migrations
 COPY packages ./packages
+COPY scripts ./scripts
 COPY services ./services
 
 RUN python -m pip install --upgrade pip==25.0.1 \

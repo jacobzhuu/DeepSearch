@@ -27,6 +27,7 @@ then an ExecPlan is required.
 4. Do not treat the plan as a static proposal.
 5. If implementation diverges from the original plan, update the plan before or together with the code.
 6. The plan must be understandable to a reader with no memory of prior chat context.
+7. If the project goal or delivery route changes, update `AGENTS.md`, the relevant phase docs, and all active ExecPlans before continuing implementation.
 
 ---
 
@@ -212,6 +213,7 @@ When implementing from an ExecPlan:
 - proceed to the next milestone when safe
 - keep the plan synchronized with code reality
 - record deviations explicitly
+- if repository-level goals changed, stop and update the governing docs and active plans first
 
 When reviewing an ExecPlan:
 

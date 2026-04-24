@@ -67,6 +67,15 @@ class ResearchRunRepository(SQLAlchemyRepository[ResearchRun]):
         )
         return list(self.session.scalars(statement))
 
+    def get_latest_for_task(self, task_id: UUID) -> ResearchRun | None:
+        statement = (
+            select(ResearchRun)
+            .where(ResearchRun.task_id == task_id)
+            .order_by(ResearchRun.round_no.desc())
+            .limit(1)
+        )
+        return self.session.scalar(statement)
+
     def get_for_task_round(self, task_id: UUID, round_no: int) -> ResearchRun | None:
         statement = select(ResearchRun).where(
             ResearchRun.task_id == task_id,

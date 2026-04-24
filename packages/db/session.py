@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 
 def build_engine(database_url: str, *, echo: bool = False) -> Engine:
-    engine = create_engine(database_url, echo=echo)
+    engine = create_engine(database_url, echo=echo, pool_pre_ping=True)
 
     if engine.dialect.name == "sqlite":
 

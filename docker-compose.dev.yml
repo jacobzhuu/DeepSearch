@@ -1,8 +1,16 @@
 services:
+  postgres:
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deepresearch_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-deepresearch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deepresearch}
+
+  opensearch:
+    environment:
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+
   orchestrator:
-    build:
-      context: .
-      dockerfile: services/orchestrator/Dockerfile
     command:
       - uvicorn
       - services.orchestrator.app.main:app
@@ -11,15 +19,27 @@ services:
       - --port
       - "8000"
       - --reload
-    env_file:
-      - .env
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: DEBUG
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-deepresearch}:${POSTGRES_PASSWORD:-deepresearch}@postgres:5432/${POSTGRES_DB:-deepresearch_dev}
+      SNAPSHOT_STORAGE_BACKEND: minio
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_SECURE: "false"
+      OPENSEARCH_BASE_URL: http://opensearch:9200
+      OPENSEARCH_USERNAME: ""
+      OPENSEARCH_PASSWORD: ""
+      OPENSEARCH_VERIFY_TLS: "false"
+      OPENSEARCH_CA_BUNDLE_PATH: ""
+      OPENSEARCH_VALIDATE_CONNECTIVITY_ON_STARTUP: "false"
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 5s
-    ports:
-      - "${APP_PORT:-8000}:8000"
     volumes:
       - .:/workspace

@@ -283,6 +283,11 @@ class FetchJob(Base):
     __table_args__ = (
         sa.CheckConstraint("length(trim(mode)) > 0", name="fetch_job_mode_non_empty"),
         sa.CheckConstraint("length(trim(status)) > 0", name="fetch_job_status_non_empty"),
+        sa.UniqueConstraint(
+            "candidate_url_id",
+            "mode",
+            name="uq_fetch_job_candidate_url_id_mode",
+        ),
         sa.Index("ix_fetch_job_task_id_status", "task_id", "status"),
         sa.Index("ix_fetch_job_candidate_url_id_status", "candidate_url_id", "status"),
         sa.Index("ix_fetch_job_status_lease_until", "status", "lease_until"),
@@ -402,6 +407,10 @@ class ContentSnapshot(Base):
     )
 
     fetch_attempt: Mapped[FetchAttempt] = relationship(back_populates="content_snapshot")
+    source_document: Mapped[SourceDocument | None] = relationship(
+        back_populates="content_snapshot",
+        uselist=False,
+    )
 
 
 class SourceDocument(Base):
@@ -445,7 +454,12 @@ class SourceDocument(Base):
             "canonical_url",
             name="uq_source_document_task_id_canonical_url",
         ),
+        sa.UniqueConstraint(
+            "content_snapshot_id",
+            name="uq_source_document_content_snapshot_id",
+        ),
         sa.Index("ix_source_document_task_id_final_source_score", "task_id", "final_source_score"),
+        sa.Index("ix_source_document_content_snapshot_id", "content_snapshot_id"),
         sa.Index("ix_source_document_domain", "domain"),
     )
 
@@ -453,6 +467,9 @@ class SourceDocument(Base):
     task_id: Mapped[uuid.UUID] = mapped_column(
         sa.ForeignKey("research_task.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    content_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("content_snapshot.id", ondelete="SET NULL"),
     )
     canonical_url: Mapped[str] = mapped_column(sa.Text(), nullable=False)
     domain: Mapped[str] = mapped_column(sa.String(length=255), nullable=False)
@@ -468,6 +485,9 @@ class SourceDocument(Base):
     final_source_score: Mapped[float | None] = mapped_column(sa.Float())
 
     task: Mapped[ResearchTask] = relationship(back_populates="source_documents")
+    content_snapshot: Mapped[ContentSnapshot | None] = relationship(
+        back_populates="source_document"
+    )
     chunks: Mapped[list[SourceChunk]] = relationship(
         back_populates="source_document",
         cascade="all, delete-orphan",
@@ -640,6 +660,10 @@ class ReportArtifact(Base):
             name="report_artifact_storage_key_non_empty",
         ),
         sa.CheckConstraint("length(trim(format)) > 0", name="report_artifact_format_non_empty"),
+        sa.CheckConstraint(
+            "(content_hash IS NULL) OR (length(trim(content_hash)) > 0)",
+            name="report_artifact_content_hash_non_empty",
+        ),
         sa.UniqueConstraint(
             "task_id",
             "version",
@@ -658,6 +682,8 @@ class ReportArtifact(Base):
     storage_bucket: Mapped[str] = mapped_column(sa.String(length=255), nullable=False)
     storage_key: Mapped[str] = mapped_column(sa.Text(), nullable=False)
     format: Mapped[str] = mapped_column(sa.String(length=32), nullable=False)
+    content_hash: Mapped[str | None] = mapped_column(sa.String(length=71))
+    manifest_json: Mapped[dict[str, Any] | None] = mapped_column(sa.JSON())
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,

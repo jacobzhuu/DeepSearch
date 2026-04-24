@@ -29,6 +29,8 @@ Every review should try to catch:
 - unsafe side effects
 - weak testing
 - stale or missing docs
+- unnecessary deployment complexity
+- drift away from the host-local / self-hosted primary path
 
 ---
 
@@ -91,6 +93,21 @@ Flag if:
 - crawl / parse details leak into unrelated layers
 - reporting logic bypasses ledger or claim evidence
 - chat façade becomes the hidden primary product path
+
+## 4.1 Operational route review checklist
+
+Verify the change still matches the current repository route:
+
+- host-local / self-hosted Linux remains the primary operator path
+- Docker / compose remains optional tooling, not the only runnable path
+- the change does not introduce unnecessary bootstrap or deployment complexity
+- the change does not make compose the implicit acceptance gate unless explicitly required
+
+Flag if:
+
+- Docker becomes the only documented or tested runtime path
+- host-local commands, scripts, or recovery steps become stale
+- optional deployment tooling is described as the primary product deliverable
 
 ---
 
@@ -209,7 +226,7 @@ Flag when:
 
 When behavior changed, verify updates to the right docs:
 
-- `Deep Research Codex Dev Spec.md`
+- `deep_research_codex_dev_spec.md`
 - `PLANS.md`
 - `docs/api.md`
 - `docs/schema.md`
@@ -244,6 +261,7 @@ A good change usually has these properties:
 - reversible
 - documented
 - honest about limits
+- host-local operable without unnecessary ceremony
 
 A bad change often looks like:
 
@@ -253,6 +271,7 @@ A bad change often looks like:
 - missing evidence links
 - missing state-transition reasoning
 - docs and tests left behind
+- Docker-only assumptions in a repository that is supposed to stay self-hostable first
 
 ---
 

@@ -4,6 +4,13 @@
 
 This repository implements a **Deep Research / OSINT research platform** for Linux servers.
 
+Current project route:
+
+- primary operator is the repository owner / single self-hosted operator
+- primary runtime path is host-local or self-hosted Linux operation
+- Docker / compose may remain as optional tooling, but is not the main success criterion
+- closeout work should optimize for self-use, stability, maintainability, and recoverability
+
 Primary product semantics:
 
 - asynchronous `research_task`
@@ -23,7 +30,7 @@ This is **not**:
 
 Before making any change, read these files in order:
 
-1. `Deep Research Codex Dev Spec.md`
+1. `deep_research_codex_dev_spec.md`
 2. `PLANS.md`
 3. `code_review.md`
 4. `docs/architecture.md` if present
@@ -48,6 +55,7 @@ If any of these files are missing, say so explicitly in your response and procee
 5. Every important claim must be traceable to evidence.
 6. Every important side effect must be idempotent or explicitly guarded.
 7. Do not silently expand scope.
+8. Prefer host-local / self-hosted operator paths over Docker-first packaging work.
 
 ---
 
@@ -63,6 +71,13 @@ Rules:
 - If a current task depends on future infrastructure, create the thinnest acceptable seam and document the deferred work.
 
 When unclear, choose the smallest implementation that keeps the architecture correct.
+
+Additional route rules:
+
+- after the project goal changes, update `AGENTS.md`, relevant phase docs, and active ExecPlans before continuing implementation
+- for final closeout work, prioritize docs, scripts, runbooks, and host-local recovery paths
+- do not proactively expand Docker-first deployment work
+- do not add new product features unless a conflict fix is required to keep the current shipped path working
 
 ---
 

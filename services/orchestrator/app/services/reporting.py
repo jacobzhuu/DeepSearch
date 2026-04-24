@@ -1,0 +1,363 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+from typing import cast
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from packages.db.models import Claim, ClaimEvidence, ReportArtifact, ResearchTask
+from packages.db.repositories import (
+    ClaimEvidenceRepository,
+    ClaimRepository,
+    ReportArtifactRepository,
+    ResearchTaskRepository,
+)
+from packages.observability import get_logger, record_report_result
+from services.orchestrator.app.reporting import (
+    ClaimStatus,
+    EvidenceRelation,
+    RenderedMarkdownReport,
+    ReportClaimItem,
+    ReportEvidenceItem,
+    ReportSourceItem,
+    build_report_manifest,
+    compute_report_content_hash,
+    extract_report_title,
+    render_markdown_report,
+)
+from services.orchestrator.app.services.research_tasks import TaskNotFoundError
+from services.orchestrator.app.storage import SnapshotObjectStore
+
+REPORT_FORMAT_MARKDOWN = "markdown"
+logger = get_logger(__name__)
+
+
+class ReportArtifactNotFoundError(Exception):
+    def __init__(self, task_id: UUID) -> None:
+        super().__init__(f"no markdown report artifact was found for task {task_id}")
+        self.task_id = task_id
+
+
+class ReportArtifactObjectMissingError(Exception):
+    def __init__(self, task_id: UUID, artifact_id: UUID) -> None:
+        super().__init__(
+            f"report artifact object for task {task_id} and artifact {artifact_id} is missing"
+        )
+        self.task_id = task_id
+        self.artifact_id = artifact_id
+
+
+class ReportArtifactContentMismatchError(Exception):
+    def __init__(self, task_id: UUID, artifact_id: UUID) -> None:
+        super().__init__(
+            "report artifact content for task"
+            f" {task_id} and artifact {artifact_id} failed hash verification"
+        )
+        self.task_id = task_id
+        self.artifact_id = artifact_id
+
+
+@dataclass(frozen=True)
+class ReportSynthesisResult:
+    task: ResearchTask
+    artifact: ReportArtifact
+    title: str
+    markdown: str
+    reused_existing: bool
+    supported_claims: int
+    mixed_claims: int
+    unsupported_claims: int
+    draft_claims: int
+
+
+@dataclass(frozen=True)
+class PreparedReport:
+    rendered: RenderedMarkdownReport
+    claims: list[ReportClaimItem]
+    sources: list[ReportSourceItem]
+
+
+class ReportSynthesisService:
+    def __init__(
+        self,
+        session: Session,
+        *,
+        task_repository: ResearchTaskRepository,
+        claim_repository: ClaimRepository,
+        claim_evidence_repository: ClaimEvidenceRepository,
+        report_artifact_repository: ReportArtifactRepository,
+        object_store: SnapshotObjectStore,
+        report_storage_bucket: str,
+    ) -> None:
+        self.session = session
+        self.task_repository = task_repository
+        self.claim_repository = claim_repository
+        self.claim_evidence_repository = claim_evidence_repository
+        self.report_artifact_repository = report_artifact_repository
+        self.object_store = object_store
+        self.report_storage_bucket = report_storage_bucket
+
+    def generate_markdown_report(self, task_id: UUID) -> ReportSynthesisResult:
+        task = self._get_task(task_id)
+        prepared_report = self._prepare_report(task)
+        rendered = prepared_report.rendered
+        content_hash = compute_report_content_hash(rendered.markdown)
+        markdown_bytes = rendered.markdown.encode("utf-8")
+        manifest = build_report_manifest(
+            task_id=task.id,
+            revision_no=task.revision_no,
+            query=task.query,
+            report_title=rendered.title,
+            claims=prepared_report.claims,
+            sources=prepared_report.sources,
+        )
+        latest_artifact = self.report_artifact_repository.get_latest_for_task_format(
+            task.id,
+            format=REPORT_FORMAT_MARKDOWN,
+        )
+
+        if latest_artifact is not None and self._artifact_matches(
+            latest_artifact,
+            content_hash=content_hash,
+            content=markdown_bytes,
+        ):
+            record_report_result(reused_existing=True, format=REPORT_FORMAT_MARKDOWN)
+            logger.info(
+                "report.generated",
+                extra={
+                    "task_id": str(task.id),
+                    "report_artifact_id": str(latest_artifact.id),
+                    "version": latest_artifact.version,
+                    "format": REPORT_FORMAT_MARKDOWN,
+                    "reused_existing": True,
+                },
+            )
+            return self._build_result(
+                task=task,
+                artifact=latest_artifact,
+                rendered=rendered,
+                reused_existing=True,
+            )
+
+        next_version = 1 if latest_artifact is None else latest_artifact.version + 1
+        storage_key = self._build_storage_key(task.id, next_version)
+        stored_ref = self.object_store.put_bytes(
+            bucket=self.report_storage_bucket,
+            key=storage_key,
+            content=markdown_bytes,
+            content_type="text/markdown; charset=utf-8",
+        )
+        artifact = self.report_artifact_repository.add(
+            ReportArtifact(
+                task_id=task.id,
+                version=next_version,
+                storage_bucket=stored_ref.bucket,
+                storage_key=stored_ref.key,
+                format=REPORT_FORMAT_MARKDOWN,
+                content_hash=content_hash,
+                manifest_json=manifest,
+            )
+        )
+        self.session.commit()
+        record_report_result(reused_existing=False, format=REPORT_FORMAT_MARKDOWN)
+        logger.info(
+            "report.generated",
+            extra={
+                "task_id": str(task.id),
+                "report_artifact_id": str(artifact.id),
+                "version": artifact.version,
+                "format": REPORT_FORMAT_MARKDOWN,
+                "reused_existing": False,
+                "content_hash": content_hash,
+            },
+        )
+        return self._build_result(
+            task=task,
+            artifact=artifact,
+            rendered=rendered,
+            reused_existing=False,
+        )
+
+    def get_latest_markdown_report(self, task_id: UUID) -> ReportSynthesisResult:
+        task = self._get_task(task_id)
+        artifact = self.report_artifact_repository.get_latest_for_task_format(
+            task.id,
+            format=REPORT_FORMAT_MARKDOWN,
+        )
+        if artifact is None:
+            raise ReportArtifactNotFoundError(task.id)
+
+        try:
+            markdown_bytes = self.object_store.get_bytes(
+                bucket=artifact.storage_bucket,
+                key=artifact.storage_key,
+            )
+        except FileNotFoundError as error:
+            raise ReportArtifactObjectMissingError(task.id, artifact.id) from error
+
+        markdown = markdown_bytes.decode("utf-8")
+        if (
+            artifact.content_hash is not None
+            and artifact.content_hash != compute_report_content_hash(markdown)
+        ):
+            raise ReportArtifactContentMismatchError(task.id, artifact.id)
+        return ReportSynthesisResult(
+            task=task,
+            artifact=artifact,
+            title=extract_report_title(markdown),
+            markdown=markdown,
+            reused_existing=True,
+            supported_claims=0,
+            mixed_claims=0,
+            unsupported_claims=0,
+            draft_claims=0,
+        )
+
+    def _prepare_report(self, task: ResearchTask) -> PreparedReport:
+        claims = self.claim_repository.list_for_task(task.id)
+        claim_evidence = self.claim_evidence_repository.list_for_task(task.id)
+        evidence_by_claim_id: dict[UUID, list[ClaimEvidence]] = {claim.id: [] for claim in claims}
+        for evidence in claim_evidence:
+            evidence_by_claim_id.setdefault(evidence.claim_id, []).append(evidence)
+
+        report_claims: list[ReportClaimItem] = []
+        source_items: dict[UUID, ReportSourceItem] = {}
+        for claim in claims:
+            support_evidence: list[ReportEvidenceItem] = []
+            contradict_evidence: list[ReportEvidenceItem] = []
+            for evidence in evidence_by_claim_id.get(claim.id, []):
+                citation_span = evidence.citation_span
+                source_chunk = citation_span.source_chunk
+                source_document = source_chunk.source_document
+                source_items[source_document.id] = ReportSourceItem(
+                    source_document_id=source_document.id,
+                    canonical_url=source_document.canonical_url,
+                    domain=source_document.domain,
+                    title=source_document.title,
+                )
+                report_evidence = ReportEvidenceItem(
+                    claim_evidence_id=evidence.id,
+                    citation_span_id=citation_span.id,
+                    source_document_id=source_document.id,
+                    source_chunk_id=source_chunk.id,
+                    relation_type=cast(EvidenceRelation, evidence.relation_type),
+                    score=evidence.score,
+                    canonical_url=source_document.canonical_url,
+                    domain=source_document.domain,
+                    chunk_no=source_chunk.chunk_no,
+                    start_offset=citation_span.start_offset,
+                    end_offset=citation_span.end_offset,
+                    excerpt=citation_span.excerpt,
+                )
+                if evidence.relation_type == "support":
+                    support_evidence.append(report_evidence)
+                elif evidence.relation_type == "contradict":
+                    contradict_evidence.append(report_evidence)
+
+            report_claims.append(
+                ReportClaimItem(
+                    claim_id=claim.id,
+                    statement=claim.statement,
+                    claim_type=claim.claim_type,
+                    confidence=claim.confidence,
+                    verification_status=cast(
+                        ClaimStatus,
+                        self._normalize_status(claim.verification_status),
+                    ),
+                    rationale=self._extract_rationale(claim),
+                    support_evidence=support_evidence,
+                    contradict_evidence=contradict_evidence,
+                )
+            )
+
+        sources = list(source_items.values())
+        return PreparedReport(
+            rendered=render_markdown_report(
+                task_id=task.id,
+                research_question=task.query,
+                revision_no=task.revision_no,
+                claims=report_claims,
+                sources=sources,
+            ),
+            claims=report_claims,
+            sources=sources,
+        )
+
+    def _artifact_matches(
+        self,
+        artifact: ReportArtifact,
+        *,
+        content_hash: str,
+        content: bytes,
+    ) -> bool:
+        if artifact.content_hash is not None and artifact.content_hash != content_hash:
+            return False
+        try:
+            latest_content = self.object_store.get_bytes(
+                bucket=artifact.storage_bucket,
+                key=artifact.storage_key,
+            )
+        except FileNotFoundError:
+            return False
+        return latest_content == content
+
+    def _build_result(
+        self,
+        *,
+        task: ResearchTask,
+        artifact: ReportArtifact,
+        rendered: RenderedMarkdownReport,
+        reused_existing: bool,
+    ) -> ReportSynthesisResult:
+        return ReportSynthesisResult(
+            task=task,
+            artifact=artifact,
+            title=rendered.title,
+            markdown=rendered.markdown,
+            reused_existing=reused_existing,
+            supported_claims=rendered.supported_count,
+            mixed_claims=rendered.mixed_count,
+            unsupported_claims=rendered.unsupported_count,
+            draft_claims=rendered.draft_count,
+        )
+
+    def _get_task(self, task_id: UUID) -> ResearchTask:
+        task = self.task_repository.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(task_id)
+        return task
+
+    def _build_storage_key(self, task_id: UUID, version: int) -> str:
+        return str(PurePosixPath(str(task_id), f"v{version}", "report.md"))
+
+    def _extract_rationale(self, claim: Claim) -> str | None:
+        verification_notes = claim.notes_json.get("verification", {})
+        rationale = verification_notes.get("rationale")
+        if isinstance(rationale, str) and rationale.strip():
+            return rationale.strip()
+        return None
+
+    def _normalize_status(self, status: str) -> str:
+        normalized_status = status.strip().lower()
+        if normalized_status in {"draft", "supported", "mixed", "unsupported"}:
+            return normalized_status
+        return "draft"
+
+
+def create_report_synthesis_service(
+    session: Session,
+    *,
+    object_store: SnapshotObjectStore,
+    report_storage_bucket: str,
+) -> ReportSynthesisService:
+    return ReportSynthesisService(
+        session,
+        task_repository=ResearchTaskRepository(session),
+        claim_repository=ClaimRepository(session),
+        claim_evidence_repository=ClaimEvidenceRepository(session),
+        report_artifact_repository=ReportArtifactRepository(session),
+        object_store=object_store,
+        report_storage_bucket=report_storage_bucket,
+    )

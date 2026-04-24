@@ -82,24 +82,39 @@ def test_upgrade_and_downgrade_apply_core_ledger_schema(
 
     run_uniques = {item["name"] for item in inspector.get_unique_constraints("research_run")}
     candidate_uniques = {item["name"] for item in inspector.get_unique_constraints("candidate_url")}
+    fetch_uniques = {item["name"] for item in inspector.get_unique_constraints("fetch_job")}
     report_uniques = {item["name"] for item in inspector.get_unique_constraints("report_artifact")}
     event_uniques = {item["name"] for item in inspector.get_unique_constraints("task_event")}
+    source_document_uniques = {
+        item["name"] for item in inspector.get_unique_constraints("source_document")
+    }
     task_indexes = {item["name"] for item in inspector.get_indexes("research_task")}
     fetch_indexes = {item["name"] for item in inspector.get_indexes("fetch_job")}
     event_indexes = {item["name"] for item in inspector.get_indexes("task_event")}
+    source_document_indexes = {item["name"] for item in inspector.get_indexes("source_document")}
     task_columns = {column["name"] for column in inspector.get_columns("research_task")}
     event_columns = {column["name"] for column in inspector.get_columns("task_event")}
+    source_document_columns = {
+        column["name"] for column in inspector.get_columns("source_document")
+    }
+    report_columns = {column["name"] for column in inspector.get_columns("report_artifact")}
 
     assert "uq_research_run_task_id_round_no" in run_uniques
     assert "uq_candidate_url_search_query_id_canonical_url" in candidate_uniques
+    assert "uq_fetch_job_candidate_url_id_mode" in fetch_uniques
     assert "uq_report_artifact_task_id_version_format" in report_uniques
     assert "uq_task_event_task_id_sequence_no" in event_uniques
+    assert "uq_source_document_content_snapshot_id" in source_document_uniques
     assert "ix_research_task_status_created_at" in task_indexes
     assert "ix_fetch_job_status_lease_until" in fetch_indexes
     assert "ix_task_event_task_id_sequence_no" in event_indexes
+    assert "ix_source_document_content_snapshot_id" in source_document_indexes
     assert "revision_no" in task_columns
     assert "last_event_sequence_no" in task_columns
     assert "sequence_no" in event_columns
+    assert "content_snapshot_id" in source_document_columns
+    assert "content_hash" in report_columns
+    assert "manifest_json" in report_columns
 
     upgraded_metadata = MetaData()
     research_task = Table("research_task", upgraded_metadata, autoload_with=upgraded_engine)

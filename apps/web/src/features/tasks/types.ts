@@ -16,6 +16,7 @@ export type {
   PipelineCounts,
   PipelineFailure,
   PipelineRunResponse,
+  ResearchTask,
   TaskEvent,
   TaskEventListResponse,
 } from '../../types/api';

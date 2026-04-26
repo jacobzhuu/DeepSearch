@@ -27,6 +27,7 @@ from packages.db.repositories import (
     SourceDocumentRepository,
 )
 from services.orchestrator.app.parsing import ParseResultReason
+from services.orchestrator.app.services import parsing as parsing_service_module
 from services.orchestrator.app.services.parsing import (
     ParsingConflictError,
     create_parsing_service,
@@ -52,6 +53,7 @@ def _seed_snapshot(
     content: bytes = DEFAULT_HTML_CONTENT,
     fetch_status: str = "SUCCEEDED",
     fetch_error_code: str | None = None,
+    store_content: bool = True,
 ) -> tuple[ContentSnapshot, SourceDocumentRepository, SourceChunkRepository]:
     task = create_research_task_service(db_session).create_task(query=query, constraints={})
     run = ResearchRunRepository(db_session).add(
@@ -107,17 +109,23 @@ def _seed_snapshot(
         )
     )
     object_store = FilesystemSnapshotObjectStore(root_directory=str(snapshot_root))
-    stored_object = object_store.put_bytes(
-        bucket="snapshots",
-        key=f"task/{task.id}/snapshot.bin",
-        content=content,
-        content_type=mime_type,
-    )
+    if store_content:
+        stored_object = object_store.put_bytes(
+            bucket="snapshots",
+            key=f"task/{task.id}/snapshot.bin",
+            content=content,
+            content_type=mime_type,
+        )
+        storage_bucket = stored_object.bucket
+        storage_key = stored_object.key
+    else:
+        storage_bucket = "snapshots"
+        storage_key = f"task/{task.id}/missing-snapshot.bin"
     content_snapshot = ContentSnapshotRepository(db_session).add(
         ContentSnapshot(
             fetch_attempt_id=fetch_attempt.id,
-            storage_bucket=stored_object.bucket,
-            storage_key=stored_object.key,
+            storage_bucket=storage_bucket,
+            storage_key=storage_key,
             content_hash="sha256:test",
             mime_type=mime_type,
             bytes=len(content),
@@ -152,6 +160,8 @@ def test_parsing_service_creates_source_document_and_chunks(
     assert result.created == 1
     assert result.updated == 0
     assert result.failed == 0
+    assert result.entries[0].decision == "parsed"
+    assert result.entries[0].body_length == len(DEFAULT_HTML_CONTENT)
     assert source_document is not None
     assert source_document.content_snapshot_id == content_snapshot.id
     assert source_document.title == "Example"
@@ -185,7 +195,141 @@ def test_parsing_service_skips_unsupported_mime_type(
     assert result.created == 0
     assert result.skipped_unsupported == 1
     assert result.entries[0].reason == ParseResultReason.UNSUPPORTED_MIME_TYPE
+    assert result.entries[0].decision == "skipped_unsupported_mime"
+    assert result.entries[0].body_length == len(b"%PDF-1.7")
     assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
+
+
+def test_parsing_service_records_empty_body_decision(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    content_snapshot, source_document_repo, _ = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        content=b"",
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    assert result.created == 0
+    assert result.failed == 0
+    assert result.entries[0].status == "SKIPPED"
+    assert result.entries[0].reason == ParseResultReason.EMPTY_EXTRACTED_TEXT
+    assert result.entries[0].decision == "skipped_empty"
+    assert result.entries[0].body_length == 0
+    assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
+
+
+def test_parsing_service_records_missing_blob_decision(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    content_snapshot, source_document_repo, _ = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        store_content=False,
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    assert result.created == 0
+    assert result.failed == 1
+    assert result.entries[0].status == "FAILED"
+    assert result.entries[0].reason == ParseResultReason.SNAPSHOT_OBJECT_MISSING
+    assert result.entries[0].decision == "missing_blob"
+    assert result.entries[0].body_length is None
+    assert "object store" in str(result.entries[0].parser_error)
+    assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
+
+
+def test_parsing_service_records_parser_exception_decision(
+    db_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content_snapshot, source_document_repo, _ = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+    )
+
+    def raise_parser_error(*, mime_type: str, content: bytes) -> object:
+        del mime_type, content
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setattr(
+        parsing_service_module,
+        "extract_parsed_content",
+        raise_parser_error,
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    assert result.created == 0
+    assert result.failed == 1
+    assert result.entries[0].reason == ParseResultReason.PARSE_ERROR
+    assert result.entries[0].decision == "parse_error"
+    assert result.entries[0].body_length == len(DEFAULT_HTML_CONTENT)
+    assert result.entries[0].parser_error == "parser exploded"
+    assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
+
+
+def test_parsing_service_short_html_with_title_creates_source_document(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    content = b"<html><head><title>SearXNG</title></head><body></body></html>"
+    content_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        canonical_url="https://searxng.org/",
+        content=content,
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    source_document = source_document_repo.get_for_content_snapshot(content_snapshot.id)
+    assert result.created == 1
+    assert result.failed == 0
+    assert result.entries[0].decision == "parsed"
+    assert result.entries[0].body_length == len(content)
+    assert source_document is not None
+    assert source_document.title == "SearXNG"
+    chunks = source_chunk_repo.list_for_document(source_document.id)
+    assert len(chunks) == 1
+    assert chunks[0].text == "SearXNG"
 
 
 def test_parsing_service_updates_existing_document_for_same_canonical_url(

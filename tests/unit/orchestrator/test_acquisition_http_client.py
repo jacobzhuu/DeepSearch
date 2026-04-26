@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from services.orchestrator.app.acquisition import HttpAcquisitionClient
 
@@ -44,10 +45,46 @@ def test_http_acquisition_client_fetches_content_and_hashes_body() -> None:
     assert result.trace["response_bytes"] == len(b"<html>ok</html>")
 
 
+def test_http_acquisition_client_records_proxy_env_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:secret@127.0.0.1:7890")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"ok",
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    fetch_client = HttpAcquisitionClient(
+        timeout_seconds=5.0,
+        max_redirects=3,
+        max_response_bytes=1024,
+        user_agent="deepresearch-tests/1.0",
+        resolver=StaticResolver("93.184.216.34"),
+        client=client,
+    )
+
+    result = fetch_client.fetch("https://example.com/report")
+
+    assert result.error_code is None
+    assert result.trace["proxy_enabled"] is True
+    assert result.trace["proxy_source"] == "env"
+    assert result.trace["proxy_env_var"] == "HTTPS_PROXY"
+    assert result.trace["proxy_url_masked"] == "http://***:***@127.0.0.1:7890"
+    assert result.trace["resolved_ips"] == ["93.184.216.34"]
+
+
 def test_http_acquisition_client_blocks_non_global_targets_before_request() -> None:
     request_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
         del request
         raise AssertionError("request should not be attempted for blocked targets")
 
@@ -57,7 +94,7 @@ def test_http_acquisition_client_blocks_non_global_targets_before_request() -> N
         max_redirects=3,
         max_response_bytes=1024,
         user_agent="deepresearch-tests/1.0",
-        resolver=StaticResolver("127.0.0.1"),
+        resolver=StaticResolver("10.0.0.8", "169.254.1.2", "::1"),
         client=client,
     )
 
@@ -68,6 +105,58 @@ def test_http_acquisition_client_blocks_non_global_targets_before_request() -> N
     assert result.error_code == "target_blocked"
     assert result.content is None
     assert result.trace["reason"] == "non_global_ip"
+    assert result.trace["decision_reason"] == "all_resolved_ips_non_global"
+    assert result.trace["allowed_ips"] == []
+    assert result.trace["blocked_ips"] == ["10.0.0.8", "169.254.1.2", "::1"]
+
+
+@pytest.mark.parametrize(
+    ("url", "addresses"),
+    (
+        ("https://en.wikipedia.org/wiki/SearXNG", ("31.13.88.169", "2001::1")),
+        (
+            "https://www.reddit.com/r/degoogle/comments/example",
+            ("199.232.161.140", "2001::1"),
+        ),
+    ),
+)
+def test_http_acquisition_client_allows_public_domain_with_non_global_dns_warning(
+    url: str,
+    addresses: tuple[str, ...],
+) -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"public response",
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    fetch_client = HttpAcquisitionClient(
+        timeout_seconds=5.0,
+        max_redirects=3,
+        max_response_bytes=1024,
+        user_agent="deepresearch-tests/1.0",
+        resolver=StaticResolver(*addresses),
+        client=client,
+    )
+
+    result = fetch_client.fetch(url)
+
+    assert request_count == 1
+    assert result.http_status == 200
+    assert result.error_code is None
+    assert result.content == b"public response"
+    assert result.trace["resolved_ips"] == list(addresses)
+    assert result.trace["allowed_ips"] == [addresses[0]]
+    assert result.trace["blocked_ips"] == ["2001::1"]
+    assert result.trace["decision_reason"] == "public_ip_present_with_non_global_dns_answers"
+    assert "non-global IPs" in result.trace["safety_warning"]
 
 
 def test_http_acquisition_client_limits_redirects() -> None:

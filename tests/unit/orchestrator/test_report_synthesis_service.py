@@ -131,6 +131,85 @@ def test_get_latest_report_detects_content_hash_mismatch(
         service.get_latest_markdown_report(seeded.task_id)
 
 
+def test_report_synthesis_filters_bad_claims_and_short_evidence(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="Explain OpenAI",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://example.com/weak",
+            domain="example.com",
+            title="Weak source",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=None,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=None,
+        )
+    )
+    weak_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text="C",
+            token_count=1,
+            metadata_json={"strategy": "paragraph_window_v1"},
+        )
+    )
+    bad_claim = Claim(
+        task_id=task.id,
+        statement="Data",
+        claim_type="fact",
+        confidence=0.9,
+        verification_status="supported",
+        notes_json={"verification": {"rationale": "Found 1 support evidence."}},
+    )
+    db_session.add(bad_claim)
+    db_session.flush()
+    weak_span = CitationSpan(
+        source_chunk_id=weak_chunk.id,
+        start_offset=0,
+        end_offset=1,
+        excerpt="C",
+        normalized_excerpt_hash="sha256:weak",
+    )
+    db_session.add(weak_span)
+    db_session.flush()
+    db_session.add(
+        ClaimEvidence(
+            claim_id=bad_claim.id,
+            citation_span_id=weak_span.id,
+            relation_type="support",
+            score=0.9,
+        )
+    )
+    db_session.commit()
+
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = service.generate_markdown_report(task.id)
+
+    assert result.supported_claims == 0
+    assert "Data" not in result.markdown
+    assert 'excerpt: "C"' not in result.markdown
+
+
 class SeededReportClaims:
     def __init__(self, task_id: UUID) -> None:
         self.task_id = task_id
@@ -178,10 +257,19 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
             metadata_json={"strategy": "paragraph_window_v1"},
         )
     )
-    unsupported_chunk = source_chunk_repo.add(
+    mixed_support_chunk = source_chunk_repo.add(
         SourceChunk(
             source_document_id=source_document.id,
             chunk_no=2,
+            text="The mixed claim remains under dispute according to this source.",
+            token_count=10,
+            metadata_json={"strategy": "paragraph_window_v1"},
+        )
+    )
+    unsupported_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=3,
             text="This unsupported claim is contradicted by the source document.",
             token_count=11,
             metadata_json={"strategy": "paragraph_window_v1"},
@@ -229,10 +317,10 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
         normalized_excerpt_hash="sha256:support",
     )
     mixed_support_span = CitationSpan(
-        source_chunk_id=support_chunk.id,
+        source_chunk_id=mixed_support_chunk.id,
         start_offset=0,
-        end_offset=24,
-        excerpt=support_chunk.text[:24],
+        end_offset=len(mixed_support_chunk.text),
+        excerpt=mixed_support_chunk.text,
         normalized_excerpt_hash="sha256:mixed-support",
     )
     mixed_contradict_span = CitationSpan(

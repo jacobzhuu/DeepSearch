@@ -19,9 +19,12 @@ from services.orchestrator.app.claims import (
     CLAIM_EVIDENCE_RELATION_SUPPORT,
     CLAIM_TYPE_FACT,
     CLAIM_VERIFICATION_STATUS_DRAFT,
+    CitationSpanValidationError,
     build_verification_rationale,
     compute_claim_confidence,
     draft_claim_statement,
+    is_claimable_statement,
+    normalize_claim_identity,
     normalized_excerpt_hash,
     resolve_verification_status,
     select_supporting_span,
@@ -191,17 +194,29 @@ class ClaimDraftingService:
         created_claim_evidence = 0
         reused_claim_evidence = 0
         entries: list[DraftClaimEntry] = []
+        claims_by_identity = {
+            normalize_claim_identity(claim.statement): claim
+            for claim in self.claim_repository.list_for_task(task.id)
+        }
 
         for source_chunk, retrieval_score in selected_chunks:
-            supporting_span = select_supporting_span(source_chunk.text, effective_query)
+            try:
+                supporting_span = select_supporting_span(source_chunk.text, effective_query)
+            except CitationSpanValidationError:
+                continue
             statement = draft_claim_statement(supporting_span.excerpt)
+            if not is_claimable_statement(statement, query=effective_query):
+                continue
             confidence = compute_claim_confidence(
                 query=effective_query,
                 statement=statement,
                 retrieval_score=retrieval_score,
             )
 
-            claim = self.claim_repository.get_for_task_statement(task.id, statement)
+            claim_identity = normalize_claim_identity(statement)
+            claim = claims_by_identity.get(
+                claim_identity
+            ) or self.claim_repository.get_for_task_statement(task.id, statement)
             reused_claim = claim is not None
             if claim is None:
                 claim = self.claim_repository.add(
@@ -221,6 +236,7 @@ class ClaimDraftingService:
                         },
                     )
                 )
+                claims_by_identity[claim_identity] = claim
                 created_claims += 1
             else:
                 reused_claims += 1

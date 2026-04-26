@@ -29,6 +29,11 @@ Close out the current v1 candidate around the primary host-local / self-hosted L
   - health checks
   - shutdown
   - troubleshooting
+- post-MVP hardening for the completed host-local loop:
+  - SearXNG endpoint validation and structured diagnostics
+  - task-event/task-detail visibility for search results, selected sources, fetch failures, and low-source warnings
+  - deterministic filtering of weak claim and citation material before new claims or regenerated reports
+  - report page Raw Markdown, Copy Markdown, and Download `.md` controls
 - updated architecture, API, schema, and ExecPlan documentation
 
 ## Explicitly excluded

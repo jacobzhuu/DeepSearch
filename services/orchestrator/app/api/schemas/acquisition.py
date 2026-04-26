@@ -23,6 +23,7 @@ class AcquisitionEntryResponse(BaseModel):
     status: str
     http_status: int | None
     error_code: str | None
+    error_reason: str | None = None
     skipped_existing: bool
 
 
@@ -46,6 +47,7 @@ class FetchJobResponse(BaseModel):
     latest_attempt_no: int | None
     latest_http_status: int | None
     latest_error_code: str | None
+    latest_error_reason: str | None = None
     snapshot_id: UUID | None
 
 

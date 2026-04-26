@@ -123,6 +123,11 @@ def run_task_acquisition(
                 error_code=(
                     entry.fetch_attempt.error_code if entry.fetch_attempt is not None else None
                 ),
+                error_reason=(
+                    _fetch_error_reason(entry.fetch_attempt.trace_json)
+                    if entry.fetch_attempt is not None
+                    else None
+                ),
                 skipped_existing=entry.skipped_existing,
             )
             for entry in result.entries
@@ -164,6 +169,11 @@ def list_task_fetch_jobs(
                 latest_error_code=(
                     entry.latest_attempt.error_code if entry.latest_attempt is not None else None
                 ),
+                latest_error_reason=(
+                    _fetch_error_reason(entry.latest_attempt.trace_json)
+                    if entry.latest_attempt is not None
+                    else None
+                ),
                 snapshot_id=(
                     entry.content_snapshot.id if entry.content_snapshot is not None else None
                 ),
@@ -171,6 +181,21 @@ def list_task_fetch_jobs(
             for entry in fetch_jobs
         ],
     )
+
+
+def _fetch_error_reason(trace: dict[str, object] | None) -> str | None:
+    if not isinstance(trace, dict):
+        return None
+    for key in ("message", "reason"):
+        value = trace.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    storage_error = trace.get("storage_error")
+    if isinstance(storage_error, dict):
+        value = storage_error.get("message")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 @router.get("/{task_id}/fetch-attempts", response_model=FetchAttemptListResponse)

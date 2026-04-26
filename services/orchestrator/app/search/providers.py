@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from json import JSONDecodeError
 from typing import Any, Protocol
 
 import httpx
+
+from packages.observability import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,35 @@ class SearchProvider(Protocol):
     name: str
 
     def search(self, request: SearchRequest) -> SearchResponse: ...
+
+
+class SearchProviderError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        reason: str,
+        message: str,
+        status_code: int | None,
+        content_type: str | None,
+        body_preview: str | None,
+        unresponsive_engines: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.status_code = status_code
+        self.content_type = content_type
+        self.body_preview = body_preview
+        self.unresponsive_engines = unresponsive_engines
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "message": str(self),
+            "status": self.status_code,
+            "content_type": self.content_type,
+            "body_preview": self.body_preview,
+            "unresponsive_engines": self.unresponsive_engines,
+        }
 
 
 class SmokeSearchProvider:
@@ -152,18 +186,206 @@ class SearXNGSearchProvider:
                 "request_params": request_params,
                 "number_of_results": payload.get("number_of_results"),
                 "query_correction": payload.get("query_correction"),
+                "unresponsive_engines": _normalize_unresponsive_engines(
+                    payload.get("unresponsive_engines")
+                ),
             },
         )
 
     def _perform_request(self, params: dict[str, str | int]) -> dict[str, Any]:
         if self.client is not None:
             response = self.client.get(f"{self.base_url}/search", params=params)
-            response.raise_for_status()
-            payload = response.json()
-            return payload if isinstance(payload, dict) else {}
+            return self._validate_endpoint_response(response)
 
         with httpx.Client(timeout=self.timeout_seconds, trust_env=False) as client:
             response = client.get(f"{self.base_url}/search", params=params)
-            response.raise_for_status()
+            return self._validate_endpoint_response(response)
+
+    def _validate_endpoint_response(self, response: httpx.Response) -> dict[str, Any]:
+        content_type = response.headers.get("content-type", "")
+        body_preview = _body_preview(response)
+        unresponsive_engines: list[str] = []
+
+        if response.status_code == 403:
+            self._log_endpoint_response(
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+                level="warning",
+            )
+            raise SearchProviderError(
+                reason="searxng_http_forbidden",
+                message=(
+                    "SearXNG returned HTTP 403 Forbidden. Check endpoint access, rate limits, "
+                    "engine CAPTCHA, or reverse-proxy rules."
+                ),
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+            )
+
+        if response.status_code >= 400:
+            self._log_endpoint_response(
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+                level="warning",
+            )
+            raise SearchProviderError(
+                reason="searxng_http_error",
+                message=f"SearXNG returned HTTP {response.status_code}.",
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+            )
+
+        if _looks_like_html_response(content_type=content_type, body_preview=body_preview):
+            self._log_endpoint_response(
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+                level="warning",
+            )
+            raise SearchProviderError(
+                reason="searxng_html_response",
+                message=(
+                    "SearXNG endpoint returned HTML instead of JSON. Point SEARXNG_BASE_URL "
+                    "at a SearXNG-compatible /search?format=json endpoint, not the web UI or "
+                    "frontend server."
+                ),
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+            )
+
+        try:
             payload = response.json()
-            return payload if isinstance(payload, dict) else {}
+        except (JSONDecodeError, ValueError) as error:
+            self._log_endpoint_response(
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+                level="warning",
+            )
+            raise SearchProviderError(
+                reason="searxng_invalid_json",
+                message=f"SearXNG response was not valid JSON: {error}",
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+            ) from error
+
+        if not isinstance(payload, dict):
+            self._log_endpoint_response(
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+                level="warning",
+            )
+            raise SearchProviderError(
+                reason="searxng_invalid_json_shape",
+                message="SearXNG JSON response was not an object.",
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+            )
+
+        unresponsive_engines = _normalize_unresponsive_engines(payload.get("unresponsive_engines"))
+        raw_results = payload.get("results")
+        if unresponsive_engines and (not isinstance(raw_results, list) or not raw_results):
+            self._log_endpoint_response(
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+                level="warning",
+            )
+            raise SearchProviderError(
+                reason="searxng_empty_results_with_unresponsive_engines",
+                message=(
+                    "SearXNG returned no results and reported unresponsive engines: "
+                    f"{', '.join(unresponsive_engines)}."
+                ),
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=unresponsive_engines,
+            )
+
+        self._log_endpoint_response(
+            status_code=response.status_code,
+            content_type=content_type,
+            body_preview=body_preview,
+            unresponsive_engines=unresponsive_engines,
+            level="warning" if unresponsive_engines else "info",
+        )
+        return payload
+
+    def _log_endpoint_response(
+        self,
+        *,
+        status_code: int,
+        content_type: str,
+        body_preview: str,
+        unresponsive_engines: list[str],
+        level: str,
+    ) -> None:
+        log_method = logger.warning if level == "warning" else logger.info
+        log_method(
+            "search.searxng.response",
+            extra={
+                "SEARCH_PROVIDER": self.name,
+                "SEARXNG_BASE_URL": self.base_url,
+                "status": status_code,
+                "content_type": content_type,
+                "body_preview": body_preview,
+                "unresponsive_engines": unresponsive_engines,
+            },
+        )
+
+
+def _body_preview(response: httpx.Response) -> str:
+    return response.text[:300]
+
+
+def _looks_like_html_response(*, content_type: str, body_preview: str) -> bool:
+    normalized_type = content_type.lower()
+    if "text/html" in normalized_type:
+        return True
+    stripped_preview = body_preview.lstrip().lower()
+    return stripped_preview.startswith("<!doctype html") or stripped_preview.startswith("<html")
+
+
+def _normalize_unresponsive_engines(raw_value: Any) -> list[str]:
+    if not isinstance(raw_value, list):
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_value:
+        if isinstance(item, str):
+            engine = item.strip()
+        elif isinstance(item, list | tuple) and item:
+            raw_engine = item[0]
+            engine = raw_engine.strip() if isinstance(raw_engine, str) else ""
+        elif isinstance(item, dict):
+            raw_engine = item.get("engine") or item.get("name")
+            engine = raw_engine.strip() if isinstance(raw_engine, str) else ""
+        else:
+            engine = ""
+
+        if not engine or engine in seen:
+            continue
+        normalized.append(engine)
+        seen.add(engine)
+    return normalized

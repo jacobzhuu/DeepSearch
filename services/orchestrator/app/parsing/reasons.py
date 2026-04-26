@@ -9,6 +9,7 @@ class ParseResultReason(StrEnum):
     SNAPSHOT_OBJECT_MISSING = "snapshot_object_missing"
     UNSUPPORTED_MIME_TYPE = "unsupported_mime_type"
     EMPTY_EXTRACTED_TEXT = "empty_extracted_text"
+    PARSE_ERROR = "parse_error"
 
 
 PARSE_RESULT_REASON_VALUES = tuple(reason.value for reason in ParseResultReason)

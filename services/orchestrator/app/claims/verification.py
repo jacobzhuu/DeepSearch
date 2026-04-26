@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from services.orchestrator.app.claims.drafting import (
     CLAIM_EVIDENCE_RELATION_SUPPORT,
     CitationSpanValidationError,
+    is_claimable_excerpt,
     iter_supporting_spans,
     validate_citation_span,
 )
@@ -42,6 +43,8 @@ def select_verification_span(source_text: str, statement: str) -> VerificationSp
 
     best_match: tuple[tuple[float, float, float, int], VerificationSpanMatch] | None = None
     for span in iter_supporting_spans(source_text):
+        if not is_claimable_excerpt(span.excerpt):
+            continue
         classified = _classify_relation(statement=normalized_statement, excerpt=span.excerpt)
         if classified is None:
             continue

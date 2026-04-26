@@ -26,6 +26,7 @@ class PipelineFailureResponse(BaseModel):
     message: str
     next_action: str
     counts: PipelineCountsResponse
+    details: dict[str, Any] | None = None
 
 
 class PipelineRunResponse(BaseModel):

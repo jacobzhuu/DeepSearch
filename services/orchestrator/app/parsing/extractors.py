@@ -36,6 +36,8 @@ def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
         parser.close()
         text = _normalize_plain_text("".join(parser.text_parts))
         title = _normalize_single_line("".join(parser.title_parts))
+        if not text and title:
+            text = title
         return ParsedContent(
             text=text,
             title=title or None,

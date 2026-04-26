@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from services.orchestrator.app.search import (
+    SearchProviderError,
     SearchRequest,
     SearXNGSearchProvider,
     SimpleQueryExpansionStrategy,
@@ -76,6 +77,7 @@ def test_searxng_provider_parses_results_and_tracks_request_params() -> None:
             json={
                 "number_of_results": 2,
                 "query_correction": ["nvidia open source model"],
+                "unresponsive_engines": [["duckduckgo", "timeout"]],
                 "results": [
                     {
                         "url": "https://example.com/a?utm_source=x&id=1",
@@ -122,6 +124,87 @@ def test_searxng_provider_parses_results_and_tracks_request_params() -> None:
     assert response.results[0].metadata["category"] == "general"
     assert response.metadata["request_params"]["engines"] == "google,bing"
     assert response.metadata["number_of_results"] == 2
+    assert response.metadata["unresponsive_engines"] == ["duckduckgo"]
+
+
+def test_searxng_provider_rejects_html_response() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                text="<html><body>not json</body></html>",
+                request=request,
+            )
+        )
+    )
+    provider = SearXNGSearchProvider(
+        base_url="http://searxng.test",
+        timeout_seconds=5.0,
+        client=client,
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        provider.search(SearchRequest(query_text="openai", language=None, limit=10))
+
+    assert exc_info.value.reason == "searxng_html_response"
+    assert exc_info.value.status_code == 200
+    assert exc_info.value.content_type == "text/html; charset=utf-8"
+    assert "not json" in (exc_info.value.body_preview or "")
+
+
+def test_searxng_provider_rejects_403_response() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                403,
+                headers={"content-type": "text/plain"},
+                text="Forbidden",
+                request=request,
+            )
+        )
+    )
+    provider = SearXNGSearchProvider(
+        base_url="http://searxng.test",
+        timeout_seconds=5.0,
+        client=client,
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        provider.search(SearchRequest(query_text="openai", language=None, limit=10))
+
+    assert exc_info.value.reason == "searxng_http_forbidden"
+    assert exc_info.value.status_code == 403
+    assert "Forbidden" in (exc_info.value.body_preview or "")
+
+
+def test_searxng_provider_rejects_empty_results_with_unresponsive_engines() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "results": [],
+                    "unresponsive_engines": [
+                        ["google", "CAPTCHA"],
+                        {"engine": "bing", "error": "too many requests"},
+                    ],
+                },
+                request=request,
+            )
+        )
+    )
+    provider = SearXNGSearchProvider(
+        base_url="http://searxng.test",
+        timeout_seconds=5.0,
+        client=client,
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        provider.search(SearchRequest(query_text="openai", language=None, limit=10))
+
+    assert exc_info.value.reason == "searxng_empty_results_with_unresponsive_engines"
+    assert exc_info.value.unresponsive_engines == ["google", "bing"]
 
 
 def test_searxng_provider_disables_environment_proxy_lookup_for_internal_client(

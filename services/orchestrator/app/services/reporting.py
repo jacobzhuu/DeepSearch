@@ -15,6 +15,7 @@ from packages.db.repositories import (
     ResearchTaskRepository,
 )
 from packages.observability import get_logger, record_report_result
+from services.orchestrator.app.claims import is_claimable_excerpt, is_claimable_statement
 from services.orchestrator.app.reporting import (
     ClaimStatus,
     EvidenceRelation,
@@ -225,18 +226,16 @@ class ReportSynthesisService:
         report_claims: list[ReportClaimItem] = []
         source_items: dict[UUID, ReportSourceItem] = {}
         for claim in claims:
+            if not is_claimable_statement(claim.statement, query=task.query):
+                continue
             support_evidence: list[ReportEvidenceItem] = []
             contradict_evidence: list[ReportEvidenceItem] = []
             for evidence in evidence_by_claim_id.get(claim.id, []):
                 citation_span = evidence.citation_span
+                if not is_claimable_excerpt(citation_span.excerpt):
+                    continue
                 source_chunk = citation_span.source_chunk
                 source_document = source_chunk.source_document
-                source_items[source_document.id] = ReportSourceItem(
-                    source_document_id=source_document.id,
-                    canonical_url=source_document.canonical_url,
-                    domain=source_document.domain,
-                    title=source_document.title,
-                )
                 report_evidence = ReportEvidenceItem(
                     claim_evidence_id=evidence.id,
                     citation_span_id=citation_span.id,
@@ -253,8 +252,24 @@ class ReportSynthesisService:
                 )
                 if evidence.relation_type == "support":
                     support_evidence.append(report_evidence)
+                    source_items[source_document.id] = ReportSourceItem(
+                        source_document_id=source_document.id,
+                        canonical_url=source_document.canonical_url,
+                        domain=source_document.domain,
+                        title=source_document.title,
+                    )
                 elif evidence.relation_type == "contradict":
                     contradict_evidence.append(report_evidence)
+                    source_items[source_document.id] = ReportSourceItem(
+                        source_document_id=source_document.id,
+                        canonical_url=source_document.canonical_url,
+                        domain=source_document.domain,
+                        title=source_document.title,
+                    )
+
+            normalized_status = self._normalize_status(claim.verification_status)
+            if normalized_status in {"supported", "mixed"} and not support_evidence:
+                normalized_status = "unsupported"
 
             report_claims.append(
                 ReportClaimItem(
@@ -262,10 +277,7 @@ class ReportSynthesisService:
                     statement=claim.statement,
                     claim_type=claim.claim_type,
                     confidence=claim.confidence,
-                    verification_status=cast(
-                        ClaimStatus,
-                        self._normalize_status(claim.verification_status),
-                    ),
+                    verification_status=cast(ClaimStatus, normalized_status),
                     rationale=self._extract_rationale(claim),
                     support_evidence=support_evidence,
                     contradict_evidence=contradict_evidence,

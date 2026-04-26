@@ -51,6 +51,10 @@ class Settings(BaseSettings):
         default=5,
         validation_alias="ACQUISITION_MAX_CANDIDATES_PER_REQUEST",
     )
+    acquisition_target_successful_snapshots: int = Field(
+        default=2,
+        validation_alias="ACQUISITION_TARGET_SUCCESSFUL_SNAPSHOTS",
+    )
     acquisition_user_agent: str = Field(
         default="deepresearch-orchestrator/0.1",
         validation_alias="ACQUISITION_USER_AGENT",

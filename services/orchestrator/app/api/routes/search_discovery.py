@@ -19,6 +19,7 @@ from services.orchestrator.app.db import get_db_session
 from services.orchestrator.app.search import (
     QueryExpansionStrategy,
     SearchProvider,
+    SearchProviderError,
     SearXNGSearchProvider,
     SimpleQueryExpansionStrategy,
     SmokeSearchProvider,
@@ -100,6 +101,18 @@ def discover_task_searches(task_id: UUID, service: ServiceDep) -> SearchDiscover
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
     except SearchDiscoveryConflictError as error:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+    except SearchProviderError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "failed_stage": "SEARCHING",
+                **error.to_payload(),
+                "next_action": (
+                    "Verify SEARCH_PROVIDER and SEARXNG_BASE_URL. The endpoint must return "
+                    "SearXNG JSON from /search?format=json."
+                ),
+            },
+        ) from error
 
     return SearchDiscoveryResponse(
         task_id=result.task.id,

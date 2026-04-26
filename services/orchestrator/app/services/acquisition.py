@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -59,6 +60,9 @@ class AcquisitionLedgerEntry:
 @dataclass(frozen=True)
 class AcquisitionBatchResult:
     task: ResearchTask
+    selected_candidates_from_search: list[CandidateUrl]
+    selected_candidates_for_fetch: list[CandidateUrl]
+    unattempted_candidates: list[CandidateUrl]
     entries: list[AcquisitionLedgerEntry]
     created: int
     skipped_existing: int
@@ -107,6 +111,7 @@ class AcquisitionService:
         *,
         candidate_url_ids: list[UUID] | None,
         limit: int | None,
+        target_successful_snapshots: int | None = None,
     ) -> AcquisitionBatchResult:
         task = self._get_task(task_id)
         if task.status not in self.allowed_statuses:
@@ -116,26 +121,38 @@ class AcquisitionService:
         if limit is not None:
             effective_limit = min(limit, self.max_candidates_per_request)
 
-        selected_candidates = self._select_candidates(
+        selected_candidates_from_search = self._select_candidates(
             task.id,
             candidate_url_ids=candidate_url_ids,
-            limit=effective_limit,
+        )
+        selected_candidates_for_fetch = (
+            selected_candidates_from_search
+            if candidate_url_ids is not None
+            else _sort_candidates_for_fetch(selected_candidates_from_search)
+        )
+        success_target = (
+            max(target_successful_snapshots, 1) if target_successful_snapshots is not None else None
         )
 
         entries: list[AcquisitionLedgerEntry] = []
+        attempted_candidate_ids: set[UUID] = set()
         created = 0
         skipped_existing = 0
         succeeded = 0
         failed = 0
+        successful_snapshots = 0
 
-        for candidate_url in selected_candidates:
-            if candidate_url_ids is None and created >= effective_limit:
+        for candidate_url in selected_candidates_for_fetch:
+            if created >= effective_limit:
+                break
+            if success_target is not None and successful_snapshots >= success_target:
                 break
             existing_job = self.fetch_job_repository.get_for_candidate_mode(
                 candidate_url.id,
                 FETCH_MODE_HTTP,
             )
             if existing_job is not None:
+                attempted_candidate_ids.add(candidate_url.id)
                 latest_attempt = self.fetch_attempt_repository.get_latest_for_job(existing_job.id)
                 content_snapshot = None
                 if latest_attempt is not None:
@@ -152,15 +169,26 @@ class AcquisitionService:
                     )
                 )
                 skipped_existing += 1
+                if content_snapshot is not None:
+                    successful_snapshots += 1
                 continue
 
             entry = self._execute_candidate_fetch(task, candidate_url)
+            attempted_candidate_ids.add(candidate_url.id)
             entries.append(entry)
             created += 1
             if entry.fetch_job.status == FETCH_STATUS_SUCCEEDED:
                 succeeded += 1
+                if entry.content_snapshot is not None:
+                    successful_snapshots += 1
             else:
                 failed += 1
+
+        unattempted_candidates = [
+            candidate_url
+            for candidate_url in selected_candidates_for_fetch
+            if candidate_url.id not in attempted_candidate_ids
+        ]
 
         record_fetch_results(
             created=created,
@@ -180,6 +208,9 @@ class AcquisitionService:
         )
         return AcquisitionBatchResult(
             task=task,
+            selected_candidates_from_search=selected_candidates_from_search,
+            selected_candidates_for_fetch=selected_candidates_for_fetch,
+            unattempted_candidates=unattempted_candidates,
             entries=entries,
             created=created,
             skipped_existing=skipped_existing,
@@ -342,7 +373,6 @@ class AcquisitionService:
         task_id: UUID,
         *,
         candidate_url_ids: list[UUID] | None,
-        limit: int,
     ) -> list[CandidateUrl]:
         task_candidates = self.candidate_url_repository.list_for_task(task_id)
         candidates_by_id = {candidate.id: candidate for candidate in task_candidates}
@@ -358,7 +388,7 @@ class AcquisitionService:
                     raise CandidateUrlNotFoundError(task_id, candidate_url_id)
                 selected_candidates.append(candidate)
                 seen_candidate_ids.add(candidate_url_id)
-            return selected_candidates[:limit]
+            return selected_candidates
 
         return task_candidates
 
@@ -398,3 +428,77 @@ def _merge_trace(original_trace: dict[str, Any], patch: dict[str, Any]) -> dict[
     merged_trace = dict(original_trace)
     merged_trace.update(patch)
     return merged_trace
+
+
+def _sort_candidates_for_fetch(candidates: list[CandidateUrl]) -> list[CandidateUrl]:
+    return sorted(candidates, key=_fetch_priority_key)
+
+
+def _fetch_priority_key(candidate_url: CandidateUrl) -> tuple[int, int, str]:
+    return (
+        _fetch_priority_score(candidate_url),
+        candidate_url.rank,
+        str(candidate_url.id),
+    )
+
+
+def _fetch_priority_score(candidate_url: CandidateUrl) -> int:
+    domain = (candidate_url.domain or "").strip().lower().removeprefix("www.")
+    parsed = urlsplit(candidate_url.canonical_url)
+    path = parsed.path.strip().lower()
+    title = (candidate_url.title or "").strip().lower()
+
+    if _is_social_video_or_forum_domain(domain):
+        return 90
+    if domain == "github.com":
+        return 80
+    if _is_docs_like(domain=domain, path=path, title=title):
+        return 0
+    if _is_project_homepage(domain=domain, path=path):
+        return 10
+    if domain.endswith("wikipedia.org"):
+        return 20
+    return 50
+
+
+def _is_docs_like(*, domain: str, path: str, title: str) -> bool:
+    if domain.startswith("docs.") or domain.startswith("documentation."):
+        return True
+    docs_markers = (
+        "/docs",
+        "/doc/",
+        "/documentation",
+        "/guide",
+        "/guides",
+        "/manual",
+        "/reference",
+    )
+    if any(marker in path for marker in docs_markers):
+        return True
+    return "documentation" in title or "docs" in title
+
+
+def _is_project_homepage(*, domain: str, path: str) -> bool:
+    if not domain or domain.endswith("wikipedia.org"):
+        return False
+    normalized_path = path.rstrip("/")
+    return normalized_path in {"", "/"}
+
+
+def _is_social_video_or_forum_domain(domain: str) -> bool:
+    social_video_forum_domains = (
+        "reddit.com",
+        "youtube.com",
+        "youtu.be",
+        "x.com",
+        "twitter.com",
+        "facebook.com",
+        "instagram.com",
+        "tiktok.com",
+        "medium.com",
+        "news.ycombinator.com",
+        "stackoverflow.com",
+        "stackexchange.com",
+        "quora.com",
+    )
+    return any(domain == item or domain.endswith(f".{item}") for item in social_video_forum_domains)

@@ -23,10 +23,11 @@ from packages.db.repositories import (
     TaskEventRepository,
 )
 from services.orchestrator.app.indexing import IndexedChunkPage
+from services.orchestrator.app.search import SearchProviderError
 from services.orchestrator.app.services.acquisition import AcquisitionService
 from services.orchestrator.app.services.claims import ClaimDraftingService
 from services.orchestrator.app.services.indexing import IndexingService
-from services.orchestrator.app.services.parsing import ParsingService
+from services.orchestrator.app.services.parsing import ParsingService, parse_entry_diagnostic
 from services.orchestrator.app.services.reporting import ReportSynthesisService
 from services.orchestrator.app.services.research_tasks import (
     TaskNotFoundError,
@@ -58,6 +59,7 @@ PARSING_ALLOWED_STATUSES = ("PLANNED", STAGE_PARSING)
 INDEXING_ALLOWED_STATUSES = ("PLANNED", STAGE_INDEXING)
 DRAFT_ALLOWED_STATUSES = ("PLANNED", STAGE_DRAFTING_CLAIMS)
 VERIFY_ALLOWED_STATUSES = ("PLANNED", STAGE_VERIFYING)
+MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD = 2
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class DebugPipelineFailure:
     message: str
     next_action: str
     counts: DebugPipelineCounts
+    details: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -98,8 +101,9 @@ class DebugPipelineResult:
 
 
 class DebugPipelinePreconditionError(Exception):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
+        self.details = details
 
 
 class DebugRealPipelineRunner:
@@ -120,6 +124,7 @@ class DebugRealPipelineRunner:
         claim_limit: int = 5,
         event_source: str = PIPELINE_EVENT_SOURCE,
         event_prefix: str = PIPELINE_EVENT_PREFIX,
+        target_successful_snapshots: int = MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD,
     ) -> None:
         self.session = session
         self.search_service = search_service
@@ -135,6 +140,7 @@ class DebugRealPipelineRunner:
         self.claim_limit = claim_limit
         self.event_source = event_source
         self.event_prefix = event_prefix
+        self.target_successful_snapshots = target_successful_snapshots
         self.task_repository = ResearchTaskRepository(session)
         self.event_repository = TaskEventRepository(session)
 
@@ -174,6 +180,7 @@ class DebugRealPipelineRunner:
                     message=str(error),
                     next_action=_next_action_for_failure(stage=stage, error=error),
                     counts=counts,
+                    details=getattr(error, "details", None),
                 )
                 self._record_failure(task.id, failure)
                 refreshed_task = self._get_task(task.id)
@@ -213,9 +220,36 @@ class DebugRealPipelineRunner:
         result = self.search_service.discover_candidates(task_id)
         if not result.candidate_urls:
             raise DebugPipelinePreconditionError("search produced no candidate URLs")
+        search_queries = []
+        search_result_count = 0
+        for item in result.search_queries:
+            raw_payload = item.search_query.raw_response_json or {}
+            result_count = raw_payload.get("result_count", 0)
+            if not isinstance(result_count, int):
+                result_count = 0
+            search_result_count += result_count
+            search_queries.append(
+                {
+                    "search_query_id": str(item.search_query.id),
+                    "query_text": item.search_query.query_text,
+                    "provider": item.search_query.provider,
+                    "result_count": result_count,
+                    "candidates_added": item.candidates_added,
+                    "duplicates_skipped": item.duplicates_skipped,
+                    "filtered_out": item.filtered_out,
+                    "unresponsive_engines": raw_payload.get("response_metadata", {}).get(
+                        "unresponsive_engines", []
+                    ),
+                }
+            )
         return {
-            "search_queries": len(result.search_queries),
+            "search_queries": search_queries,
+            "search_query_count": len(result.search_queries),
+            "search_result_count": search_result_count,
             "candidate_urls_added": len(result.candidate_urls),
+            "selected_sources": [
+                _candidate_url_summary(candidate_url) for candidate_url in result.candidate_urls
+            ],
             "duplicates_skipped": result.duplicates_skipped,
             "filtered_out": result.filtered_out,
         }
@@ -225,15 +259,22 @@ class DebugRealPipelineRunner:
             task_id,
             candidate_url_ids=None,
             limit=self.fetch_limit,
+            target_successful_snapshots=self.target_successful_snapshots,
         )
-        if result.succeeded <= 0:
-            raise DebugPipelinePreconditionError("fetch produced no successful content snapshots")
-        return {
-            "created": result.created,
-            "skipped_existing": result.skipped_existing,
-            "succeeded": result.succeeded,
-            "failed": result.failed,
-        }
+        stage_result = _acquisition_stage_result(result)
+        if stage_result["fetch_succeeded"] <= 0:
+            raise DebugPipelinePreconditionError(
+                "fetch produced no successful content snapshots",
+                details=stage_result,
+            )
+        warnings = []
+        if stage_result["fetch_succeeded"] < MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD:
+            warnings.append(
+                "fetch succeeded for fewer than 2 sources; the MVP flow continues, but report "
+                "coverage may be weak."
+            )
+        stage_result["warnings"] = warnings
+        return stage_result
 
     def _run_parse(self, task_id: UUID) -> dict[str, Any]:
         result = self.parsing_service.parse_snapshots(
@@ -241,15 +282,21 @@ class DebugRealPipelineRunner:
             content_snapshot_ids=None,
             limit=self.parse_limit,
         )
-        if result.created + result.updated + result.skipped_existing <= 0:
-            raise DebugPipelinePreconditionError("parse produced no source documents")
-        return {
+        parse_decisions = [parse_entry_diagnostic(entry) for entry in result.entries]
+        stage_result = {
             "created": result.created,
             "updated": result.updated,
             "skipped_existing": result.skipped_existing,
             "skipped_unsupported": result.skipped_unsupported,
             "failed": result.failed,
+            "parse_decisions": parse_decisions,
         }
+        if result.created + result.updated + result.skipped_existing <= 0:
+            raise DebugPipelinePreconditionError(
+                _format_parse_no_documents_message(parse_decisions),
+                details=stage_result,
+            )
+        return stage_result
 
     def _run_index(self, task_id: UUID) -> dict[str, Any]:
         result = self.indexing_service.index_source_chunks(
@@ -378,6 +425,7 @@ class DebugRealPipelineRunner:
                 "stage": stage,
                 "result": _json_safe(stage_result),
                 "counts": _counts_to_dict(self._safe_counts(task_id)),
+                "warnings": _stage_warnings(stage_result),
             },
         )
         self.session.commit()
@@ -397,6 +445,7 @@ class DebugRealPipelineRunner:
                 "message": failure.message,
                 "next_action": failure.next_action,
                 "counts": _counts_to_dict(failure.counts),
+                "details": _json_safe(failure.details) if failure.details is not None else None,
             },
         )
         self.session.commit()
@@ -481,9 +530,168 @@ def _counts_to_dict(counts: DebugPipelineCounts) -> dict[str, int]:
     }
 
 
+def _candidate_url_summary(candidate_url: Any) -> dict[str, Any]:
+    return {
+        "candidate_url_id": str(candidate_url.id),
+        "canonical_url": candidate_url.canonical_url,
+        "domain": candidate_url.domain,
+        "title": candidate_url.title,
+        "rank": candidate_url.rank,
+    }
+
+
+def _fetch_entry_summary(entry: Any) -> dict[str, Any]:
+    attempt = entry.fetch_attempt
+    trace = attempt.trace_json if attempt is not None else {}
+    if not isinstance(trace, dict):
+        trace = {}
+    trace_summary = _fetch_trace_summary(trace)
+    return {
+        **_candidate_url_summary(entry.candidate_url),
+        "fetch_job_id": str(entry.fetch_job.id),
+        "fetch_attempt_id": str(attempt.id) if attempt is not None else None,
+        "attempted": True,
+        "fetch_attempted": True,
+        "status": entry.fetch_job.status,
+        "fetch_status": entry.fetch_job.status,
+        "http_status": attempt.http_status if attempt is not None else None,
+        "error_code": attempt.error_code if attempt is not None else None,
+        "error_reason": _fetch_error_reason(trace),
+        "final_url": trace_summary.get("final_url"),
+        "trace": trace_summary,
+        "snapshot_id": (
+            str(entry.content_snapshot.id) if entry.content_snapshot is not None else None
+        ),
+        "skipped_existing": entry.skipped_existing,
+    }
+
+
+def _acquisition_stage_result(result: Any) -> dict[str, Any]:
+    attempted_sources = [_fetch_entry_summary(entry) for entry in result.entries]
+    unattempted_sources = [
+        _unattempted_candidate_summary(candidate_url)
+        for candidate_url in result.unattempted_candidates
+    ]
+    failed_sources = [
+        source for source in attempted_sources if source.get("fetch_status") == "FAILED"
+    ]
+    successful_sources = [
+        source
+        for source in attempted_sources
+        if source.get("fetch_status") == "SUCCEEDED" and source.get("snapshot_id") is not None
+    ]
+    selected_sources = [*attempted_sources, *unattempted_sources]
+    return {
+        "created": result.created,
+        "skipped_existing": result.skipped_existing,
+        "succeeded": len(successful_sources),
+        "failed": len(failed_sources),
+        "fetch_succeeded": len(successful_sources),
+        "fetch_failed": len(failed_sources),
+        "content_snapshots": len(successful_sources),
+        "selected_sources_from_search": [
+            _candidate_url_summary(candidate_url)
+            for candidate_url in result.selected_candidates_from_search
+        ],
+        "selected_sources": selected_sources,
+        "attempted_sources": attempted_sources,
+        "unattempted_sources": unattempted_sources,
+        "failed_sources": failed_sources,
+        "fetch_attempts_summary": selected_sources,
+        "warnings": [],
+    }
+
+
+def _unattempted_candidate_summary(candidate_url: Any) -> dict[str, Any]:
+    return {
+        **_candidate_url_summary(candidate_url),
+        "fetch_job_id": None,
+        "fetch_attempt_id": None,
+        "attempted": False,
+        "fetch_attempted": False,
+        "status": "UNATTEMPTED",
+        "fetch_status": "UNATTEMPTED",
+        "http_status": None,
+        "error_code": None,
+        "error_reason": None,
+        "final_url": None,
+        "trace": {},
+        "snapshot_id": None,
+        "skipped_existing": False,
+    }
+
+
+def _fetch_trace_summary(trace: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in (
+        "requested_url",
+        "final_url",
+        "exception_type",
+        "message",
+        "resolved_ips",
+        "proxy_enabled",
+        "proxy_source",
+        "proxy_url_masked",
+        "decision_reason",
+        "safety_warning",
+    ):
+        value = trace.get(key)
+        if value is not None:
+            summary[key] = value
+    return summary
+
+
+def _fetch_error_reason(trace: dict[str, Any]) -> str | None:
+    for key in ("message", "reason"):
+        value = trace.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    storage_error = trace.get("storage_error")
+    if isinstance(storage_error, dict):
+        value = storage_error.get("message")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _format_parse_no_documents_message(parse_decisions: list[dict[str, Any]]) -> str:
+    if not parse_decisions:
+        return "parse produced no source documents; no content snapshots were selected."
+
+    formatted_decisions = []
+    for decision in parse_decisions:
+        formatted_decisions.append(
+            "snapshot_id={snapshot_id} canonical_url={canonical_url} "
+            "mime_type={mime_type} storage_bucket={storage_bucket} "
+            "storage_key={storage_key} snapshot_bytes={snapshot_bytes} "
+            "body_length={body_length} decision={decision} parser_error={parser_error}".format(
+                snapshot_id=decision.get("snapshot_id"),
+                canonical_url=decision.get("canonical_url"),
+                mime_type=decision.get("mime_type"),
+                storage_bucket=decision.get("storage_bucket"),
+                storage_key=decision.get("storage_key"),
+                snapshot_bytes=decision.get("snapshot_bytes"),
+                body_length=decision.get("body_length"),
+                decision=decision.get("decision"),
+                parser_error=decision.get("parser_error") or "n/a",
+            )
+        )
+
+    return "parse produced no source documents; parse decisions: " + " | ".join(formatted_decisions)
+
+
+def _stage_warnings(stage_result: dict[str, Any]) -> list[str]:
+    warnings = stage_result.get("warnings", [])
+    if not isinstance(warnings, list):
+        return []
+    return [item for item in warnings if isinstance(item, str) and item.strip()]
+
+
 def _classify_failure(error: Exception) -> str:
     if isinstance(error, DebugPipelinePreconditionError):
         return "pipeline_precondition_failed"
+    if isinstance(error, SearchProviderError):
+        return error.reason
     if isinstance(error, TaskNotFoundError):
         return "task_not_found"
     return "stage_exception"

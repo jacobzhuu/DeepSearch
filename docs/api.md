@@ -98,10 +98,21 @@ Response `200 OK`:
   "progress": {
     "current_state": "PLANNED",
     "events_total": 1,
-    "latest_event_at": "2026-04-22T12:00:00Z"
+    "latest_event_at": "2026-04-22T12:00:00Z",
+    "observability": null
   }
 }
 ```
+
+When a task has run through the synchronous pipeline, `progress.observability` is derived from task events and may include:
+
+- `search_result_count`
+- `selected_sources`
+- `fetch_succeeded`
+- `fetch_failed`
+- `failed_sources` with URL, HTTP status, error code, and error reason when available
+- `parse_decisions` with per-snapshot parsing outcome details when parsing has run or failed
+- non-blocking `warnings`, such as fewer than two successful fetched sources
 
 ### `GET /api/v1/research/tasks/{task_id}/events`
 
@@ -348,6 +359,12 @@ Response `200 OK`:
 - `search_query.provider` stores the provider id, currently `searxng`
 - per-result `source_engine` and provider metadata are stored in `candidate_url.metadata_json`
 - `search_query.raw_response_json` currently stores `task_revision_no`, expansion metadata, discovered source engines, provider response metadata, and `result_count`
+- the SearXNG provider validates endpoint responses before they enter the ledger:
+  - HTML responses are rejected as `searxng_html_response`
+  - HTTP 403 is rejected as `searxng_http_forbidden`
+  - invalid JSON is rejected as `searxng_invalid_json`
+  - empty results with `unresponsive_engines` are rejected as `searxng_empty_results_with_unresponsive_engines`
+- SearXNG diagnostics are logged with `SEARCH_PROVIDER`, `SEARXNG_BASE_URL`, response status, content type, body preview, and `unresponsive_engines`
 - no fetch jobs, fetch attempts, crawler calls, parser calls, OpenSearch writes, claim drafting, verification, or report generation are triggered by `POST /searches`
 - paused or cancelled tasks return `409 Conflict` from `POST /searches`
 
@@ -404,6 +421,7 @@ Response `200 OK`:
       "status": "SUCCEEDED",
       "http_status": 200,
       "error_code": null,
+      "error_reason": null,
       "skipped_existing": false
     }
   ]
@@ -450,6 +468,7 @@ Response `200 OK`:
       "latest_attempt_no": 1,
       "latest_http_status": 200,
       "latest_error_code": null,
+      "latest_error_reason": null,
       "snapshot_id": "uuid"
     }
   ]
@@ -510,7 +529,8 @@ Response `200 OK`:
 | --- | --- |
 | Allowed schemes | `http`, `https` |
 | Blocked hostnames | `localhost`, `metadata`, `metadata.google.internal` |
-| Blocked resolved targets | loopback, private, link-local, and any other non-global IP |
+| Blocked resolved targets | loopback, private, link-local, and any other non-global IP when all DNS answers are non-global |
+| Mixed DNS answers | allowed when at least one resolved IP is global; trace includes `allowed_ips`, `blocked_ips`, and `decision_reason` |
 | Timeout | bounded by `ACQUISITION_TIMEOUT_SECONDS` |
 | Redirects | bounded by `ACQUISITION_MAX_REDIRECTS` |
 | Max response body | bounded by `ACQUISITION_MAX_RESPONSE_BYTES` |
@@ -557,9 +577,16 @@ Response `200 OK`:
       "source_document_id": "uuid",
       "canonical_url": "https://example.com/",
       "mime_type": "text/html",
+      "content_type": "text/html",
+      "storage_bucket": "snapshots",
+      "storage_key": "research-task/uuid/candidate-url/uuid/fetch-attempt/uuid/response.bin",
+      "snapshot_bytes": 286,
+      "body_length": 286,
       "chunks_created": 1,
       "status": "CREATED",
       "reason": null,
+      "decision": "parsed",
+      "parser_error": null,
       "updated_existing": false
     }
   ]
@@ -576,8 +603,19 @@ Command contract:
   - `snapshot_object_missing`
   - `unsupported_mime_type`
   - `empty_extracted_text`
+  - `parse_error`
+- parse entry `decision` is the operator-facing outcome and may be:
+  - `parsed`
+  - `already_parsed`
+  - `fetch_not_succeeded`
+  - `skipped_empty`
+  - `skipped_unsupported_mime`
+  - `missing_blob`
+  - `parse_error`
 - unsupported MIME types are skipped with `reason = "unsupported_mime_type"`
 - if the snapshot object is missing from storage, the entry is returned as `FAILED` with `reason = "snapshot_object_missing"`
+- empty extracted text is skipped with `decision = "skipped_empty"` and includes `body_length`
+- parser exceptions are returned as `FAILED` with `decision = "parse_error"` and `parser_error`
 - if a `source_document` already points at the same `content_snapshot`, the entry is skipped with `reason = "already_parsed"`
 - if a `source_document` already exists for the same `(task_id, canonical_url)` but points at an older or null snapshot, the current minimum behavior is to update that row, move its `content_snapshot_id`, and rebuild its chunks
 - does not emit new `task_event` rows and does not change `research_task.status`
@@ -1046,6 +1084,12 @@ Command contract:
   - `start_offset < end_offset`
   - `excerpt` must exactly equal the corresponding `source_chunk.text` slice
 - current confidence is a minimal heuristic derived from query overlap, statement length, and retrieval score when present
+- claim drafting now filters weak deterministic candidates before persistence:
+  - statements must be complete sentence-like text with minimum length and token content
+  - one-word or short fragments such as `C` or `Data` are skipped
+  - title/question-like statements such as `What is OpenAI?` are skipped, especially when they duplicate the task query
+  - duplicate statements are deduped using a case- and punctuation-normalized identity
+- verification skips citation excerpts that fail the same minimum claimable-excerpt rules, so short fragments are not added as support evidence
 - verification is deterministic and explainable:
   - retrieve task-scoped chunks by `claim.statement`
   - classify the best sentence-like span as `support`, `contradict`, or no match
@@ -1152,6 +1196,10 @@ Response `200 OK`:
 - current report synthesis never invents unsupported conclusions:
   - only `supported` claims appear as settled conclusions
   - `mixed` and `unsupported` claims are rendered only inside uncertainty-aware sections with explicit status labels
+- report synthesis filters historical weak ledger material before rendering:
+  - non-claimable title/question/fragment statements are skipped
+  - citation excerpts below the minimum claimable threshold are not rendered as support evidence
+  - claims marked `supported` or `mixed` without remaining support evidence are downgraded to `unsupported` in the rendered report
 - current storage uses the existing object-store abstraction with the configured report bucket
 - Phase 10 now persists additional internal report-artifact provenance:
   - `content_hash`
@@ -1191,6 +1239,12 @@ Execution contract:
   - `COMPLETED`
 - on stage failure, transitions the task to `FAILED`, emits `pipeline.failed`, and returns a structured failure object instead of an unstructured 500
 - emits `pipeline.started`, `pipeline.stage_started`, `pipeline.stage_completed`, `pipeline.failed`, and `pipeline.completed` task events
+- `pipeline.stage_completed` and `pipeline.failed` payloads include operator observability details for search, acquisition, and parsing:
+  - search result count and selected candidate source summaries
+  - fetch success/failure counts
+  - failed fetch URL summaries with HTTP status, error code, and error reason
+  - parse decisions with snapshot id, canonical URL, MIME type, storage location, body length, decision, and parser error when present
+  - warnings when fewer than two sources fetch successfully; this does not block completion when at least one source succeeds
 
 Response `200 OK` on completion:
 

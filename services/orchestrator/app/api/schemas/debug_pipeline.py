@@ -26,6 +26,7 @@ class DebugPipelineFailureResponse(BaseModel):
     message: str
     next_action: str
     counts: DebugPipelineCountsResponse
+    details: dict[str, Any] | None = None
 
 
 class DebugPipelineResponse(BaseModel):

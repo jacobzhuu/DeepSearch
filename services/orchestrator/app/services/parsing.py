@@ -30,12 +30,32 @@ MAX_SNAPSHOTS_PER_REQUEST = 10
 
 logger = get_logger(__name__)
 
+PARSE_DECISION_PARSED = "parsed"
+PARSE_DECISION_SKIPPED_EMPTY = "skipped_empty"
+PARSE_DECISION_SKIPPED_UNSUPPORTED_MIME = "skipped_unsupported_mime"
+PARSE_DECISION_MISSING_BLOB = "missing_blob"
+PARSE_DECISION_PARSE_ERROR = "parse_error"
+PARSE_DECISION_ALREADY_PARSED = "already_parsed"
+PARSE_DECISION_FETCH_NOT_SUCCEEDED = "fetch_not_succeeded"
+
 
 class ParsingConflictError(Exception):
-    def __init__(self, task_id: UUID, current_status: str) -> None:
-        super().__init__(f"cannot parse snapshots for task {task_id} from status {current_status}")
+    def __init__(
+        self,
+        task_id: UUID,
+        current_status: str,
+        allowed_statuses: tuple[str, ...] | None = None,
+    ) -> None:
+        allowed_text = ""
+        if allowed_statuses:
+            allowed_text = f"; allowed statuses: {', '.join(allowed_statuses)}"
+        super().__init__(
+            f"cannot parse snapshots for task {task_id} from status {current_status}"
+            f"{allowed_text}"
+        )
         self.task_id = task_id
         self.current_status = current_status
+        self.allowed_statuses = allowed_statuses or ()
 
 
 class ContentSnapshotNotFoundError(Exception):
@@ -53,6 +73,9 @@ class ParseLedgerEntry:
     status: str
     reason: ParseResultReason | None
     updated_existing: bool
+    decision: str
+    body_length: int | None = None
+    parser_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +120,7 @@ class ParsingService:
         if task is None:
             raise TaskNotFoundError(task_id)
         if task.status not in self.allowed_statuses:
-            raise ParsingConflictError(task.id, task.status)
+            raise ParsingConflictError(task.id, task.status, self.allowed_statuses)
 
         effective_limit = min(limit or MAX_SNAPSHOTS_PER_REQUEST, MAX_SNAPSHOTS_PER_REQUEST)
         selected_snapshots = self._select_snapshots(
@@ -146,6 +169,7 @@ class ParsingService:
                 "skipped_existing": skipped_existing,
                 "skipped_unsupported": skipped_unsupported,
                 "failed": failed,
+                "parse_decisions": [parse_entry_diagnostic(entry) for entry in entries],
             },
         )
         return ParseBatchResult(
@@ -226,6 +250,7 @@ class ParsingService:
                 status="SKIPPED",
                 reason=ParseResultReason.FETCH_NOT_SUCCEEDED,
                 updated_existing=False,
+                decision=PARSE_DECISION_FETCH_NOT_SUCCEEDED,
             )
 
         existing_for_snapshot = self.source_document_repository.get_for_content_snapshot(
@@ -239,6 +264,7 @@ class ParsingService:
                 status="SKIPPED",
                 reason=ParseResultReason.ALREADY_PARSED,
                 updated_existing=False,
+                decision=PARSE_DECISION_ALREADY_PARSED,
             )
 
         try:
@@ -254,6 +280,9 @@ class ParsingService:
                 status="FAILED",
                 reason=ParseResultReason.SNAPSHOT_OBJECT_MISSING,
                 updated_existing=False,
+                decision=PARSE_DECISION_MISSING_BLOB,
+                body_length=None,
+                parser_error="snapshot object was not found in object store",
             )
 
         try:
@@ -269,6 +298,20 @@ class ParsingService:
                 status="SKIPPED",
                 reason=ParseResultReason.UNSUPPORTED_MIME_TYPE,
                 updated_existing=False,
+                decision=PARSE_DECISION_SKIPPED_UNSUPPORTED_MIME,
+                body_length=len(raw_content),
+            )
+        except Exception as error:  # noqa: BLE001 - parser diagnostics must preserve the failure.
+            return ParseLedgerEntry(
+                content_snapshot=content_snapshot,
+                source_document=None,
+                chunks_created=0,
+                status="FAILED",
+                reason=ParseResultReason.PARSE_ERROR,
+                updated_existing=False,
+                decision=PARSE_DECISION_PARSE_ERROR,
+                body_length=len(raw_content),
+                parser_error=str(error),
             )
 
         if not parsed_content.text.strip():
@@ -276,9 +319,11 @@ class ParsingService:
                 content_snapshot=content_snapshot,
                 source_document=None,
                 chunks_created=0,
-                status="FAILED",
+                status="SKIPPED",
                 reason=ParseResultReason.EMPTY_EXTRACTED_TEXT,
                 updated_existing=False,
+                decision=PARSE_DECISION_SKIPPED_EMPTY,
+                body_length=len(raw_content),
             )
 
         candidate_url = fetch_job.candidate_url
@@ -344,6 +389,8 @@ class ParsingService:
             status="UPDATED" if updated_existing else "CREATED",
             reason=None,
             updated_existing=updated_existing,
+            decision=PARSE_DECISION_PARSED,
+            body_length=len(raw_content),
         )
 
     def _get_task_or_raise(self, task_id: UUID) -> None:
@@ -367,3 +414,28 @@ def create_parsing_service(
         snapshot_object_store=snapshot_object_store,
         allowed_statuses=allowed_statuses,
     )
+
+
+def parse_entry_diagnostic(entry: ParseLedgerEntry) -> dict[str, object]:
+    content_snapshot = entry.content_snapshot
+    fetch_job = content_snapshot.fetch_attempt.fetch_job
+    candidate_url = fetch_job.candidate_url
+    return {
+        "snapshot_id": str(content_snapshot.id),
+        "content_snapshot_id": str(content_snapshot.id),
+        "canonical_url": candidate_url.canonical_url,
+        "mime_type": content_snapshot.mime_type,
+        "content_type": content_snapshot.mime_type,
+        "storage_bucket": content_snapshot.storage_bucket,
+        "storage_key": content_snapshot.storage_key,
+        "snapshot_bytes": content_snapshot.bytes,
+        "body_length": entry.body_length,
+        "decision": entry.decision,
+        "status": entry.status,
+        "reason": entry.reason.value if entry.reason is not None else None,
+        "parser_error": entry.parser_error,
+        "source_document_id": (
+            str(entry.source_document.id) if entry.source_document is not None else None
+        ),
+        "chunks_created": entry.chunks_created,
+    }

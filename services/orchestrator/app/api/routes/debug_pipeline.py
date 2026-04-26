@@ -93,7 +93,7 @@ def run_debug_real_pipeline(
             http_client=http_client,
             snapshot_object_store=snapshot_object_store,
             snapshot_bucket=settings.snapshot_storage_bucket,
-            max_candidates_per_request=min(settings.acquisition_max_candidates_per_request, 3),
+            max_candidates_per_request=settings.acquisition_max_candidates_per_request,
             allowed_statuses=ACQUISITION_ALLOWED_STATUSES,
         ),
         parsing_service=create_parsing_service(
@@ -126,12 +126,13 @@ def run_debug_real_pipeline(
             report_storage_bucket=settings.report_storage_bucket,
         ),
         dependencies=dependencies,
-        fetch_limit=3,
+        fetch_limit=settings.acquisition_max_candidates_per_request,
         parse_limit=3,
         index_limit=10,
         claim_limit=5,
         event_source=DEBUG_EVENT_SOURCE,
         event_prefix=DEBUG_EVENT_PREFIX,
+        target_successful_snapshots=settings.acquisition_target_successful_snapshots,
     )
 
     try:
@@ -158,6 +159,7 @@ def run_debug_real_pipeline(
                 message=result.failure.message,
                 next_action=result.failure.next_action,
                 counts=_serialize_counts(result.failure.counts),
+                details=result.failure.details,
             )
             if result.failure is not None
             else None

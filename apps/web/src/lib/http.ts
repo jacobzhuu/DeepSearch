@@ -34,7 +34,7 @@ export async function fetchApi<T>(endpoint: string, options: RequestInit = {}): 
     try {
       const errorData = JSON.parse(responseText);
       rawDetail = errorData.detail ?? errorData;
-      errorMessage = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail, null, 2);
+      errorMessage = formatErrorDetail(rawDetail);
     } catch {
       if (responseText) {
         errorMessage = responseText;
@@ -45,4 +45,25 @@ export async function fetchApi<T>(endpoint: string, options: RequestInit = {}): 
   }
 
   return response.json();
+}
+
+function formatErrorDetail(detail: unknown): string {
+  if (typeof detail === 'string') {
+    return detail;
+  }
+  if (detail && typeof detail === 'object') {
+    const record = detail as Record<string, unknown>;
+    const message = typeof record.message === 'string' ? record.message : null;
+    const reason = typeof record.reason === 'string' ? record.reason : null;
+    const nextAction = typeof record.next_action === 'string' ? record.next_action : null;
+    if (message) {
+      return [
+        message,
+        reason ? `Reason: ${reason}` : null,
+        nextAction ? `Next action: ${nextAction}` : null,
+      ].filter(Boolean).join('\n');
+    }
+    return JSON.stringify(detail, null, 2);
+  }
+  return String(detail);
 }

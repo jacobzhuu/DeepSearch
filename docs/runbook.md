@@ -41,6 +41,8 @@ The current v1 path supports:
 - support-only claim drafting with citation span binding
 - minimal claim verification with `support` and `contradict` evidence
 - Markdown report synthesis backed by persisted report artifacts
+- task-event and task-detail observability for search result counts, selected sources, fetch success/failure counts, failed fetch reasons, parse decisions, and low-source warnings
+- report page HTML rendering plus Raw Markdown, Copy Markdown, and Download `.md` controls
 - JSON logs and basic metrics
 
 ## What is intentionally not being expanded now
@@ -311,6 +313,15 @@ python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 80
 
 If `SEARXNG_BASE_URL=http://127.0.0.1:8080` returns frontend HTML, it is misconfigured. Point it at a SearXNG-compatible `/search?format=json` endpoint, or use explicit smoke mode for development validation.
 
+The SearXNG client validates endpoint responses before storing search ledger rows. Common structured failures:
+
+- `searxng_html_response`: the configured endpoint returned HTML instead of JSON
+- `searxng_http_forbidden`: the endpoint returned HTTP 403, often due to access rules, CAPTCHA, or rate limiting
+- `searxng_invalid_json`: the endpoint returned a non-JSON body
+- `searxng_empty_results_with_unresponsive_engines`: SearXNG returned no results and reported unavailable engines
+
+For each SearXNG response, logs include `SEARCH_PROVIDER`, `SEARXNG_BASE_URL`, status, content type, the first 300 response characters, and `unresponsive_engines`.
+
 Development smoke mode:
 
 ```bash
@@ -436,6 +447,7 @@ At minimum, that route would still need:
 
 - verify `SEARXNG_BASE_URL`
 - if no external SearXNG is available, use `scripts/mock_searxng.py`
+- inspect the structured search failure `reason` and JSON logs; HTML, 403, invalid JSON, and empty results with unresponsive engines are reported explicitly
 
 ### Mac browser cannot open the frontend URL printed by the Linux server
 
@@ -448,10 +460,17 @@ At minimum, that route would still need:
 
 - verify the returned URLs are globally reachable
 - the current acquisition policy intentionally blocks loopback, private, link-local, and metadata targets
+- mixed DNS answers are allowed when at least one resolved IP is global; inspect fetch attempt trace fields `allowed_ips`, `blocked_ips`, and `decision_reason` before treating `non_global_ip` as a domain-wide block
+- inspect task events or `GET /api/v1/research/tasks/<task_id>` for `progress.observability.failed_sources`; failed entries include URL, HTTP status, error code, and error reason when the fetch trace recorded one
+- a run with one successful fetched source and one or more failed sources can still complete; it emits a warning that report coverage may be weak
 
 ### Smoke test fails at parse
 
 - only `text/html` and `text/plain` are supported
+- inspect task events or `GET /api/v1/research/tasks/<task_id>` for `progress.observability.parse_decisions`
+- parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, and `parser_error`
+- `skipped_empty`, `missing_blob`, `skipped_unsupported_mime`, and `parse_error` are distinct outcomes; a `PARSING` failure message lists these per snapshot instead of only reporting that no source documents were produced
+- `POST /api/v1/research/tasks/<task_id>/parse` remains status-gated; a FAILED task returns `409` and should be revised or recreated rather than rerun in place
 
 ### Smoke test fails at index, draft, verify, or report
 

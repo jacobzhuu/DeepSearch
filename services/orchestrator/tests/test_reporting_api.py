@@ -206,10 +206,19 @@ def _seed_verified_claims(session: Session) -> UUID:
             metadata_json={"strategy": "paragraph_window_v1"},
         )
     )
-    unsupported_chunk = source_chunk_repo.add(
+    mixed_support_chunk = source_chunk_repo.add(
         SourceChunk(
             source_document_id=source_document.id,
             chunk_no=2,
+            text="The mixed claim remains under dispute according to this source.",
+            token_count=10,
+            metadata_json={"strategy": "paragraph_window_v1"},
+        )
+    )
+    unsupported_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=3,
             text="This unsupported claim is contradicted by the source document.",
             token_count=11,
             metadata_json={"strategy": "paragraph_window_v1"},
@@ -257,10 +266,10 @@ def _seed_verified_claims(session: Session) -> UUID:
         normalized_excerpt_hash="sha256:support",
     )
     mixed_support_span = CitationSpan(
-        source_chunk_id=support_chunk.id,
+        source_chunk_id=mixed_support_chunk.id,
         start_offset=0,
-        end_offset=24,
-        excerpt=support_chunk.text[:24],
+        end_offset=len(mixed_support_chunk.text),
+        excerpt=mixed_support_chunk.text,
         normalized_excerpt_hash="sha256:mixed-support",
     )
     mixed_contradict_span = CitationSpan(

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import os
 import socket
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -63,6 +64,26 @@ class HttpFetchResult:
     trace: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _TargetValidationResult:
+    resolved_ips: tuple[str, ...]
+    allowed_ips: tuple[str, ...]
+    blocked_ips: tuple[str, ...]
+    decision_reason: str
+    warning: str | None = None
+
+    def to_trace(self) -> dict[str, Any]:
+        trace: dict[str, Any] = {
+            "resolved_ips": list(self.resolved_ips),
+            "allowed_ips": list(self.allowed_ips),
+            "blocked_ips": list(self.blocked_ips),
+            "decision_reason": self.decision_reason,
+        }
+        if self.warning:
+            trace["safety_warning"] = self.warning
+        return trace
+
+
 class HttpAcquisitionClient:
     def __init__(
         self,
@@ -93,7 +114,7 @@ class HttpAcquisitionClient:
                 mime_type=None,
                 content=None,
                 content_hash=None,
-                trace=error.trace,
+                trace=_merge_trace(_proxy_trace_for_url(url), error.trace),
             )
         except httpx.RequestError as error:
             return HttpFetchResult(
@@ -104,11 +125,7 @@ class HttpAcquisitionClient:
                 mime_type=None,
                 content=None,
                 content_hash=None,
-                trace={
-                    "exception_type": type(error).__name__,
-                    "message": str(error),
-                    "requested_url": url,
-                },
+                trace=_request_error_trace(url=url, error=error),
             )
 
     def _fetch_with_redirects(self, url: str) -> HttpFetchResult:
@@ -116,8 +133,36 @@ class HttpAcquisitionClient:
         redirect_chain: list[dict[str, Any]] = []
 
         for redirect_count in range(self.max_redirects + 1):
-            resolved_ips = self._validate_target_url(current_url)
-            response_data = self._perform_request(current_url)
+            target_validation = self._validate_target_url(current_url)
+            try:
+                response_data = self._perform_request(current_url)
+            except AcquisitionPolicyError as error:
+                raise AcquisitionPolicyError(
+                    error_code=error.error_code,
+                    http_status=error.http_status,
+                    trace=_merge_trace(
+                        {
+                            "requested_url": url,
+                            "final_url": current_url,
+                            **_proxy_trace_for_url(current_url),
+                            **target_validation.to_trace(),
+                        },
+                        error.trace,
+                    ),
+                ) from error
+            except httpx.RequestError as error:
+                raise AcquisitionPolicyError(
+                    error_code="network_error",
+                    trace=_merge_trace(
+                        {
+                            "requested_url": url,
+                            "final_url": current_url,
+                            **_proxy_trace_for_url(current_url),
+                            **target_validation.to_trace(),
+                        },
+                        _request_error_trace(url=current_url, error=error),
+                    ),
+                ) from error
             location = response_data.headers.get("location")
             if location is not None and response_data.http_status in {301, 302, 303, 307, 308}:
                 if redirect_count >= self.max_redirects:
@@ -128,7 +173,8 @@ class HttpAcquisitionClient:
                             "requested_url": url,
                             "final_url": response_data.final_url,
                             "redirect_chain": redirect_chain,
-                            "resolved_ips": list(resolved_ips),
+                            **_proxy_trace_for_url(current_url),
+                            **target_validation.to_trace(),
                         },
                     )
 
@@ -157,7 +203,8 @@ class HttpAcquisitionClient:
                     "requested_url": url,
                     "final_url": response_data.final_url,
                     "redirect_chain": redirect_chain,
-                    "resolved_ips": list(resolved_ips),
+                    **_proxy_trace_for_url(current_url),
+                    **target_validation.to_trace(),
                     "response_bytes": len(response_data.content),
                 },
             )
@@ -178,7 +225,7 @@ class HttpAcquisitionClient:
         with httpx.Client(
             follow_redirects=False,
             timeout=self.timeout_seconds,
-            trust_env=False,
+            trust_env=True,
         ) as client:
             return self._perform_request_with_client(client, url, headers)
 
@@ -226,7 +273,7 @@ class HttpAcquisitionClient:
                 content=bytes(content),
             )
 
-    def _validate_target_url(self, url: str) -> tuple[str, ...]:
+    def _validate_target_url(self, url: str) -> _TargetValidationResult:
         parsed = urlsplit(url)
         scheme = parsed.scheme.lower()
         if scheme not in {"http", "https"}:
@@ -250,25 +297,46 @@ class HttpAcquisitionClient:
                     "requested_url": url,
                     "host": normalized_host,
                     "reason": "blocked_hostname",
+                    "decision_reason": "blocked_hostname",
                 },
             )
 
         port = parsed.port or (443 if scheme == "https" else 80)
         resolved_ips = self._resolve_ips(normalized_host, port)
-        blocked_ips = [address for address in resolved_ips if _is_blocked_ip(address)]
-        if blocked_ips:
+        allowed_ips = tuple(address for address in resolved_ips if not _is_blocked_ip(address))
+        blocked_ips = tuple(address for address in resolved_ips if _is_blocked_ip(address))
+        if not allowed_ips:
             raise AcquisitionPolicyError(
                 error_code="target_blocked",
                 trace={
                     "requested_url": url,
                     "host": normalized_host,
                     "resolved_ips": list(resolved_ips),
-                    "blocked_ips": blocked_ips,
+                    "allowed_ips": [],
+                    "blocked_ips": list(blocked_ips),
                     "reason": "non_global_ip",
+                    "decision_reason": "all_resolved_ips_non_global",
                 },
             )
 
-        return resolved_ips
+        if blocked_ips:
+            return _TargetValidationResult(
+                resolved_ips=resolved_ips,
+                allowed_ips=allowed_ips,
+                blocked_ips=blocked_ips,
+                decision_reason="public_ip_present_with_non_global_dns_answers",
+                warning=(
+                    "DNS answers included non-global IPs, but at least one global IP was "
+                    "available; continuing with SSRF guard metadata."
+                ),
+            )
+
+        return _TargetValidationResult(
+            resolved_ips=resolved_ips,
+            allowed_ips=allowed_ips,
+            blocked_ips=(),
+            decision_reason="all_resolved_ips_global",
+        )
 
     def _resolve_ips(self, host: str, port: int) -> tuple[str, ...]:
         try:
@@ -310,6 +378,104 @@ def _normalize_mime_type(content_type: str | None) -> str:
 def _is_blocked_ip(address: str) -> bool:
     ip = ipaddress.ip_address(address)
     return not ip.is_global
+
+
+def _request_error_trace(*, url: str, error: httpx.RequestError) -> dict[str, Any]:
+    request = _request_from_error(error)
+    request_url = str(request.url) if request is not None else url
+    return {
+        "exception_type": type(error).__name__,
+        "message": str(error),
+        "requested_url": url,
+        "final_url": request_url,
+        **_proxy_trace_for_url(url),
+    }
+
+
+def _proxy_trace_for_url(url: str) -> dict[str, Any]:
+    proxy_url, env_var, no_proxy_matched = _proxy_env_for_url(url)
+    return {
+        "proxy_enabled": proxy_url is not None,
+        "proxy_source": "env" if proxy_url is not None else "none",
+        "proxy_env_var": env_var,
+        "proxy_url_masked": _mask_proxy_url(proxy_url) if proxy_url is not None else None,
+        "no_proxy_matched": no_proxy_matched,
+    }
+
+
+def _request_from_error(error: httpx.RequestError) -> httpx.Request | None:
+    try:
+        return error.request
+    except RuntimeError:
+        return None
+
+
+def _proxy_env_for_url(url: str) -> tuple[str | None, str | None, bool]:
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    no_proxy = _env_value("NO_PROXY") or _env_value("no_proxy")
+    if _host_matches_no_proxy(host, no_proxy):
+        return None, None, True
+
+    scheme = parsed.scheme.lower()
+    env_names = [f"{scheme.upper()}_PROXY", f"{scheme}_proxy", "ALL_PROXY", "all_proxy"]
+    for env_name in env_names:
+        value = _env_value(env_name)
+        if value:
+            return value, env_name, False
+    return None, None, False
+
+
+def _env_value(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _host_matches_no_proxy(host: str, no_proxy: str | None) -> bool:
+    if not host or not no_proxy:
+        return False
+    normalized_host = host.rstrip(".").lower()
+    for raw_entry in no_proxy.split(","):
+        entry = raw_entry.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        if entry.startswith(".") and normalized_host.endswith(entry):
+            return True
+        if normalized_host == entry or normalized_host.endswith(f".{entry}"):
+            return True
+    return False
+
+
+def _mask_proxy_url(proxy_url: str) -> str:
+    parsed = urlsplit(proxy_url)
+    if parsed.username is None and parsed.password is None:
+        return proxy_url
+    hostname = parsed.hostname or ""
+    host = hostname
+    if ":" in hostname and not hostname.startswith("["):
+        host = f"[{hostname}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit(
+        (
+            parsed.scheme,
+            f"***:***@{host}",
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+
+
+def _merge_trace(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    merged.update(patch)
+    return merged
 
 
 @dataclass(frozen=True)

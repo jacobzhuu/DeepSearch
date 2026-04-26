@@ -26,6 +26,16 @@ def test_extract_parsed_content_from_html_discards_script_and_keeps_title() -> N
     assert parsed.metadata["extractor"] == "html_text_v1"
 
 
+def test_extract_parsed_content_from_short_html_uses_title_as_text_fallback() -> None:
+    parsed = extract_parsed_content(
+        mime_type="text/html",
+        content=b"<html><head><title>SearXNG</title></head><body></body></html>",
+    )
+
+    assert parsed.title == "SearXNG"
+    assert parsed.text == "SearXNG"
+
+
 def test_extract_parsed_content_from_plain_text_derives_title() -> None:
     parsed = extract_parsed_content(
         mime_type="text/plain",

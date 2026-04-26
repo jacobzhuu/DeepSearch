@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -12,6 +12,7 @@ from services.orchestrator.app.api.schemas.research_tasks import (
     CreateResearchTaskRequest,
     ResearchTaskDetailResponse,
     ResearchTaskMutationResponse,
+    ResearchTaskObservabilityResponse,
     ResearchTaskProgressResponse,
     ReviseResearchTaskRequest,
     TaskEventListResponse,
@@ -179,5 +180,114 @@ def _serialize_task_snapshot(snapshot: TaskSnapshot) -> ResearchTaskDetailRespon
             current_state=current_state,
             events_total=len(snapshot.events),
             latest_event_at=latest_event_at,
+            observability=_derive_observability(snapshot),
         ),
     )
+
+
+def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityResponse | None:
+    search_result_count: int | None = None
+    selected_sources_from_search: list[dict[str, Any]] = []
+    selected_sources: list[dict[str, Any]] = []
+    fetch_succeeded: int | None = None
+    fetch_failed: int | None = None
+    attempted_sources: list[dict[str, Any]] = []
+    unattempted_sources: list[dict[str, Any]] = []
+    failed_sources: list[dict[str, Any]] = []
+    parse_decisions: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for event in snapshot.events:
+        payload = event.payload_json or {}
+        if not isinstance(payload, dict):
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            result = {}
+
+        stage = payload.get("stage")
+        if stage == "SEARCHING":
+            value = result.get("search_result_count")
+            if isinstance(value, int):
+                search_result_count = value
+            selected_sources = _object_list(result.get("selected_sources"))
+        elif stage == "ACQUIRING":
+            details = payload.get("details")
+            acquisition_payload = result
+            if not acquisition_payload and isinstance(details, dict):
+                acquisition_payload = details
+            succeeded = acquisition_payload.get(
+                "fetch_succeeded",
+                acquisition_payload.get("succeeded"),
+            )
+            failed = acquisition_payload.get(
+                "fetch_failed",
+                acquisition_payload.get("failed"),
+            )
+            if isinstance(succeeded, int):
+                fetch_succeeded = succeeded
+            if isinstance(failed, int):
+                fetch_failed = failed
+            selected_sources_from_search = (
+                _object_list(acquisition_payload.get("selected_sources_from_search"))
+                or selected_sources_from_search
+            )
+            selected_sources = (
+                _object_list(acquisition_payload.get("selected_sources")) or selected_sources
+            )
+            attempted_sources = (
+                _object_list(acquisition_payload.get("attempted_sources")) or attempted_sources
+            )
+            unattempted_sources = (
+                _object_list(acquisition_payload.get("unattempted_sources")) or unattempted_sources
+            )
+            failed_sources = _object_list(acquisition_payload.get("failed_sources"))
+        elif stage == "PARSING":
+            parse_decisions = _object_list(result.get("parse_decisions")) or parse_decisions
+
+        details = payload.get("details")
+        if isinstance(details, dict):
+            parse_decisions = _object_list(details.get("parse_decisions")) or parse_decisions
+
+        warnings.extend(_string_list(payload.get("warnings")))
+        warnings.extend(_string_list(result.get("warnings")))
+
+    deduped_warnings = list(dict.fromkeys(warnings))
+    if (
+        search_result_count is None
+        and not selected_sources_from_search
+        and not selected_sources
+        and fetch_succeeded is None
+        and fetch_failed is None
+        and not attempted_sources
+        and not unattempted_sources
+        and not failed_sources
+        and not parse_decisions
+        and not deduped_warnings
+    ):
+        return None
+
+    return ResearchTaskObservabilityResponse(
+        search_result_count=search_result_count,
+        selected_sources_from_search=selected_sources_from_search,
+        selected_sources=selected_sources,
+        fetch_succeeded=fetch_succeeded,
+        fetch_failed=fetch_failed,
+        attempted_sources=attempted_sources,
+        unattempted_sources=unattempted_sources,
+        failed_sources=failed_sources,
+        parse_decisions=parse_decisions,
+        warnings=deduped_warnings,
+    )
+
+
+def _object_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]

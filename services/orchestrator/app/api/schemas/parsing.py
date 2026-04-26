@@ -21,9 +21,16 @@ class ParseEntryResponse(BaseModel):
     source_document_id: UUID | None
     canonical_url: str
     mime_type: str
+    content_type: str
+    storage_bucket: str
+    storage_key: str
+    snapshot_bytes: int
+    body_length: int | None
     chunks_created: int
     status: str
     reason: ParseResultReason | None
+    decision: str
+    parser_error: str | None = None
     updated_existing: bool
 
 

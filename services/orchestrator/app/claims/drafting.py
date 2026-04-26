@@ -12,6 +12,12 @@ CLAIM_EVIDENCE_RELATION_SUPPORT = "support"
 _SENTENCE_PATTERN = re.compile(r"[^\n.!?。！？]+(?:[.!?。！？]+)?", re.MULTILINE)
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+", re.UNICODE)
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_CLAIM_IDENTITY_PUNCTUATION_PATTERN = re.compile(r"[^0-9a-zA-Z\u4e00-\u9fff]+")
+_CJK_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_TERMINAL_SENTENCE_PATTERN = re.compile(r"[.!。！]$")
+_MEANINGLESS_CLAIMS = frozenset({"c", "data", "none", "null", "undefined"})
+MIN_CLAIM_STATEMENT_CHARS = 32
+MIN_CLAIM_STATEMENT_TOKENS = 5
 
 
 class CitationSpanValidationError(ValueError):
@@ -32,8 +38,38 @@ def draft_claim_statement(excerpt: str) -> str:
     return normalized
 
 
+def is_claimable_statement(statement: str, query: str | None = None) -> bool:
+    normalized = _normalize_whitespace(statement)
+    if len(normalized) < MIN_CLAIM_STATEMENT_CHARS:
+        return False
+    if normalized.lower() in _MEANINGLESS_CLAIMS:
+        return False
+    if normalized.endswith(("?", "？")):
+        return False
+    if _TERMINAL_SENTENCE_PATTERN.search(normalized) is None:
+        return False
+    tokens = _tokenize(normalized)
+    semantic_units = len(tokens) + (len(_CJK_CHAR_PATTERN.findall(normalized)) // 2)
+    if semantic_units < MIN_CLAIM_STATEMENT_TOKENS:
+        return False
+    if query is not None and normalize_claim_identity(normalized) == normalize_claim_identity(
+        query
+    ):
+        return False
+    return True
+
+
+def is_claimable_excerpt(excerpt: str, query: str | None = None) -> bool:
+    return is_claimable_statement(draft_claim_statement(excerpt), query=query)
+
+
+def normalize_claim_identity(statement: str) -> str:
+    normalized = _normalize_whitespace(statement).lower()
+    return _CLAIM_IDENTITY_PUNCTUATION_PATTERN.sub("", normalized)
+
+
 def select_supporting_span(text: str, query: str) -> SupportingSpan:
-    spans = list(iter_supporting_spans(text))
+    spans = [span for span in iter_supporting_spans(text) if is_claimable_excerpt(span.excerpt)]
     if not spans:
         raise CitationSpanValidationError("source chunk text does not contain a claimable span")
 

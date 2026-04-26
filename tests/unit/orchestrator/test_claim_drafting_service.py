@@ -169,6 +169,87 @@ def test_claim_drafting_service_supports_explicit_source_chunk_ids_and_rejects_p
         )
 
 
+def test_claim_drafting_service_filters_title_short_and_duplicate_claims(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is OpenAI?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://example.com/openai",
+            domain="example.com",
+            title="OpenAI source",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=None,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=None,
+        )
+    )
+    source_chunk_repo = SourceChunkRepository(db_session)
+    title_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text="What Is OpenAI?\n\nData\n\nC",
+            token_count=4,
+            metadata_json={"strategy": "paragraph_window_v1"},
+        )
+    )
+    first_fact_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=1,
+            text="OpenAI is an artificial intelligence research and deployment company.",
+            token_count=10,
+            metadata_json={"strategy": "paragraph_window_v1"},
+        )
+    )
+    duplicate_fact_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=2,
+            text="OpenAI is an Artificial Intelligence Research and Deployment Company.",
+            token_count=10,
+            metadata_json={"strategy": "paragraph_window_v1"},
+        )
+    )
+    db_session.commit()
+
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[title_chunk.id, first_fact_chunk.id, duplicate_fact_chunk.id],
+        limit=5,
+    )
+
+    claims = ClaimRepository(db_session).list_for_task(task.id)
+    claim_evidence = ClaimEvidenceRepository(db_session).list_for_task(task.id)
+
+    assert result.created_claims == 1
+    assert result.reused_claims == 1
+    assert len(result.entries) == 2
+    assert len(claims) == 1
+    assert len(claim_evidence) == 2
+    assert claims[0].statement == (
+        "OpenAI is an artificial intelligence research and deployment company."
+    )
+
+
 def _seed_source_chunk(db_session: Session) -> SeededChunk:
     task = create_research_task_service(db_session).create_task(
         query="illustrative examples",

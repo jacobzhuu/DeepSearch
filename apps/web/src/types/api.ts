@@ -8,6 +8,18 @@ export interface ResearchTaskProgress {
   current_state: string;
   events_total: number;
   latest_event_at: string;
+  observability?: {
+    search_result_count: number | null;
+    selected_sources_from_search: Array<Record<string, any>>;
+    selected_sources: Array<Record<string, any>>;
+    fetch_succeeded: number | null;
+    fetch_failed: number | null;
+    attempted_sources: Array<Record<string, any>>;
+    unattempted_sources: Array<Record<string, any>>;
+    failed_sources: Array<Record<string, any>>;
+    parse_decisions: Array<Record<string, any>>;
+    warnings: string[];
+  } | null;
 }
 
 export interface ResearchTask {
@@ -57,6 +69,7 @@ export interface PipelineFailure {
   message: string;
   next_action: string;
   counts: PipelineCounts;
+  details?: Record<string, any> | null;
 }
 
 export interface PipelineRunResponse {

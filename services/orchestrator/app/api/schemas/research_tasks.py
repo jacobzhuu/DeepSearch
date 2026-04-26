@@ -52,10 +52,24 @@ class ResearchTaskMutationResponse(BaseModel):
     updated_at: datetime
 
 
+class ResearchTaskObservabilityResponse(BaseModel):
+    search_result_count: int | None = None
+    selected_sources_from_search: list[dict[str, Any]] = Field(default_factory=list)
+    selected_sources: list[dict[str, Any]] = Field(default_factory=list)
+    fetch_succeeded: int | None = None
+    fetch_failed: int | None = None
+    attempted_sources: list[dict[str, Any]] = Field(default_factory=list)
+    unattempted_sources: list[dict[str, Any]] = Field(default_factory=list)
+    failed_sources: list[dict[str, Any]] = Field(default_factory=list)
+    parse_decisions: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ResearchTaskProgressResponse(BaseModel):
     current_state: str
     events_total: int
     latest_event_at: datetime | None
+    observability: ResearchTaskObservabilityResponse | None = None
 
 
 class ResearchTaskDetailResponse(BaseModel):

@@ -97,9 +97,16 @@ def parse_task_snapshots(
                 ),
                 canonical_url=entry.content_snapshot.fetch_attempt.fetch_job.candidate_url.canonical_url,
                 mime_type=entry.content_snapshot.mime_type,
+                content_type=entry.content_snapshot.mime_type,
+                storage_bucket=entry.content_snapshot.storage_bucket,
+                storage_key=entry.content_snapshot.storage_key,
+                snapshot_bytes=entry.content_snapshot.bytes,
+                body_length=entry.body_length,
                 chunks_created=entry.chunks_created,
                 status=entry.status,
                 reason=entry.reason,
+                decision=entry.decision,
+                parser_error=entry.parser_error,
                 updated_existing=entry.updated_existing,
             )
             for entry in result.entries

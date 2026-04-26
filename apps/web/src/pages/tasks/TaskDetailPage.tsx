@@ -3,7 +3,7 @@ import { useParams, Link, useLocation, useNavigate } from 'react-router-dom';
 import { PageLayout } from '../../components/layout/PageLayout';
 import { LoadingState } from '../../components/common/LoadingState';
 import { ErrorState } from '../../components/common/ErrorState';
-import { PipelineCounts, PipelineRunResponse, TaskEvent } from '../../features/tasks/types';
+import { PipelineCounts, PipelineRunResponse, ResearchTask, TaskEvent } from '../../features/tasks/types';
 import { useRunTask, useTask, useTaskEvents } from '../../features/tasks/hooks';
 
 export const TaskDetailPage: React.FC = () => {
@@ -17,7 +17,7 @@ export const TaskDetailPage: React.FC = () => {
   const pipelineResult = runResult || initialPipelineResult;
 
   const handleRun = async () => {
-    if (!taskId) return;
+    if (!taskId || task?.status !== 'PLANNED') return;
     const result = await runTask(taskId);
     await refetch();
     await refetchEvents();
@@ -37,21 +37,34 @@ export const TaskDetailPage: React.FC = () => {
 
   if (!task) return <PageLayout title="Task Detail"><p>Task not found.</p></PageLayout>;
 
+  const canRun = task.status === 'PLANNED';
+  const runDisabledReason = canRun
+    ? null
+    : 'Only PLANNED tasks can be run. Create a new task or revise this task before running.';
+
   return (
     <PageLayout 
       title="Task Detail"
       actions={
-        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-          <span style={{ padding: '0.25rem 0.75rem', backgroundColor: '#eee', borderRadius: '1rem', fontSize: '0.875rem', fontWeight: 'bold' }}>
-            {task.status}
-          </span>
-          <button
-            onClick={handleRun}
-            disabled={isRunning || task.status !== 'PLANNED'}
-            style={{ ...buttonStyle, border: 0, cursor: isRunning || task.status !== 'PLANNED' ? 'not-allowed' : 'pointer' }}
-          >
-            {isRunning ? 'Running...' : 'Run DeepSearch'}
-          </button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', alignItems: 'flex-end' }}>
+          <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+            <span style={{ padding: '0.25rem 0.75rem', backgroundColor: '#eee', borderRadius: '1rem', fontSize: '0.875rem', fontWeight: 'bold' }}>
+              {task.status}
+            </span>
+            <button
+              onClick={handleRun}
+              disabled={isRunning || !canRun}
+              aria-describedby={runDisabledReason ? 'run-disabled-reason' : undefined}
+              style={{ ...buttonStyle, border: 0, opacity: canRun ? 1 : 0.65, cursor: isRunning || !canRun ? 'not-allowed' : 'pointer' }}
+            >
+              {isRunning ? 'Running...' : 'Run DeepSearch'}
+            </button>
+          </div>
+          {runDisabledReason && (
+            <div id="run-disabled-reason" style={{ maxWidth: '22rem', fontSize: '0.8rem', color: '#7a4b00', textAlign: 'right' }}>
+              {runDisabledReason}
+            </div>
+          )}
         </div>
       }
     >
@@ -76,6 +89,8 @@ export const TaskDetailPage: React.FC = () => {
           </ul>
         </section>
 
+        <TaskObservabilityPanel observability={task.progress?.observability || null} />
+
         <section>
           <h3 style={{ borderBottom: '1px solid #eee', paddingBottom: '0.5rem' }}>Exploration</h3>
           <div style={{ display: 'flex', gap: '1rem' }}>
@@ -92,6 +107,109 @@ export const TaskDetailPage: React.FC = () => {
 
       </div>
     </PageLayout>
+  );
+};
+
+type TaskObservability = NonNullable<NonNullable<ResearchTask['progress']>['observability']>;
+
+const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null }> = ({ observability }) => {
+  if (!observability) return null;
+
+  const selectedSources = Array.isArray(observability.selected_sources) ? observability.selected_sources : [];
+  const attemptedSources = Array.isArray(observability.attempted_sources) ? observability.attempted_sources : [];
+  const unattemptedSources = Array.isArray(observability.unattempted_sources) ? observability.unattempted_sources : [];
+  const failedSources = Array.isArray(observability.failed_sources) ? observability.failed_sources : [];
+  const parseDecisions = Array.isArray(observability.parse_decisions) ? observability.parse_decisions : [];
+  const warnings = Array.isArray(observability.warnings) ? observability.warnings : [];
+
+  return (
+    <section style={{ border: '1px solid #e2e8f0', borderRadius: '8px', padding: '1rem', backgroundColor: '#fbfdff' }}>
+      <h3 style={{ marginTop: 0 }}>Run Observability</h3>
+      <ul style={{ listStyle: 'none', padding: 0, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '0.5rem' }}>
+        <li><strong>Search Results:</strong><br />{observability.search_result_count ?? 'n/a'}</li>
+        <li><strong>Fetch Succeeded:</strong><br />{observability.fetch_succeeded ?? 'n/a'}</li>
+        <li><strong>Fetch Failed:</strong><br />{observability.fetch_failed ?? 'n/a'}</li>
+      </ul>
+      {warnings.length > 0 && (
+        <div style={{ marginTop: '0.75rem', color: '#7a4b00' }}>
+          {warnings.map((warning: string) => (
+            <div key={warning}><strong>Warning:</strong> {warning}</div>
+          ))}
+        </div>
+      )}
+      {selectedSources.length > 0 && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <strong>Selected Sources</strong>
+          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+            {selectedSources.slice(0, 5).map((source: any) => (
+              <li key={source.candidate_url_id || source.canonical_url}>
+                <span>{source.domain || 'unknown'}</span>{' '}
+                <a href={source.canonical_url} target="_blank" rel="noreferrer">{source.canonical_url}</a>
+                {' '}<span style={{ color: '#64748b' }}>
+                  {source.fetch_status ? `(${source.fetch_status})` : source.fetch_attempted === false ? '(UNATTEMPTED)' : ''}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {attemptedSources.length > 0 && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <strong>Attempted Fetches</strong>
+          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+            {attemptedSources.slice(0, 5).map((source: any) => (
+              <li key={source.fetch_attempt_id || source.canonical_url}>
+                <a href={source.canonical_url} target="_blank" rel="noreferrer">{source.canonical_url}</a>
+                {' '}status {source.fetch_status || 'unknown'}
+                {source.error_code ? ` / ${source.error_code}` : ''}
+                {source.error_reason ? ` / ${source.error_reason}` : ''}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {failedSources.length > 0 && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <strong>Failed Fetches</strong>
+          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+            {failedSources.slice(0, 5).map((source: any) => (
+              <li key={source.fetch_attempt_id || source.canonical_url}>
+                <a href={source.canonical_url} target="_blank" rel="noreferrer">{source.canonical_url}</a>
+                {' '}status {source.http_status ?? 'n/a'} / {source.error_code || source.error_reason || 'unknown'}
+                {source.trace?.exception_type ? ` / ${source.trace.exception_type}` : ''}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {unattemptedSources.length > 0 && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <strong>Unattempted Sources</strong>
+          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+            {unattemptedSources.slice(0, 5).map((source: any) => (
+              <li key={source.candidate_url_id || source.canonical_url}>
+                <a href={source.canonical_url} target="_blank" rel="noreferrer">{source.canonical_url}</a>
+                {' '}rank {source.rank ?? 'n/a'}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {parseDecisions.length > 0 && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <strong>Parse Decisions</strong>
+          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+            {parseDecisions.slice(0, 5).map((decision: any) => (
+              <li key={decision.snapshot_id || decision.content_snapshot_id}>
+                <span style={{ fontFamily: 'monospace' }}>{decision.decision || 'unknown'}</span>
+                {' '}for <a href={decision.canonical_url} target="_blank" rel="noreferrer">{decision.canonical_url || 'unknown URL'}</a>
+                {' '}({decision.mime_type || 'unknown mime'}, body {decision.body_length ?? 'n/a'} bytes)
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
   );
 };
 

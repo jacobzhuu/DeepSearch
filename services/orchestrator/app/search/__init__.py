@@ -7,6 +7,7 @@ from services.orchestrator.app.search.canonicalization import (
 )
 from services.orchestrator.app.search.providers import (
     SearchProvider,
+    SearchProviderError,
     SearchRequest,
     SearchResponse,
     SearchResultItem,
@@ -24,6 +25,7 @@ __all__ = [
     "ExpandedQuery",
     "QueryExpansionStrategy",
     "SearchProvider",
+    "SearchProviderError",
     "SearchRequest",
     "SearchResponse",
     "SearchResultItem",

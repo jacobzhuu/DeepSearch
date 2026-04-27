@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from packages.db.models import ContentSnapshot, SourceChunk, SourceDocument
+from packages.db.models import ContentSnapshot, ResearchTask, SourceChunk, SourceDocument
 from packages.db.repositories import (
     ContentSnapshotRepository,
     ResearchTaskRepository,
@@ -16,6 +17,8 @@ from packages.observability import get_logger, record_parse_results
 from services.orchestrator.app.parsing import (
     ParseResultReason,
     UnsupportedMimeTypeError,
+    assess_chunk_quality,
+    assess_source_quality,
     chunk_text,
     extract_parsed_content,
 )
@@ -137,7 +140,7 @@ class ParsingService:
         failed = 0
 
         for content_snapshot in selected_snapshots:
-            entry = self._parse_one_snapshot(task_id, content_snapshot)
+            entry = self._parse_one_snapshot(task, content_snapshot)
             entries.append(entry)
             if entry.status == "CREATED":
                 created += 1
@@ -237,9 +240,10 @@ class ParsingService:
 
     def _parse_one_snapshot(
         self,
-        task_id: UUID,
+        task: ResearchTask,
         content_snapshot: ContentSnapshot,
     ) -> ParseLedgerEntry:
+        task_id = task.id
         fetch_attempt = content_snapshot.fetch_attempt
         fetch_job = fetch_attempt.fetch_job
         if fetch_job.status != FETCH_STATUS_SUCCEEDED or fetch_attempt.error_code is not None:
@@ -327,9 +331,18 @@ class ParsingService:
             )
 
         candidate_url = fetch_job.candidate_url
+        document_url = _document_url_for_fetch(
+            candidate_url.canonical_url, fetch_attempt.trace_json
+        )
+        document_domain = _domain_from_url(document_url) or candidate_url.domain
+        source_quality = assess_source_quality(
+            canonical_url=document_url,
+            domain=document_domain,
+            parsed_metadata=parsed_content.metadata,
+        )
         source_document = self.source_document_repository.get_for_task_url(
             task_id,
-            candidate_url.canonical_url,
+            document_url,
         )
         updated_existing = source_document is not None
         if source_document is None:
@@ -337,18 +350,18 @@ class ParsingService:
                 SourceDocument(
                     task_id=task_id,
                     content_snapshot_id=content_snapshot.id,
-                    canonical_url=candidate_url.canonical_url,
-                    domain=candidate_url.domain,
+                    canonical_url=document_url,
+                    domain=document_domain,
                     title=parsed_content.title or candidate_url.title,
                     source_type=parsed_content.source_type,
                     published_at=None,
                     fetched_at=content_snapshot.fetched_at,
-                    authority_score=None,
+                    authority_score=source_quality.score,
                     freshness_score=None,
                     originality_score=None,
                     consistency_score=None,
                     safety_score=None,
-                    final_source_score=None,
+                    final_source_score=source_quality.score,
                 )
             )
         else:
@@ -359,17 +372,50 @@ class ParsingService:
             source_document.title = parsed_content.title or candidate_url.title
             source_document.source_type = parsed_content.source_type
             source_document.fetched_at = content_snapshot.fetched_at
+            source_document.domain = document_domain
+            source_document.authority_score = source_quality.score
+            source_document.final_source_score = source_quality.score
 
         parsed_chunks = chunk_text(parsed_content.text)
         for parsed_chunk in parsed_chunks:
             metadata = dict(parsed_chunk.metadata)
+            chunk_quality = assess_chunk_quality(
+                text=parsed_chunk.text,
+                query=task.query,
+                source_quality_score=source_quality.score,
+                parsed_metadata=parsed_content.metadata,
+            )
             metadata.update(
                 {
                     "content_snapshot_id": str(content_snapshot.id),
                     "mime_type": content_snapshot.mime_type,
                     "extractor": parsed_content.metadata.get("extractor"),
+                    "extractor_strategy_used": parsed_content.metadata.get(
+                        "extractor_strategy_used"
+                    ),
+                    "fallback_used": parsed_content.metadata.get("fallback_used"),
+                    "removed_boilerplate_count": parsed_content.metadata.get(
+                        "removed_boilerplate_count"
+                    ),
+                    "extracted_text_length": parsed_content.metadata.get("extracted_text_length"),
+                    "source_quality_score": source_quality.score,
+                    "source_quality_reason": source_quality.reason,
+                    "content_quality": chunk_quality.content_quality,
+                    "content_quality_score": chunk_quality.content_quality_score,
+                    "query_relevance_score": chunk_quality.query_relevance_score,
+                    "boilerplate_score": chunk_quality.boilerplate_score,
+                    "eligible_for_claims": chunk_quality.eligible_for_claims,
+                    "should_generate_claims": chunk_quality.eligible_for_claims,
+                    "is_navigation_noise": chunk_quality.is_navigation_noise,
+                    "is_reference_section": chunk_quality.is_reference_section,
+                    "quality_reasons": chunk_quality.reasons,
                 }
             )
+            if parsed_content.metadata.get("reason") == "redirect_stub":
+                metadata["reason"] = "redirect_stub"
+                metadata["discovered_followup_url"] = parsed_content.metadata.get(
+                    "discovered_followup_url"
+                )
             self.source_chunk_repository.add(
                 SourceChunk(
                     source_document_id=source_document.id,
@@ -437,5 +483,55 @@ def parse_entry_diagnostic(entry: ParseLedgerEntry) -> dict[str, object]:
         "source_document_id": (
             str(entry.source_document.id) if entry.source_document is not None else None
         ),
+        "content_quality": _first_chunk_metadata(entry.source_document, "content_quality"),
+        "content_quality_score": _first_chunk_metadata(
+            entry.source_document,
+            "content_quality_score",
+        ),
+        "extractor_strategy_used": _first_chunk_metadata(
+            entry.source_document,
+            "extractor_strategy_used",
+        ),
+        "fallback_used": _first_chunk_metadata(entry.source_document, "fallback_used"),
+        "removed_boilerplate_count": _first_chunk_metadata(
+            entry.source_document,
+            "removed_boilerplate_count",
+        ),
+        "extracted_text_length": _first_chunk_metadata(
+            entry.source_document,
+            "extracted_text_length",
+        ),
+        "source_quality_score": (
+            entry.source_document.final_source_score if entry.source_document is not None else None
+        ),
+        "reason_detail": _first_chunk_metadata(entry.source_document, "reason"),
+        "discovered_followup_url": _first_chunk_metadata(
+            entry.source_document,
+            "discovered_followup_url",
+        ),
         "chunks_created": entry.chunks_created,
     }
+
+
+def _document_url_for_fetch(candidate_url: str, trace: dict[str, object] | None) -> str:
+    if isinstance(trace, dict):
+        final_url = trace.get("final_url")
+        if isinstance(final_url, str) and final_url.startswith(("http://", "https://")):
+            return final_url
+    return candidate_url
+
+
+def _domain_from_url(url: str) -> str | None:
+    parsed = urlsplit(url)
+    if parsed.hostname is None:
+        return None
+    return parsed.hostname.lower()
+
+
+def _first_chunk_metadata(
+    source_document: SourceDocument | None,
+    key: str,
+) -> object | None:
+    if source_document is None or not source_document.chunks:
+        return None
+    return source_document.chunks[0].metadata_json.get(key)

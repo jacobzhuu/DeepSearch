@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import os
+import re
 import socket
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -184,6 +185,32 @@ class HttpAcquisitionClient:
                         "from_url": response_data.final_url,
                         "status_code": response_data.http_status,
                         "to_url": next_url,
+                    }
+                )
+                current_url = next_url
+                continue
+            stub_redirect_target = _extract_html_redirect_stub_target(response_data)
+            if stub_redirect_target is not None:
+                if redirect_count >= self.max_redirects:
+                    raise AcquisitionPolicyError(
+                        error_code="too_many_redirects",
+                        http_status=response_data.http_status,
+                        trace={
+                            "requested_url": url,
+                            "final_url": response_data.final_url,
+                            "redirect_chain": redirect_chain,
+                            "redirect_stub_target": stub_redirect_target,
+                            **_proxy_trace_for_url(current_url),
+                            **target_validation.to_trace(),
+                        },
+                    )
+                next_url = urljoin(response_data.final_url, stub_redirect_target)
+                redirect_chain.append(
+                    {
+                        "from_url": response_data.final_url,
+                        "status_code": response_data.http_status,
+                        "to_url": next_url,
+                        "reason": "html_redirect_stub",
                     }
                 )
                 current_url = next_url
@@ -378,6 +405,39 @@ def _normalize_mime_type(content_type: str | None) -> str:
 def _is_blocked_ip(address: str) -> bool:
     ip = ipaddress.ip_address(address)
     return not ip.is_global
+
+
+def _extract_html_redirect_stub_target(response_data: _HttpResponseData) -> str | None:
+    if response_data.http_status < 200 or response_data.http_status >= 300:
+        return None
+    if response_data.mime_type not in {"text/html", "text/plain"}:
+        return None
+    if len(response_data.content) > 2048:
+        return None
+    text = response_data.content.decode("utf-8", errors="replace")
+    normalized = " ".join(text.split())
+    lower = normalized.lower()
+    markers = (
+        "redirecting to ",
+        "you are being redirected",
+        "moved permanently",
+        "click here if you are not redirected",
+    )
+    if not any(marker in lower for marker in markers):
+        return None
+    for pattern in (
+        r"https?://[^\s<>'\")]+",
+        r"<meta[^>]+http-equiv=[\"']?refresh[\"']?[^>]+content=[\"'][^\"']*url=([^\"'>]+)",
+        r"<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        target = match.group(1) if match.lastindex else match.group(0)
+        target = target.strip().rstrip(".,;")
+        if target.startswith(("http://", "https://", "/")):
+            return target
+    return None
 
 
 def _request_error_trace(*, url: str, error: httpx.RequestError) -> dict[str, Any]:

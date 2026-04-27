@@ -62,6 +62,7 @@ class ResearchTaskObservabilityResponse(BaseModel):
     unattempted_sources: list[dict[str, Any]] = Field(default_factory=list)
     failed_sources: list[dict[str, Any]] = Field(default_factory=list)
     parse_decisions: list[dict[str, Any]] = Field(default_factory=list)
+    source_quality_summary: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
 
 

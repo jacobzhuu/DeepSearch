@@ -18,6 +18,7 @@ export interface ResearchTaskProgress {
     unattempted_sources: Array<Record<string, any>>;
     failed_sources: Array<Record<string, any>>;
     parse_decisions: Array<Record<string, any>>;
+    source_quality_summary?: Record<string, any> | null;
     warnings: string[];
   } | null;
 }

@@ -448,17 +448,54 @@ def _fetch_priority_score(candidate_url: CandidateUrl) -> int:
     path = parsed.path.strip().lower()
     title = (candidate_url.title or "").strip().lower()
 
-    if _is_social_video_or_forum_domain(domain):
-        return 90
-    if domain == "github.com":
-        return 80
     if _is_docs_like(domain=domain, path=path, title=title):
         return 0
     if _is_project_homepage(domain=domain, path=path):
         return 10
     if domain.endswith("wikipedia.org"):
         return 20
+    if domain == "github.com":
+        return 80
+    if _is_social_video_or_forum_domain(domain):
+        return 90
     return 50
+
+
+def fetch_priority_metadata(candidate_url: CandidateUrl) -> dict[str, object]:
+    score = _fetch_priority_score(candidate_url)
+    return {
+        "fetch_priority_score": score,
+        "fetch_priority_reason": _fetch_priority_reason(score),
+        "source_quality_score": _source_quality_score_for_fetch_priority(score),
+    }
+
+
+def _fetch_priority_reason(score: int) -> str:
+    if score == 0:
+        return "official_docs"
+    if score == 10:
+        return "project_homepage"
+    if score == 20:
+        return "wikipedia_article"
+    if score == 80:
+        return "github_repository_landing_page"
+    if score == 90:
+        return "social_video_or_forum"
+    return "generic_web_page"
+
+
+def _source_quality_score_for_fetch_priority(score: int) -> float:
+    if score == 0:
+        return 0.95
+    if score == 10:
+        return 0.72
+    if score == 20:
+        return 0.78
+    if score == 80:
+        return 0.45
+    if score == 90:
+        return 0.2
+    return 0.55
 
 
 def _is_docs_like(*, domain: str, path: str, title: str) -> bool:

@@ -21,6 +21,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 ## Phase 11 schema note
 
 - Phase 11 adds no new relational fields, tables, or indexes
+- query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`
 - host-local operational closeout, optional compose wiring, init scripts, and smoke validation all reuse the existing Phase 10 schema as-is
 - the latest relational schema change remains `20260424_0005_report_artifact_manifest_and_hash`
 - the current functional ledger loop is complete through:
@@ -181,6 +182,12 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `content_snapshot_id`
   - `mime_type`
   - `extractor`
+  - `extractor_strategy_used`
+  - `fallback_used`
+  - `removed_boilerplate_count`
+  - `extracted_text_length`
+- the parser uses those metadata keys for HTML extractor observability only; no parse-history table or new relational schema was added
+- `reference_section` chunk metadata is reserved for chunks that begin with reference material or are mostly citation/reference text; a chunk with explanatory body prose followed by `See also` or `References` should remain claim-eligible when its quality score passes
 
 ## Phase 6 indexing and retrieval usage
 
@@ -219,11 +226,17 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 - `citation_span.normalized_excerpt_hash` is now derived from a normalized excerpt string and stored with a `sha256:<hex>` format
 - current claim drafting is deterministic and explainable:
   - select source chunks from retrieval hits or explicit ids
-  - choose one support sentence-like span per chunk
+  - generate sentence candidates from eligible chunks
+  - classify query intent with lightweight rules, including the `What is X and how does it work?` definition/mechanism pattern
+  - score each candidate for content quality, query relevance, claim quality, answer fit, and source quality
+  - reject setup/getting-started instructions and broken-link residue before persistence
+  - select top answer-relevant candidates with light category and paragraph diversification
+  - if strict filters produce no claims, optionally select only explanatory fallback candidates that still meet minimum query-answer or query-relevance thresholds
   - normalize that span into a claim statement
   - create or reuse the exact-statement task claim
   - create or reuse the exact-offset citation span
   - create or reuse `claim_evidence(claim_id, citation_span_id, support)`
+- no-claims drafting diagnostics are carried in service return payloads and `pipeline.failed.details`, not stored in new database tables
 - repeated Phase 7 draft calls are guarded only by exact statement reuse plus existing citation and claim-evidence uniqueness boundaries; broader semantic claim deduplication is deferred
 
 ## Phase 8 verification and conflict-handling usage
@@ -269,6 +282,9 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - supported claims appear as settled conclusions
   - mixed and unsupported claims are rendered only with explicit status labels and uncertainty sections
   - no new claims, verification decisions, or retrieval operations are introduced during report generation
+  - low-quality or off-query supported claims are filtered using persisted or recomputed claim-quality and query-answer scores before they can appear in the Executive Summary, key conclusions, evidence details, or claim mapping
+  - definition/mechanism reports also apply an answer-category gate so supported `other`, setup, community, slogan, reference, or navigation claims do not appear as conclusions by status alone
+  - the rendered Method and Source Scope section reports answer-relevant included claims and excluded low-quality/off-query claims
 - repeated report generation is currently guarded by byte-for-byte reuse of the latest stored Markdown artifact
   - if the newly rendered Markdown matches the latest stored artifact bytes, no new `report_artifact` row is created
   - otherwise a new Markdown artifact version is created for the task

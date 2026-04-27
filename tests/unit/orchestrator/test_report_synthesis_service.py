@@ -210,6 +210,293 @@ def test_report_synthesis_filters_bad_claims_and_short_evidence(
     assert 'excerpt: "C"' not in result.markdown
 
 
+def test_report_synthesis_excludes_low_quality_supported_claims_and_warns(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/user/about.html",
+            domain="docs.searxng.org",
+            title="SearXNG about",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    source_chunk_repo = SourceChunkRepository(db_session)
+    good_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "SearXNG is a metasearch engine, aggregating the results of other search "
+                "engines while not storing information about its users."
+            ),
+            token_count=18,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.95},
+        )
+    )
+    bad_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=1,
+            text="Track development, send contributions, and report issues at SearXNG sources.",
+            token_count=10,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.95},
+        )
+    )
+    good_claim = Claim(
+        task_id=task.id,
+        statement=good_chunk.text,
+        claim_type="fact",
+        confidence=0.93,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "definition",
+            "claim_quality_score": 0.95,
+            "query_answer_score": 1.0,
+        },
+    )
+    bad_claim = Claim(
+        task_id=task.id,
+        statement=bad_chunk.text,
+        claim_type="fact",
+        confidence=0.9,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "community",
+            "claim_quality_score": 0.2,
+            "query_answer_score": 0.1,
+        },
+    )
+    db_session.add_all([good_claim, bad_claim])
+    db_session.flush()
+    good_span = CitationSpan(
+        source_chunk_id=good_chunk.id,
+        start_offset=0,
+        end_offset=len(good_chunk.text),
+        excerpt=good_chunk.text,
+        normalized_excerpt_hash="sha256:good-searxng",
+    )
+    bad_span = CitationSpan(
+        source_chunk_id=bad_chunk.id,
+        start_offset=0,
+        end_offset=len(bad_chunk.text),
+        excerpt=bad_chunk.text,
+        normalized_excerpt_hash="sha256:bad-searxng",
+    )
+    db_session.add_all([good_span, bad_span])
+    db_session.flush()
+    db_session.add_all(
+        [
+            ClaimEvidence(
+                claim_id=good_claim.id,
+                citation_span_id=good_span.id,
+                relation_type="support",
+                score=0.93,
+            ),
+            ClaimEvidence(
+                claim_id=bad_claim.id,
+                citation_span_id=bad_span.id,
+                relation_type="support",
+                score=0.9,
+            ),
+        ]
+    )
+    db_session.commit()
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = service.generate_markdown_report(task.id)
+
+    assert result.supported_claims == 1
+    assert good_chunk.text in result.markdown
+    assert bad_chunk.text not in result.markdown
+    assert "Low answer coverage: only 1 answer-relevant claims were generated." in result.markdown
+    assert "Answer-relevant claims included: 1." in result.markdown
+    assert "Excluded low-quality or off-query claims: 1." in result.markdown
+
+
+def test_report_synthesis_excludes_supported_other_and_setup_claims(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/",
+            domain="docs.searxng.org",
+            title="SearXNG docs",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    source_chunk_repo = SourceChunkRepository(db_session)
+    good_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text="SearXNG is a metasearch engine that aggregates results from search engines.",
+            token_count=16,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.95},
+        )
+    )
+    other_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=1,
+            text="SearXNG has a public instances list.",
+            token_count=8,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.95},
+        )
+    )
+    setup_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=2,
+            text="Get started with SearXNG by using one of the instances listed at .",
+            token_count=14,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.95},
+        )
+    )
+    good_claim = Claim(
+        task_id=task.id,
+        statement=good_chunk.text,
+        claim_type="fact",
+        confidence=0.93,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "definition",
+            "claim_quality_score": 0.95,
+            "query_answer_score": 1.0,
+        },
+    )
+    other_claim = Claim(
+        task_id=task.id,
+        statement=other_chunk.text,
+        claim_type="fact",
+        confidence=0.88,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "other",
+            "claim_quality_score": 0.8,
+            "query_answer_score": 0.55,
+        },
+    )
+    setup_claim = Claim(
+        task_id=task.id,
+        statement=setup_chunk.text,
+        claim_type="fact",
+        confidence=0.88,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "setup",
+            "claim_quality_score": 0.8,
+            "query_answer_score": 0.55,
+        },
+    )
+    db_session.add_all([good_claim, other_claim, setup_claim])
+    db_session.flush()
+    spans = [
+        CitationSpan(
+            source_chunk_id=good_chunk.id,
+            start_offset=0,
+            end_offset=len(good_chunk.text),
+            excerpt=good_chunk.text,
+            normalized_excerpt_hash="sha256:good-definition",
+        ),
+        CitationSpan(
+            source_chunk_id=other_chunk.id,
+            start_offset=0,
+            end_offset=len(other_chunk.text),
+            excerpt=other_chunk.text,
+            normalized_excerpt_hash="sha256:other-off-query",
+        ),
+        CitationSpan(
+            source_chunk_id=setup_chunk.id,
+            start_offset=0,
+            end_offset=len(setup_chunk.text),
+            excerpt=setup_chunk.text,
+            normalized_excerpt_hash="sha256:setup-instruction",
+        ),
+    ]
+    db_session.add_all(spans)
+    db_session.flush()
+    db_session.add_all(
+        [
+            ClaimEvidence(
+                claim_id=good_claim.id,
+                citation_span_id=spans[0].id,
+                relation_type="support",
+                score=0.93,
+            ),
+            ClaimEvidence(
+                claim_id=other_claim.id,
+                citation_span_id=spans[1].id,
+                relation_type="support",
+                score=0.88,
+            ),
+            ClaimEvidence(
+                claim_id=setup_claim.id,
+                citation_span_id=spans[2].id,
+                relation_type="support",
+                score=0.88,
+            ),
+        ]
+    )
+    db_session.commit()
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = service.generate_markdown_report(task.id)
+
+    assert result.supported_claims == 1
+    assert good_chunk.text in result.markdown
+    assert other_chunk.text not in result.markdown
+    assert setup_chunk.text not in result.markdown
+    assert "Excluded low-quality or off-query claims: 2." in result.markdown
+
+
 class SeededReportClaims:
     def __init__(self, task_id: UUID) -> None:
         self.task_id = task_id
@@ -283,7 +570,10 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
         confidence=0.92,
         verification_status="supported",
         notes_json={
-            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."}
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "definition",
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.9,
         },
     )
     mixed_claim = Claim(
@@ -293,7 +583,10 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
         confidence=0.68,
         verification_status="mixed",
         notes_json={
-            "verification": {"rationale": "Found 1 support evidence and 1 contradict evidence."}
+            "verification": {"rationale": "Found 1 support evidence and 1 contradict evidence."},
+            "claim_category": "mechanism",
+            "claim_quality_score": 0.82,
+            "query_answer_score": 0.8,
         },
     )
     unsupported_claim = Claim(
@@ -303,7 +596,12 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
         confidence=0.41,
         verification_status="unsupported",
         notes_json={
-            "verification": {"rationale": "No support evidence found; found 1 contradict evidence."}
+            "verification": {
+                "rationale": "No support evidence found; found 1 contradict evidence."
+            },
+            "claim_category": "privacy",
+            "claim_quality_score": 0.78,
+            "query_answer_score": 0.75,
         },
     )
     db_session.add_all([supported_claim, mixed_claim, unsupported_claim])

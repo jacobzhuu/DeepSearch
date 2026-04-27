@@ -38,9 +38,9 @@ The current v1 path supports:
 - synchronous HTTP acquisition with fetch jobs, attempts, and stored snapshots
 - synchronous parsing for `text/html` and `text/plain`
 - task-scoped chunk indexing and retrieval through OpenSearch
-- support-only claim drafting with citation span binding
+- support-only claim drafting with citation span binding, query-aware deterministic claim scoring, and answer-focused top-K selection
 - minimal claim verification with `support` and `contradict` evidence
-- Markdown report synthesis backed by persisted report artifacts
+- Markdown report synthesis backed by persisted report artifacts, with low-quality/off-query claim filtering and low answer-coverage warnings
 - task-event and task-detail observability for search result counts, selected sources, fetch success/failure counts, failed fetch reasons, parse decisions, and low-source warnings
 - report page HTML rendering plus Raw Markdown, Copy Markdown, and Download `.md` controls
 - JSON logs and basic metrics
@@ -132,6 +132,10 @@ Development-only note:
 | --- | --- | --- |
 | `CLAIM_DRAFTING_MAX_CANDIDATES_PER_REQUEST` | Max retrieval candidates for drafting | `5` |
 | `CLAIM_VERIFICATION_MAX_CLAIMS_PER_REQUEST` | Max claims per verification request | `5` |
+
+Claim drafting is deterministic and no-LLM. For definition/mechanism queries such as `What is SearXNG and how does it work?`, the selector now prefers definition, mechanism, privacy/design-goal, and feature sentences. It rejects contribution calls-to-action, community logistics, promotional slogans, lowercase fragments, setup/getting-started instructions, and broken-link residue such as `listed at .` before claim persistence. Scoring metadata is stored in `claim.notes_json` and regenerated reports use that metadata to exclude low-quality, setup, unsupported-category, or off-query supported claims from the report body.
+
+If strict claim filters produce no claims, the service runs a narrow deterministic fallback over explanatory definition, mechanism, privacy, or feature sentences only. It does not promote short slogans such as `Search without being tracked.`, contribution/community text, navigation, references, redirect stubs, or setup-only instructions unless the query explicitly asks for that material. Fallback claims are marked in `claim.notes_json` with `draft_mode = "fallback_relaxed"`, `fallback_reason`, and `original_rejected_reason`.
 
 ## Host-local daily operator path
 
@@ -468,7 +472,9 @@ At minimum, that route would still need:
 
 - only `text/html` and `text/plain` are supported
 - inspect task events or `GET /api/v1/research/tasks/<task_id>` for `progress.observability.parse_decisions`
-- parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, and `parser_error`
+- parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, `parser_error`, `extractor_strategy_used`, `fallback_used`, `removed_boilerplate_count`, and `extracted_text_length`
+- for Wikipedia/MediaWiki pages, expected extraction is article-body text from `main`, `article`, `#content`, `#bodyContent`, `#mw-content-text`, or `.mw-parser-output`, with paragraph fallback from `.mw-parser-output p`, `#mw-content-text p`, or readable body paragraphs if strict extraction would otherwise be empty
+- a chunk that starts with `References` should remain ineligible, but a chunk with useful `Privacy` prose followed by trailing `See also` or `References` headings should remain eligible when its quality score passes
 - `skipped_empty`, `missing_blob`, `skipped_unsupported_mime`, and `parse_error` are distinct outcomes; a `PARSING` failure message lists these per snapshot instead of only reporting that no source documents were produced
 - `POST /api/v1/research/tasks/<task_id>/parse` remains status-gated; a FAILED task returns `409` and should be revised or recreated rather than rerun in place
 
@@ -476,6 +482,7 @@ At minimum, that route would still need:
 
 - inspect `GET /metrics`
 - inspect JSON logs from the orchestrator
+- if `DRAFTING_CLAIMS` fails with `claim drafting produced no claims`, inspect `pipeline.failed.details`; it should include `total_chunks_seen`, `eligible_chunks_seen`, `candidate_sentences_count`, `rejected_candidates_count`, `top_rejected_candidates`, `rejection_reason_distribution`, and per-chunk previews with quality/relevance fields
 - query the intermediate resources:
   - `GET /candidate-urls`
   - `GET /content-snapshots`

@@ -712,7 +712,11 @@ Response `200 OK`:
         "approx_token_count": 83,
         "content_snapshot_id": "uuid",
         "mime_type": "text/html",
-        "extractor": "html_text_v1"
+        "extractor": "html_main_content_v1",
+        "extractor_strategy_used": "main_content",
+        "fallback_used": false,
+        "removed_boilerplate_count": 0,
+        "extracted_text_length": 332
       }
     }
   ]
@@ -727,6 +731,10 @@ Response `200 OK`:
   - `html_text_v1` for `text/html`
   - `plain_text_v1` for `text/plain`
 - HTML extraction keeps `<title>` for `source_document.title` but excludes it from body chunks
+- Wikipedia/MediaWiki-like HTML is extracted from content regions first (`main`, `article`, `#content`, `#bodyContent`, `#mw-content-text`, `.mw-parser-output`) and then falls back to readable paragraphs from `.mw-parser-output p`, `#mw-content-text p`, or body paragraphs when strict extraction would otherwise produce empty text
+- HTML boilerplate cleanup removes navigation, sidebars, table-of-contents blocks, edit labels, reference blocks, navboxes, footers, scripts, styles, and SVG/button/form/header noise while preserving article paragraphs
+- chunk quality treats `References`, `Bibliography`, and `External links` as whole reference sections only when the chunk starts with that material or is mostly citation/reference text; explanatory prose before a trailing `See also` or `References` heading can remain claim-eligible
+- parsed HTML chunk metadata includes `extractor_strategy_used`, `fallback_used`, `removed_boilerplate_count`, and `extracted_text_length` so skipped or weak parses can be diagnosed without opening the raw snapshot
 - plain-text title derivation currently uses the first non-empty line
 - chunking currently uses the stable `paragraph_window_v1` strategy:
   - normalize text and paragraph breaks
@@ -1084,10 +1092,23 @@ Command contract:
   - `start_offset < end_offset`
   - `excerpt` must exactly equal the corresponding `source_chunk.text` slice
 - current confidence is a minimal heuristic derived from query overlap, statement length, and retrieval score when present
+- claim drafting now ranks sentence candidates with deterministic, query-aware scoring before persistence:
+  - `content_quality_score`
+  - `query_relevance_score`
+  - `claim_quality_score`
+  - `query_answer_score`
+  - `source_quality_score`
+- for definition/mechanism questions such as `What is X and how does it work?`, the draft selector prefers definition, mechanism, privacy/design-goal, and feature claims, and penalizes setup instructions, contribution/community text, slogans, references, and navigation material
+- persisted draft claims store the scoring metadata in `claim.notes`, including `claim_category`, `claim_quality_score`, `query_answer_score`, `claim_selection_score`, and `rejected_reason` when available
+- if strict filters produce no claims, drafting may run a narrow deterministic `fallback_relaxed` pass over explanatory definition, mechanism, privacy, or feature sentences only; fallback still rejects slogans, calls-to-action, community/contribution text, redirect stubs, navigation, references, and setup-only instructions unless the query asks for them
+- fallback-created claims record `draft_mode = "fallback_relaxed"`, `fallback_reason = "strict_filters_produced_no_claims"`, and `original_rejected_reason` in `claim.notes`
 - claim drafting now filters weak deterministic candidates before persistence:
   - statements must be complete sentence-like text with minimum length and token content
   - one-word or short fragments such as `C` or `Data` are skipped
   - title/question-like statements such as `What is OpenAI?` are skipped, especially when they duplicate the task query
+  - imperative or call-to-action text such as contribution requests, Matrix/Weblate community logistics, and `run it yourself` slogans are skipped unless the task query explicitly asks for that kind of material
+  - setup/getting-started instructions and missing-link residue such as `listed at .`, `see .`, `at .`, or `from up to 251 .` are skipped for definition/mechanism queries
+  - lowercase slogan fragments without a subject are skipped
   - duplicate statements are deduped using a case- and punctuation-normalized identity
 - verification skips citation excerpts that fail the same minimum claimable-excerpt rules, so short fragments are not added as support evidence
 - verification is deterministic and explainable:
@@ -1199,6 +1220,10 @@ Response `200 OK`:
 - report synthesis filters historical weak ledger material before rendering:
   - non-claimable title/question/fragment statements are skipped
   - citation excerpts below the minimum claimable threshold are not rendered as support evidence
+  - supported claims below the persisted or recomputed `claim_quality_score` and `query_answer_score` thresholds are excluded from the report instead of being promoted into the Executive Summary
+  - for definition/mechanism queries, supported claims outside the expected definition, mechanism, privacy, or feature categories are excluded unless their answer score is very high
+  - the Method and Source Scope section reports answer-relevant included claim count and excluded low-quality/off-query claim count
+  - when fewer than two answer-relevant claims remain, the report includes `Low answer coverage: only N answer-relevant claims were generated.`
   - claims marked `supported` or `mixed` without remaining support evidence are downgraded to `unsupported` in the rendered report
 - current storage uses the existing object-store abstraction with the configured report bucket
 - Phase 10 now persists additional internal report-artifact provenance:
@@ -1244,6 +1269,7 @@ Execution contract:
   - fetch success/failure counts
   - failed fetch URL summaries with HTTP status, error code, and error reason
   - parse decisions with snapshot id, canonical URL, MIME type, storage location, body length, decision, and parser error when present
+  - claim-drafting diagnostics when a no-claims failure occurs, including chunk summaries, candidate counts, top rejected candidates, rejection reason distribution, and scoring fields for rejected candidates
   - warnings when fewer than two sources fetch successfully; this does not block completion when at least one source succeeds
 
 Response `200 OK` on completion:

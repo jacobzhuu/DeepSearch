@@ -19,15 +19,21 @@ from services.orchestrator.app.claims import (
     CLAIM_EVIDENCE_RELATION_SUPPORT,
     CLAIM_TYPE_FACT,
     CLAIM_VERIFICATION_STATUS_DRAFT,
-    CitationSpanValidationError,
+    MIN_DRAFT_CLAIM_QUALITY_SCORE,
+    MIN_DRAFT_QUERY_ANSWER_SCORE,
+    ClaimCandidateScore,
+    SupportingSpan,
     build_verification_rationale,
+    candidate_category_sort_key,
+    classify_query_intent,
     compute_claim_confidence,
     draft_claim_statement,
     is_claimable_statement,
+    iter_supporting_spans,
     normalize_claim_identity,
     normalized_excerpt_hash,
     resolve_verification_status,
-    select_supporting_span,
+    score_claim_statement,
     select_verification_span,
     validate_citation_span,
 )
@@ -92,6 +98,26 @@ class DraftClaimEntry:
 
 
 @dataclass(frozen=True)
+class DraftClaimCandidate:
+    source_chunk: SourceChunk
+    supporting_span: SupportingSpan
+    statement: str
+    score: ClaimCandidateScore
+    retrieval_score: float | None
+    paragraph_key: tuple[UUID, int]
+    rejected_rules: tuple[str, ...] = ()
+    draft_mode: str = "strict"
+    fallback_reason: str | None = None
+    original_rejected_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DraftChunkSelection:
+    chunks_seen: list[tuple[SourceChunk, float | None]]
+    eligible_chunks: list[tuple[SourceChunk, float | None]]
+
+
+@dataclass(frozen=True)
 class ClaimDraftBatchResult:
     task: ResearchTask
     effective_query: str
@@ -102,6 +128,7 @@ class ClaimDraftBatchResult:
     created_claim_evidence: int
     reused_claim_evidence: int
     entries: list[DraftClaimEntry]
+    diagnostics: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -180,7 +207,7 @@ class ClaimDraftingService:
             effective_limit = min(limit, self.max_candidates_per_request)
 
         effective_query = (query or task.query).strip()
-        selected_chunks = self._select_chunks(
+        chunk_selection = self._select_chunks_for_drafting(
             task.id,
             query=effective_query,
             source_chunk_ids=source_chunk_ids,
@@ -199,18 +226,29 @@ class ClaimDraftingService:
             for claim in self.claim_repository.list_for_task(task.id)
         }
 
-        for source_chunk, retrieval_score in selected_chunks:
-            try:
-                supporting_span = select_supporting_span(source_chunk.text, effective_query)
-            except CitationSpanValidationError:
-                continue
-            statement = draft_claim_statement(supporting_span.excerpt)
-            if not is_claimable_statement(statement, query=effective_query):
-                continue
+        ranked_candidates, diagnostics = self._rank_claim_candidates(
+            chunks_seen=chunk_selection.chunks_seen,
+            query=effective_query,
+            limit=effective_limit,
+        )
+
+        for selection_rank, candidate in enumerate(ranked_candidates, start=1):
+            source_chunk = candidate.source_chunk
+            supporting_span = candidate.supporting_span
+            retrieval_score = candidate.retrieval_score
+            statement = candidate.statement
             confidence = compute_claim_confidence(
                 query=effective_query,
                 statement=statement,
                 retrieval_score=retrieval_score,
+            )
+            claim_notes = self._build_claim_notes(
+                query=effective_query,
+                source_chunk=source_chunk,
+                retrieval_score=retrieval_score,
+                candidate=candidate,
+                selection_rank=selection_rank,
+                relation_type=CLAIM_EVIDENCE_RELATION_SUPPORT,
             )
 
             claim_identity = normalize_claim_identity(statement)
@@ -226,19 +264,13 @@ class ClaimDraftingService:
                         claim_type=CLAIM_TYPE_FACT,
                         confidence=confidence,
                         verification_status=CLAIM_VERIFICATION_STATUS_DRAFT,
-                        notes_json={
-                            "draft_query": effective_query,
-                            "draft_method": "chunk_sentence_v1",
-                            "source_chunk_id": str(source_chunk.id),
-                            "source_document_id": str(source_chunk.source_document_id),
-                            "retrieval_score": retrieval_score,
-                            "relation_type": CLAIM_EVIDENCE_RELATION_SUPPORT,
-                        },
+                        notes_json=claim_notes,
                     )
                 )
                 claims_by_identity[claim_identity] = claim
                 created_claims += 1
             else:
+                claim.notes_json = self._merge_claim_notes(claim.notes_json, claim_notes)
                 reused_claims += 1
 
             citation_span, reused_citation_span = self._ensure_citation_span(
@@ -287,6 +319,7 @@ class ClaimDraftingService:
             created_claim_evidence=created_claim_evidence,
             reused_claim_evidence=reused_claim_evidence,
             entries=entries,
+            diagnostics=diagnostics,
         )
 
     def list_claims(
@@ -365,6 +398,8 @@ class ClaimDraftingService:
             ).hits
             if retrieval_hits:
                 for source_chunk, _ in self._load_retrieved_chunks(task.id, retrieval_hits):
+                    if not _source_chunk_eligible_for_claims(source_chunk):
+                        continue
                     matched_span = select_verification_span(source_chunk.text, claim.statement)
                     if matched_span is None:
                         continue
@@ -465,6 +500,8 @@ class ClaimDraftingService:
                 source_chunk = selected_by_id.get(source_chunk_id)
                 if source_chunk is None:
                     raise ClaimSourceChunkNotFoundError(task_id, source_chunk_id)
+                if not _source_chunk_eligible_for_claims(source_chunk):
+                    continue
                 ordered_chunks.append((source_chunk, None))
                 seen_ids.add(source_chunk_id)
                 if len(ordered_chunks) >= limit:
@@ -482,10 +519,280 @@ class ClaimDraftingService:
 
         return self._load_retrieved_chunks(task_id, retrieval_hits)
 
+    def _select_chunks_for_drafting(
+        self,
+        task_id: UUID,
+        *,
+        query: str,
+        source_chunk_ids: list[UUID] | None,
+        limit: int,
+    ) -> DraftChunkSelection:
+        if source_chunk_ids is not None:
+            selected = self.source_chunk_repository.list_by_ids_for_task(task_id, source_chunk_ids)
+            selected_by_id = {item.id: item for item in selected}
+            chunks_seen: list[tuple[SourceChunk, float | None]] = []
+            seen_ids: set[UUID] = set()
+            for source_chunk_id in source_chunk_ids:
+                if source_chunk_id in seen_ids:
+                    continue
+                source_chunk = selected_by_id.get(source_chunk_id)
+                if source_chunk is None:
+                    raise ClaimSourceChunkNotFoundError(task_id, source_chunk_id)
+                chunks_seen.append((source_chunk, None))
+                seen_ids.add(source_chunk_id)
+                if len(chunks_seen) >= limit:
+                    break
+            return DraftChunkSelection(
+                chunks_seen=chunks_seen,
+                eligible_chunks=[
+                    item for item in chunks_seen if _source_chunk_eligible_for_claims(item[0])
+                ],
+            )
+
+        retrieval_hits = self.index_backend.retrieve_chunks(
+            task_id=task_id,
+            query=query,
+            offset=0,
+            limit=limit,
+        ).hits
+        if not retrieval_hits:
+            return DraftChunkSelection(chunks_seen=[], eligible_chunks=[])
+
+        chunks_seen = self._load_retrieved_chunks(
+            task_id,
+            retrieval_hits,
+            include_ineligible=True,
+        )
+        return DraftChunkSelection(
+            chunks_seen=chunks_seen,
+            eligible_chunks=[
+                item for item in chunks_seen if _source_chunk_eligible_for_claims(item[0])
+            ],
+        )
+
+    def _rank_claim_candidates(
+        self,
+        *,
+        chunks_seen: list[tuple[SourceChunk, float | None]],
+        query: str,
+        limit: int,
+    ) -> tuple[list[DraftClaimCandidate], dict[str, object]]:
+        candidates: list[DraftClaimCandidate] = []
+        for source_chunk, retrieval_score in chunks_seen:
+            content_quality_score = _chunk_content_quality_score(source_chunk)
+            source_quality_score = _source_quality_score(source_chunk)
+            for supporting_span in iter_supporting_spans(source_chunk.text):
+                try:
+                    statement = draft_claim_statement(supporting_span.excerpt)
+                except ValueError:
+                    continue
+                score = score_claim_statement(
+                    statement=statement,
+                    query=query,
+                    content_quality_score=content_quality_score,
+                    source_quality_score=source_quality_score,
+                )
+                rejected_rules = _strict_rejected_rules(source_chunk, statement, query, score)
+                candidates.append(
+                    DraftClaimCandidate(
+                        source_chunk=source_chunk,
+                        supporting_span=supporting_span,
+                        statement=statement,
+                        score=score,
+                        retrieval_score=retrieval_score,
+                        paragraph_key=(
+                            source_chunk.id,
+                            _paragraph_index(source_chunk.text, supporting_span.start_offset),
+                        ),
+                        rejected_rules=tuple(rejected_rules),
+                        original_rejected_reason=_first_rejection_reason(rejected_rules, score),
+                    )
+                )
+
+        diagnostics = _build_claim_drafting_diagnostics(
+            chunks_seen=chunks_seen,
+            candidates=candidates,
+        )
+        if not candidates:
+            return [], diagnostics
+
+        strict_candidates = [candidate for candidate in candidates if not candidate.rejected_rules]
+        if not strict_candidates:
+            fallback_candidates = self._fallback_claim_candidates(
+                candidates=candidates,
+                query=query,
+            )
+            diagnostics = {
+                **diagnostics,
+                "fallback_attempted": True,
+                "fallback_candidates_count": len(fallback_candidates),
+            }
+            if not fallback_candidates:
+                return [], diagnostics
+            ordered_fallback_candidates = sorted(
+                fallback_candidates,
+                key=lambda candidate: (
+                    -candidate.score.final_score,
+                    candidate_category_sort_key(candidate.score.claim_category),
+                    -candidate.score.query_answer_score,
+                    -candidate.score.claim_quality_score,
+                    str(candidate.source_chunk.source_document_id),
+                    candidate.source_chunk.chunk_no,
+                    candidate.supporting_span.start_offset,
+                ),
+            )
+            return (
+                self._diversify_claim_candidates(
+                    candidates=ordered_fallback_candidates,
+                    query=query,
+                    limit=limit,
+                ),
+                diagnostics,
+            )
+
+        ordered_candidates = sorted(
+            strict_candidates,
+            key=lambda candidate: (
+                -candidate.score.final_score,
+                candidate_category_sort_key(candidate.score.claim_category),
+                -candidate.score.query_answer_score,
+                -candidate.score.claim_quality_score,
+                str(candidate.source_chunk.source_document_id),
+                candidate.source_chunk.chunk_no,
+                candidate.supporting_span.start_offset,
+            ),
+        )
+        return (
+            self._diversify_claim_candidates(
+                candidates=ordered_candidates,
+                query=query,
+                limit=limit,
+            ),
+            diagnostics,
+        )
+
+    def _fallback_claim_candidates(
+        self,
+        *,
+        candidates: list[DraftClaimCandidate],
+        query: str,
+    ) -> list[DraftClaimCandidate]:
+        del query
+        fallback_candidates: list[DraftClaimCandidate] = []
+        for candidate in candidates:
+            if not _fallback_candidate_allowed(candidate):
+                continue
+            fallback_candidates.append(
+                DraftClaimCandidate(
+                    source_chunk=candidate.source_chunk,
+                    supporting_span=candidate.supporting_span,
+                    statement=candidate.statement,
+                    score=candidate.score,
+                    retrieval_score=candidate.retrieval_score,
+                    paragraph_key=candidate.paragraph_key,
+                    rejected_rules=(),
+                    draft_mode="fallback_relaxed",
+                    fallback_reason="strict_filters_produced_no_claims",
+                    original_rejected_reason=candidate.original_rejected_reason,
+                )
+            )
+        return fallback_candidates
+
+    def _diversify_claim_candidates(
+        self,
+        *,
+        candidates: list[DraftClaimCandidate],
+        query: str,
+        limit: int,
+    ) -> list[DraftClaimCandidate]:
+        selected: list[DraftClaimCandidate] = []
+        selected_keys: set[tuple[UUID, int, int]] = set()
+        used_paragraphs: set[tuple[UUID, int]] = set()
+        intent = classify_query_intent(query)
+
+        def candidate_key(candidate: DraftClaimCandidate) -> tuple[UUID, int, int]:
+            return (
+                candidate.source_chunk.id,
+                candidate.supporting_span.start_offset,
+                candidate.supporting_span.end_offset,
+            )
+
+        def add_candidate(
+            candidate: DraftClaimCandidate,
+            *,
+            enforce_paragraph_diversity: bool,
+        ) -> bool:
+            if len(selected) >= limit:
+                return False
+            key = candidate_key(candidate)
+            if key in selected_keys:
+                return False
+            if enforce_paragraph_diversity and candidate.paragraph_key in used_paragraphs:
+                return False
+            selected.append(candidate)
+            selected_keys.add(key)
+            used_paragraphs.add(candidate.paragraph_key)
+            return True
+
+        for category in intent.expected_claim_types:
+            for candidate in candidates:
+                if candidate.score.claim_category == category and add_candidate(
+                    candidate,
+                    enforce_paragraph_diversity=True,
+                ):
+                    break
+
+        for candidate in candidates:
+            add_candidate(candidate, enforce_paragraph_diversity=True)
+
+        if len(selected) < limit:
+            for candidate in candidates:
+                add_candidate(candidate, enforce_paragraph_diversity=False)
+
+        return selected[:limit]
+
+    def _build_claim_notes(
+        self,
+        *,
+        query: str,
+        source_chunk: SourceChunk,
+        retrieval_score: float | None,
+        candidate: DraftClaimCandidate,
+        selection_rank: int,
+        relation_type: str,
+    ) -> dict[str, object]:
+        return {
+            "draft_query": query,
+            "draft_method": "query_aware_sentence_ranker_v1",
+            "draft_mode": candidate.draft_mode,
+            "fallback_reason": candidate.fallback_reason,
+            "original_rejected_reason": candidate.original_rejected_reason,
+            "source_chunk_id": str(source_chunk.id),
+            "source_document_id": str(source_chunk.source_document_id),
+            "retrieval_score": retrieval_score,
+            "relation_type": relation_type,
+            "selection_rank": selection_rank,
+            "paragraph_index": candidate.paragraph_key[1],
+            **candidate.score.as_notes(),
+        }
+
+    def _merge_claim_notes(
+        self,
+        existing_notes: dict[str, object],
+        new_notes: dict[str, object],
+    ) -> dict[str, object]:
+        existing_score = _numeric_note(existing_notes.get("claim_selection_score"))
+        new_score = _numeric_note(new_notes.get("claim_selection_score"))
+        if existing_score is not None and new_score is not None and existing_score >= new_score:
+            return existing_notes
+        return {**existing_notes, **new_notes}
+
     def _load_retrieved_chunks(
         self,
         task_id: UUID,
         retrieval_hits: list[IndexedChunkRecord],
+        *,
+        include_ineligible: bool = False,
     ) -> list[tuple[SourceChunk, float | None]]:
         source_chunk_ids = [hit.source_chunk_id for hit in retrieval_hits]
         selected = self.source_chunk_repository.list_by_ids_for_task(task_id, source_chunk_ids)
@@ -496,6 +803,8 @@ class ClaimDraftingService:
             source_chunk = selected_by_id.get(hit.source_chunk_id)
             if source_chunk is None:
                 raise ClaimDraftingDataIntegrityError(hit.source_chunk_id)
+            if not include_ineligible and not _source_chunk_eligible_for_claims(source_chunk):
+                continue
             ordered_chunks.append((source_chunk, hit.score))
         return ordered_chunks
 
@@ -669,3 +978,174 @@ def create_claim_drafting_service(
         draft_allowed_statuses=draft_allowed_statuses,
         verify_allowed_statuses=verify_allowed_statuses,
     )
+
+
+def _source_chunk_eligible_for_claims(source_chunk: SourceChunk) -> bool:
+    metadata = source_chunk.metadata_json or {}
+    if metadata.get("eligible_for_claims") is False:
+        return False
+    if metadata.get("should_generate_claims") is False:
+        return False
+    if metadata.get("is_reference_section") is True:
+        return False
+    if metadata.get("is_navigation_noise") is True:
+        return False
+    if metadata.get("reason") == "redirect_stub":
+        return False
+    quality_score = metadata.get("content_quality_score")
+    if isinstance(quality_score, int | float) and quality_score < 0.3:
+        return False
+    source_score = source_chunk.source_document.final_source_score
+    if source_score is not None and source_score < 0.2:
+        return False
+    return True
+
+
+def _source_chunk_hard_excluded_for_claims(source_chunk: SourceChunk) -> bool:
+    metadata = source_chunk.metadata_json or {}
+    if metadata.get("is_reference_section") is True:
+        return True
+    if metadata.get("is_navigation_noise") is True:
+        return True
+    if metadata.get("reason") == "redirect_stub":
+        return True
+    source_score = source_chunk.source_document.final_source_score
+    return source_score is not None and source_score < 0.2
+
+
+def _strict_rejected_rules(
+    source_chunk: SourceChunk,
+    statement: str,
+    query: str,
+    score: ClaimCandidateScore,
+) -> list[str]:
+    rejected_rules: list[str] = []
+    if not _source_chunk_eligible_for_claims(source_chunk):
+        rejected_rules.append("chunk_ineligible")
+    if score.rejected_reason is not None:
+        rejected_rules.append(score.rejected_reason)
+    if score.claim_quality_score < MIN_DRAFT_CLAIM_QUALITY_SCORE:
+        rejected_rules.append("insufficient_claim_quality")
+    if score.query_answer_score < MIN_DRAFT_QUERY_ANSWER_SCORE:
+        rejected_rules.append("insufficient_answer_score")
+    if not is_claimable_statement(statement, query=query) and score.rejected_reason is None:
+        rejected_rules.append("not_claimable_statement")
+    return list(dict.fromkeys(rejected_rules))
+
+
+def _fallback_candidate_allowed(candidate: DraftClaimCandidate) -> bool:
+    statement = " ".join(candidate.statement.split())
+    if len(statement) < 40 or len(statement) > 300:
+        return False
+    if _source_chunk_hard_excluded_for_claims(candidate.source_chunk):
+        return False
+    if candidate.score.rejected_reason is not None:
+        return False
+    if candidate.score.claim_category in {"setup", "community", "slogan", "reference"}:
+        return False
+    if candidate.score.claim_category not in {"definition", "mechanism", "privacy", "feature"}:
+        return False
+    if (
+        candidate.score.query_answer_score < MIN_DRAFT_QUERY_ANSWER_SCORE
+        and candidate.score.query_relevance_score < 0.45
+    ):
+        return False
+    return True
+
+
+def _first_rejection_reason(
+    rejected_rules: list[str],
+    score: ClaimCandidateScore,
+) -> str | None:
+    if score.rejected_reason is not None:
+        return score.rejected_reason
+    return rejected_rules[0] if rejected_rules else None
+
+
+def _build_claim_drafting_diagnostics(
+    *,
+    chunks_seen: list[tuple[SourceChunk, float | None]],
+    candidates: list[DraftClaimCandidate],
+) -> dict[str, object]:
+    rejected_candidates = [candidate for candidate in candidates if candidate.rejected_rules]
+    distribution: dict[str, int] = {}
+    for candidate in rejected_candidates:
+        for rule in candidate.rejected_rules:
+            distribution[rule] = distribution.get(rule, 0) + 1
+
+    return {
+        "total_chunks_seen": len(chunks_seen),
+        "eligible_chunks_seen": sum(
+            1 for source_chunk, _ in chunks_seen if _source_chunk_eligible_for_claims(source_chunk)
+        ),
+        "candidate_sentences_count": len(candidates),
+        "rejected_candidates_count": len(rejected_candidates),
+        "top_rejected_candidates": [
+            _candidate_diagnostic(candidate)
+            for candidate in sorted(
+                rejected_candidates,
+                key=lambda item: (-item.score.final_score, item.source_chunk.chunk_no),
+            )[:10]
+        ],
+        "rejection_reason_distribution": dict(sorted(distribution.items())),
+        "chunks": [_chunk_diagnostic(source_chunk) for source_chunk, _ in chunks_seen],
+        "fallback_attempted": False,
+        "fallback_candidates_count": 0,
+    }
+
+
+def _candidate_diagnostic(candidate: DraftClaimCandidate) -> dict[str, object]:
+    rejected_reason = _first_rejection_reason(list(candidate.rejected_rules), candidate.score)
+    return {
+        "candidate_text": candidate.statement,
+        "source_chunk_id": str(candidate.source_chunk.id),
+        "claim_category": candidate.score.claim_category,
+        "claim_quality_score": candidate.score.claim_quality_score,
+        "query_answer_score": candidate.score.query_answer_score,
+        "query_relevance_score": candidate.score.query_relevance_score,
+        "claim_selection_score": candidate.score.final_score,
+        "rejected_reason": rejected_reason,
+        "rejected_rules": list(candidate.rejected_rules),
+    }
+
+
+def _chunk_diagnostic(source_chunk: SourceChunk) -> dict[str, object]:
+    metadata = source_chunk.metadata_json or {}
+    return {
+        "source_chunk_id": str(source_chunk.id),
+        "source_document_id": str(source_chunk.source_document_id),
+        "chunk_no": source_chunk.chunk_no,
+        "token_count": source_chunk.token_count,
+        "eligible_for_claims": _source_chunk_eligible_for_claims(source_chunk),
+        "content_quality_score": metadata.get("content_quality_score"),
+        "query_relevance_score": metadata.get("query_relevance_score"),
+        "text_preview": " ".join(source_chunk.text.split())[:240],
+    }
+
+
+def _chunk_content_quality_score(source_chunk: SourceChunk) -> float | None:
+    metadata = source_chunk.metadata_json or {}
+    quality_score = metadata.get("content_quality_score")
+    if isinstance(quality_score, int | float):
+        return float(quality_score)
+    return None
+
+
+def _source_quality_score(source_chunk: SourceChunk) -> float | None:
+    source_score = source_chunk.source_document.final_source_score
+    if isinstance(source_score, int | float):
+        return float(source_score)
+    return None
+
+
+def _paragraph_index(text: str, start_offset: int) -> int:
+    if start_offset <= 0:
+        return 0
+    prefix = text[:start_offset]
+    return len([part for part in prefix.split("\n\n")[:-1]])
+
+
+def _numeric_note(value: object) -> float | None:
+    if isinstance(value, int | float):
+        return float(value)
+    return None

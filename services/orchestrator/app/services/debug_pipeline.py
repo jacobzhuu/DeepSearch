@@ -24,7 +24,10 @@ from packages.db.repositories import (
 )
 from services.orchestrator.app.indexing import IndexedChunkPage
 from services.orchestrator.app.search import SearchProviderError
-from services.orchestrator.app.services.acquisition import AcquisitionService
+from services.orchestrator.app.services.acquisition import (
+    AcquisitionService,
+    fetch_priority_metadata,
+)
 from services.orchestrator.app.services.claims import ClaimDraftingService
 from services.orchestrator.app.services.indexing import IndexingService
 from services.orchestrator.app.services.parsing import ParsingService, parse_entry_diagnostic
@@ -326,12 +329,16 @@ class DebugRealPipelineRunner:
             limit=self.claim_limit,
         )
         if not result.entries:
-            raise DebugPipelinePreconditionError("claim drafting produced no claims")
+            raise DebugPipelinePreconditionError(
+                "claim drafting produced no claims",
+                details=result.diagnostics,
+            )
         return {
             "created_claims": result.created_claims,
             "reused_claims": result.reused_claims,
             "created_claim_evidence": result.created_claim_evidence,
             "reused_claim_evidence": result.reused_claim_evidence,
+            "diagnostics": result.diagnostics,
         }
 
     def _run_verify_claims(self, task_id: UUID) -> dict[str, Any]:
@@ -354,6 +361,7 @@ class DebugRealPipelineRunner:
         result = self.reporting_service.generate_markdown_report(task_id)
         if not result.markdown.strip():
             raise DebugPipelinePreconditionError("report generation produced empty markdown")
+        source_quality_summary = _build_source_quality_summary(self.session, task_id)
         return {
             "report_artifact_id": result.artifact.id,
             "report_version": result.artifact.version,
@@ -362,6 +370,8 @@ class DebugRealPipelineRunner:
             "unsupported_claims": result.unsupported_claims,
             "draft_claims": result.draft_claims,
             "report_markdown_preview": result.markdown[:500],
+            "source_quality_summary": source_quality_summary,
+            "warnings": source_quality_summary["warnings"],
         }
 
     def _mark_started(self, task: ResearchTask) -> None:
@@ -537,6 +547,7 @@ def _candidate_url_summary(candidate_url: Any) -> dict[str, Any]:
         "domain": candidate_url.domain,
         "title": candidate_url.title,
         "rank": candidate_url.rank,
+        **fetch_priority_metadata(candidate_url),
     }
 
 
@@ -652,6 +663,77 @@ def _fetch_error_reason(trace: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _build_source_quality_summary(session: Session, task_id: UUID) -> dict[str, Any]:
+    source_documents = SourceDocumentRepository(session).list_for_task(task_id)
+    source_chunks = SourceChunkRepository(session).list_for_task(task_id)
+    claim_evidence = ClaimEvidenceRepository(session).list_for_task(task_id)
+
+    high_quality_source_ids = {
+        source_document.id
+        for source_document in source_documents
+        if (source_document.final_source_score or 0.0) >= 0.65
+    }
+    evidence_domains: set[str] = set()
+    high_quality_evidence_domains: set[str] = set()
+    for evidence in claim_evidence:
+        source_document = evidence.citation_span.source_chunk.source_document
+        evidence_domains.add(source_document.domain)
+        if source_document.id in high_quality_source_ids:
+            high_quality_evidence_domains.add(source_document.domain)
+
+    low_quality_sources = [
+        source_document
+        for source_document in source_documents
+        if (source_document.final_source_score or 0.0) < 0.35
+    ]
+    redirect_stub_sources = [
+        source_chunk.source_document_id
+        for source_chunk in source_chunks
+        if (source_chunk.metadata_json or {}).get("reason") == "redirect_stub"
+    ]
+    excluded_chunks = [
+        source_chunk
+        for source_chunk in source_chunks
+        if not _chunk_metadata_eligible_for_claims(source_chunk.metadata_json or {})
+    ]
+
+    warnings: list[str] = []
+    if len(high_quality_evidence_domains) == 1:
+        warnings.append("Only one high-quality evidence domain was used")
+    elif not high_quality_evidence_domains and evidence_domains:
+        warnings.append("No high-quality evidence domain was used")
+    if redirect_stub_sources:
+        warnings.append("Some fetched pages were redirect stubs")
+    if excluded_chunks:
+        warnings.append("Some chunks were excluded as boilerplate/reference content")
+
+    return {
+        "source_count": len(source_documents),
+        "high_quality_source_count": len(high_quality_source_ids),
+        "evidence_domain_count": len(evidence_domains),
+        "high_quality_evidence_domain_count": len(high_quality_evidence_domains),
+        "low_quality_sources_skipped_count": len(low_quality_sources),
+        "excluded_chunk_count": len(excluded_chunks),
+        "redirect_stub_source_count": len(set(redirect_stub_sources)),
+        "warnings": warnings,
+    }
+
+
+def _chunk_metadata_eligible_for_claims(metadata: dict[str, Any]) -> bool:
+    if metadata.get("eligible_for_claims") is False:
+        return False
+    if metadata.get("should_generate_claims") is False:
+        return False
+    if metadata.get("is_reference_section") is True:
+        return False
+    if metadata.get("is_navigation_noise") is True:
+        return False
+    if metadata.get("reason") == "redirect_stub":
+        return False
+    quality_score = metadata.get("content_quality_score")
+    return not isinstance(quality_score, int | float) or quality_score >= 0.3
 
 
 def _format_parse_no_documents_message(parse_decisions: list[dict[str, Any]]) -> str:

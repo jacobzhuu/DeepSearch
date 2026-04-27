@@ -250,6 +250,549 @@ def test_claim_drafting_service_filters_title_short_and_duplicate_claims(
     )
 
 
+def test_claim_drafting_service_excludes_ineligible_quality_chunks(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://searxng.org/",
+            domain="searxng.org",
+            title="SearXNG redirect",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.8,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.8,
+        )
+    )
+    source_chunk_repo = SourceChunkRepository(db_session)
+    redirect_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text="Redirecting to https://docs.searxng.org/",
+            token_count=8,
+            metadata_json={
+                "eligible_for_claims": False,
+                "should_generate_claims": False,
+                "reason": "redirect_stub",
+            },
+        )
+    )
+    nav_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=1,
+            text=(
+                "Jump to content Main menu move to sidebar Privacy policy About Wikipedia "
+                "Edit links."
+            ),
+            token_count=14,
+            metadata_json={"eligible_for_claims": False, "is_navigation_noise": True},
+        )
+    )
+    reference_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=2,
+            text="Implementación De Un Prototipo (Bachelor Thesis).",
+            token_count=10,
+            metadata_json={"eligible_for_claims": False, "is_reference_section": True},
+        )
+    )
+    valid_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=3,
+            text=(
+                "SearXNG is a free internet metasearch engine that sends queries to "
+                "multiple search services and aggregates the results."
+            ),
+            token_count=22,
+            metadata_json={"eligible_for_claims": True, "content_quality_score": 0.9},
+        )
+    )
+    db_session.commit()
+
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[redirect_chunk.id, nav_chunk.id, reference_chunk.id, valid_chunk.id],
+        limit=5,
+    )
+
+    claims = ClaimRepository(db_session).list_for_task(task.id)
+    assert result.created_claims == 1
+    assert len(claims) == 1
+    assert claims[0].statement.startswith("SearXNG is a free internet metasearch engine")
+
+
+def test_claim_drafting_service_ranks_query_answer_candidates_over_cta_text(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/user/about.html",
+            domain="docs.searxng.org",
+            title="SearXNG about",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "SearXNG sources and run it yourself!\n\n"
+                "Track development, send contributions, and report issues at SearXNG sources.\n\n"
+                "SearXNG is a metasearch engine, aggregating the results of other search "
+                "engines while not storing information about its users.\n\n"
+                "It provides basic privacy by mixing your queries with searches on other "
+                "platforms without storing search data.\n\n"
+                "Come join us on Matrix if you have questions.\n\n"
+                "SearXNG supports OpenSearch."
+            ),
+            token_count=70,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.95},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    statements = [entry.claim.statement for entry in result.entries]
+    claims = ClaimRepository(db_session).list_for_task(task.id)
+
+    assert result.created_claims == 3
+    assert statements == [
+        (
+            "SearXNG is a metasearch engine, aggregating the results of other search "
+            "engines while not storing information about its users."
+        ),
+        (
+            "It provides basic privacy by mixing your queries with searches on other "
+            "platforms without storing search data."
+        ),
+        "SearXNG supports OpenSearch.",
+    ]
+    assert "Track development" not in " ".join(statements)
+    assert "Come join" not in " ".join(statements)
+    assert {claim.notes_json["claim_category"] for claim in claims} == {
+        "definition",
+        "privacy",
+        "feature",
+    }
+    for claim in claims:
+        assert claim.notes_json["claim_quality_score"] >= 0.45
+        assert claim.notes_json["query_answer_score"] >= 0.35
+
+
+def test_claim_drafting_service_diagnostics_explain_no_claims(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/",
+            domain="docs.searxng.org",
+            title="SearXNG docs",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text="Welcome to SearXNG\n\nSearch without being tracked.",
+            token_count=13,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.2,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": False,
+                "should_generate_claims": False,
+                "quality_reasons": ["very_short"],
+            },
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    diagnostics = result.diagnostics
+    assert result.entries == []
+    assert diagnostics["total_chunks_seen"] == 1
+    assert diagnostics["eligible_chunks_seen"] == 0
+    assert diagnostics["candidate_sentences_count"] >= 2
+    assert diagnostics["rejected_candidates_count"] >= 2
+    assert diagnostics["rejection_reason_distribution"]["chunk_ineligible"] >= 2
+    rejected_text = " ".join(
+        item["candidate_text"] for item in diagnostics["top_rejected_candidates"]
+    )
+    assert "Welcome to SearXNG" in rejected_text
+    assert "Search without being tracked." in rejected_text
+    assert diagnostics["chunks"][0]["text_preview"] == (
+        "Welcome to SearXNG Search without being tracked."
+    )
+
+
+def test_claim_drafting_fallback_accepts_explanatory_definition_from_soft_ineligible_chunk(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://en.wikipedia.org/wiki/SearXNG",
+            domain="en.wikipedia.org",
+            title="SearXNG",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.78,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.78,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "SearXNG is a free and open-source metasearch engine that aggregates "
+                "results from other search engines."
+            ),
+            token_count=16,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.25,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": False,
+                "should_generate_claims": False,
+                "quality_reasons": ["low_source_coverage"],
+            },
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    assert result.created_claims == 1
+    assert result.entries[0].claim.statement.startswith("SearXNG is a free")
+    assert result.entries[0].claim.notes_json["draft_mode"] == "fallback_relaxed"
+    assert (
+        result.entries[0].claim.notes_json["fallback_reason"] == "strict_filters_produced_no_claims"
+    )
+    assert result.entries[0].claim.notes_json["original_rejected_reason"] == "chunk_ineligible"
+
+
+def test_claim_drafting_fallback_rejects_short_slogan_and_community_text(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/",
+            domain="docs.searxng.org",
+            title="SearXNG docs",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "Search without being tracked.\n\n"
+                "SearXNG sources and run it yourself!\n\n"
+                "Track development, send contributions, and report issues at SearXNG sources."
+            ),
+            token_count=24,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.25,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": False,
+                "should_generate_claims": False,
+            },
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    assert result.entries == []
+    rejected_text = " ".join(
+        item["candidate_text"] for item in result.diagnostics["top_rejected_candidates"]
+    )
+    assert "Search without being tracked." in rejected_text
+    assert "Track development" in rejected_text
+    assert result.diagnostics["fallback_attempted"] is True
+    assert result.diagnostics["fallback_candidates_count"] == 0
+
+
+def test_claim_drafting_service_uses_docs_and_wikipedia_chunks_for_answer_claims(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    docs_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/",
+            domain="docs.searxng.org",
+            title="SearXNG docs",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    wiki_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://en.wikipedia.org/wiki/SearXNG",
+            domain="en.wikipedia.org",
+            title="SearXNG",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 1, tzinfo=UTC),
+            authority_score=0.78,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.78,
+        )
+    )
+    source_chunk_repo = SourceChunkRepository(db_session)
+    docs_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=docs_document.id,
+            chunk_no=0,
+            text=(
+                "Welcome to SearXNG\n\n"
+                "Search without being tracked.\n\n"
+                "Get started with SearXNG by using one of the instances listed at ."
+            ),
+            token_count=28,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": True,
+                "should_generate_claims": True,
+            },
+        )
+    )
+    wiki_definition_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=wiki_document.id,
+            chunk_no=0,
+            text=(
+                "SearXNG is a free and open-source metasearch engine that aggregates "
+                "results from other search engines.\n\n"
+                "SearXNG supports over 70 different search engines."
+            ),
+            token_count=28,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": True,
+                "should_generate_claims": True,
+            },
+        )
+    )
+    wiki_mechanism_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=wiki_document.id,
+            chunk_no=1,
+            text=(
+                "As a metasearch engine, SearXNG functions by sending queries to upstream "
+                "search engines and returning them to the user."
+            ),
+            token_count=24,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": True,
+                "should_generate_claims": True,
+            },
+        )
+    )
+    wiki_privacy_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=wiki_document.id,
+            chunk_no=2,
+            text=(
+                "Privacy\n\n"
+                "SearXNG removes private data from requests sent to search services. "
+                "SearXNG itself stores little to no information that can be used to identify "
+                "users.\n\n"
+                "See also\n\n"
+                "Free and open-source software portal\n\n"
+                "References"
+            ),
+            token_count=44,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": True,
+                "should_generate_claims": True,
+            },
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[
+            docs_chunk.id,
+            wiki_definition_chunk.id,
+            wiki_mechanism_chunk.id,
+            wiki_privacy_chunk.id,
+        ],
+        limit=5,
+    )
+
+    statements = [entry.claim.statement for entry in result.entries]
+    categories = {entry.claim.notes_json["claim_category"] for entry in result.entries}
+    joined_statements = " ".join(statements)
+    assert len(statements) >= 3
+    assert {"definition", "mechanism", "privacy"}.issubset(categories)
+    assert any("metasearch engine" in statement for statement in statements)
+    assert any(
+        "sending queries to upstream search engines" in statement for statement in statements
+    )
+    assert any("removes private data" in statement for statement in statements)
+    assert "Get started with SearXNG" not in joined_statements
+    assert "listed at ." not in joined_statements
+    assert "Search without being tracked" not in joined_statements
+    assert "See also" not in joined_statements
+    assert "References" not in joined_statements
+
+
 def _seed_source_chunk(db_session: Session) -> SeededChunk:
     task = create_research_task_service(db_session).create_task(
         query="illustrative examples",

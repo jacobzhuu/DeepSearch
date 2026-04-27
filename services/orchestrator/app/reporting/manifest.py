@@ -53,6 +53,9 @@ def build_report_manifest(
                 "claim_type": claim.claim_type,
                 "verification_status": claim.verification_status,
                 "confidence": claim.confidence,
+                "claim_quality_score": claim.claim_quality_score,
+                "query_answer_score": claim.query_answer_score,
+                "claim_category": claim.claim_category,
                 "support_evidence": [_serialize_evidence(item) for item in claim.support_evidence],
                 "contradict_evidence": [
                     _serialize_evidence(item) for item in claim.contradict_evidence

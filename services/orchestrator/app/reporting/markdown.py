@@ -41,6 +41,9 @@ class ReportClaimItem:
     rationale: str | None
     support_evidence: list[ReportEvidenceItem]
     contradict_evidence: list[ReportEvidenceItem]
+    claim_quality_score: float | None = None
+    query_answer_score: float | None = None
+    claim_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,8 @@ class RenderedMarkdownReport:
     mixed_count: int
     unsupported_count: int
     draft_count: int
+    answer_relevant_count: int
+    excluded_low_quality_count: int
 
 
 def extract_report_title(markdown: str) -> str:
@@ -76,6 +81,8 @@ def render_markdown_report(
     revision_no: int,
     claims: list[ReportClaimItem],
     sources: list[ReportSourceItem],
+    answer_relevant_claim_count: int | None = None,
+    excluded_low_quality_claim_count: int = 0,
 ) -> RenderedMarkdownReport:
     ordered_claims = sorted(
         claims,
@@ -87,6 +94,8 @@ def render_markdown_report(
         item for item in ordered_claims if item.verification_status == "unsupported"
     ]
     draft_claims = [item for item in ordered_claims if item.verification_status == "draft"]
+    if answer_relevant_claim_count is None:
+        answer_relevant_claim_count = len(ordered_claims)
 
     title = build_report_title(research_question)
     lines = [
@@ -107,6 +116,11 @@ def render_markdown_report(
             lines.append(f"- {_normalize_inline(claim.statement)}")
     else:
         lines.append("- No supported claims are currently available in the persisted ledger.")
+    if answer_relevant_claim_count < 2:
+        lines.append(
+            "- Warning: Low answer coverage:"
+            f" only {answer_relevant_claim_count} answer-relevant claims were generated."
+        )
     if mixed_claims or unsupported_claims or draft_claims:
         lines.append(
             "- Current uncertainty remains:"
@@ -134,6 +148,8 @@ def render_markdown_report(
                 f" {len(unsupported_claims)} unsupported,"
                 f" {len(draft_claims)} draft."
             ),
+            f"- Answer-relevant claims included: {answer_relevant_claim_count}.",
+            ("- Excluded low-quality or off-query claims:" f" {excluded_low_quality_claim_count}."),
             (
                 "- Evidence-linked source documents:"
                 f" {len(sources)} across domains: {', '.join(_format_domains(sources)) or 'none'}."
@@ -231,6 +247,8 @@ def render_markdown_report(
         mixed_count=len(mixed_claims),
         unsupported_count=len(unsupported_claims),
         draft_count=len(draft_claims),
+        answer_relevant_count=answer_relevant_claim_count,
+        excluded_low_quality_count=excluded_low_quality_claim_count,
     )
 
 

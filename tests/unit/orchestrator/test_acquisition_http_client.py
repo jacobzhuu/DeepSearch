@@ -193,6 +193,40 @@ def test_http_acquisition_client_limits_redirects() -> None:
     assert len(result.trace["redirect_chain"]) == 1
 
 
+def test_http_acquisition_client_follows_html_redirect_stub() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                content=b"<html><body>Redirecting to https://example.com/docs/</body></html>",
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<main><p>Documentation body.</p></main>",
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    fetch_client = HttpAcquisitionClient(
+        timeout_seconds=5.0,
+        max_redirects=3,
+        max_response_bytes=1024,
+        user_agent="deepresearch-tests/1.0",
+        resolver=StaticResolver("93.184.216.34"),
+        client=client,
+    )
+
+    result = fetch_client.fetch("https://example.com/")
+
+    assert result.error_code is None
+    assert result.final_url == "https://example.com/docs/"
+    assert result.content == b"<main><p>Documentation body.</p></main>"
+    assert result.trace["redirect_chain"][0]["reason"] == "html_redirect_stub"
+
+
 def test_http_acquisition_client_rejects_oversized_bodies() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

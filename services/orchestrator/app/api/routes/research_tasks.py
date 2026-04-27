@@ -195,6 +195,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     unattempted_sources: list[dict[str, Any]] = []
     failed_sources: list[dict[str, Any]] = []
     parse_decisions: list[dict[str, Any]] = []
+    source_quality_summary: dict[str, Any] | None = None
     warnings: list[str] = []
 
     for event in snapshot.events:
@@ -244,6 +245,10 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             failed_sources = _object_list(acquisition_payload.get("failed_sources"))
         elif stage == "PARSING":
             parse_decisions = _object_list(result.get("parse_decisions")) or parse_decisions
+        elif stage == "REPORTING":
+            quality_summary = result.get("source_quality_summary")
+            if isinstance(quality_summary, dict):
+                source_quality_summary = quality_summary
 
         details = payload.get("details")
         if isinstance(details, dict):
@@ -263,6 +268,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and not unattempted_sources
         and not failed_sources
         and not parse_decisions
+        and source_quality_summary is None
         and not deduped_warnings
     ):
         return None
@@ -277,6 +283,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         unattempted_sources=unattempted_sources,
         failed_sources=failed_sources,
         parse_decisions=parse_decisions,
+        source_quality_summary=source_quality_summary,
         warnings=deduped_warnings,
     )
 

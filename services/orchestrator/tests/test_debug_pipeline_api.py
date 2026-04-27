@@ -165,6 +165,31 @@ class EmptyBodyHttpAcquisitionClient:
         )
 
 
+class ShortSloganHttpAcquisitionClient:
+    def fetch(self, url: str) -> HttpFetchResult:
+        body = b"""
+        <html>
+          <head><title>SearXNG</title></head>
+          <body>
+            <main>
+              <p>Welcome to SearXNG</p>
+              <p>Search without being tracked.</p>
+            </main>
+          </body>
+        </html>
+        """
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=body,
+            content_hash="sha256:short-slogan",
+            trace={"test_fetch": True},
+        )
+
+
 class LaterSuccessHttpAcquisitionClient:
     def fetch(self, url: str) -> HttpFetchResult:
         if url.endswith("/source-4"):
@@ -611,6 +636,58 @@ def test_pipeline_parse_failure_records_snapshot_decisions(
             failed_events[-1]["payload"]["details"]["parse_decisions"][0]["decision"]
             == "skipped_empty"
         )
+    finally:
+        client_generator.close()
+
+
+def test_pipeline_claim_drafting_failure_includes_candidate_diagnostics(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(
+        session_factory,
+        tmp_path,
+        index_backend,
+        http_client=ShortSloganHttpAcquisitionClient(),
+    )
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is SearXNG and how does it work?"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+
+        assert pipeline_response.status_code == 200
+        payload = pipeline_response.json()
+        assert payload["completed"] is False
+        assert payload["status"] == "FAILED"
+        assert payload["failure"]["failed_stage"] == "DRAFTING_CLAIMS"
+
+        details = payload["failure"]["details"]
+        assert details["total_chunks_seen"] >= 1
+        assert details["candidate_sentences_count"] >= 2
+        assert details["rejected_candidates_count"] >= 2
+        assert details["top_rejected_candidates"]
+        rejected_text = " ".join(
+            item["candidate_text"] for item in details["top_rejected_candidates"]
+        )
+        assert "Welcome to SearXNG" in rejected_text
+        assert "Search without being tracked." in rejected_text
+        assert details["rejection_reason_distribution"]
+        assert details["chunks"][0]["text_preview"]
+
+        failed_events = [
+            event
+            for event in events_response.json()["events"]
+            if event["event_type"] == "pipeline.failed"
+        ]
+        assert failed_events
+        assert failed_events[-1]["payload"]["details"]["candidate_sentences_count"] >= 2
     finally:
         client_generator.close()
 

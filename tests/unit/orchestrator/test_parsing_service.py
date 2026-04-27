@@ -169,6 +169,10 @@ def test_parsing_service_creates_source_document_and_chunks(
     assert len(chunks) == 1
     assert "Alpha." in chunks[0].text
     assert chunks[0].metadata_json["content_snapshot_id"] == str(content_snapshot.id)
+    assert chunks[0].metadata_json["extractor_strategy_used"] == "main_content"
+    assert chunks[0].metadata_json["fallback_used"] is False
+    assert isinstance(chunks[0].metadata_json["removed_boilerplate_count"], int)
+    assert chunks[0].metadata_json["extracted_text_length"] >= len("Alpha.")
 
 
 def test_parsing_service_skips_unsupported_mime_type(
@@ -330,6 +334,42 @@ def test_parsing_service_short_html_with_title_creates_source_document(
     chunks = source_chunk_repo.list_for_document(source_document.id)
     assert len(chunks) == 1
     assert chunks[0].text == "SearXNG"
+
+
+def test_parsing_service_marks_redirect_stub_chunks_ineligible_and_records_followup_url(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    content = b"<html><body>Redirecting to https://docs.searxng.org/</body></html>"
+    content_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        query="What is SearXNG and how does it work?",
+        canonical_url="https://searxng.org/",
+        content=content,
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    source_document = source_document_repo.get_for_content_snapshot(content_snapshot.id)
+    assert result.created == 1
+    assert source_document is not None
+    assert source_document.final_source_score == 0.1
+    chunks = source_chunk_repo.list_for_document(source_document.id)
+    assert len(chunks) == 1
+    assert chunks[0].metadata_json["content_quality"] == "low"
+    assert chunks[0].metadata_json["reason"] == "redirect_stub"
+    assert chunks[0].metadata_json["eligible_for_claims"] is False
+    assert chunks[0].metadata_json["should_generate_claims"] is False
+    assert chunks[0].metadata_json["discovered_followup_url"] == "https://docs.searxng.org/"
 
 
 def test_parsing_service_updates_existing_document_for_same_canonical_url(

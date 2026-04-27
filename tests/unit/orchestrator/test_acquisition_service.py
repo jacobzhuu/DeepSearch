@@ -24,6 +24,7 @@ from services.orchestrator.app.services.acquisition import (
     AcquisitionConflictError,
     AcquisitionService,
     create_acquisition_service,
+    fetch_priority_metadata,
 )
 from services.orchestrator.app.services.research_tasks import create_research_task_service
 from services.orchestrator.app.storage import FilesystemSnapshotObjectStore
@@ -393,6 +394,69 @@ def test_acquisition_service_prioritizes_stable_html_sources_for_fetch(
         "https://www.reddit.com/r/degoogle/comments/example",
         "https://www.youtube.com/watch?v=SlqGDoXPazY",
     ]
+
+
+def test_acquisition_service_prioritizes_official_docs_over_social_and_repo_pages(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task, github_candidate = _seed_candidate(
+        db_session,
+        query="What is SearXNG and how does it work?",
+        canonical_url="https://github.com/searxng/searxng",
+    )
+    github_candidate.domain = "github.com"
+    docs_candidate = _add_candidate(
+        db_session,
+        github_candidate,
+        canonical_url="https://docs.searxng.org/",
+        domain="docs.searxng.org",
+        rank=2,
+        title="SearXNG Documentation",
+    )
+    reddit_candidate = _add_candidate(
+        db_session,
+        github_candidate,
+        canonical_url="https://www.reddit.com/r/degoogle/comments/example",
+        domain="www.reddit.com",
+        rank=3,
+    )
+    youtube_candidate = _add_candidate(
+        db_session,
+        github_candidate,
+        canonical_url="https://www.youtube.com/watch?v=SlqGDoXPazY",
+        domain="www.youtube.com",
+        rank=4,
+    )
+    db_session.commit()
+
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, content=b"ok", request=request
+        )
+
+    service = _create_acquisition_service(
+        db_session,
+        transport=httpx.MockTransport(handler),
+        snapshot_root=tmp_path,
+        resolver=StaticResolver("93.184.216.34"),
+    )
+
+    service.acquire_candidates(task.id, candidate_url_ids=None, limit=4)
+
+    docs_metadata = fetch_priority_metadata(docs_candidate)
+    reddit_metadata = fetch_priority_metadata(reddit_candidate)
+    youtube_metadata = fetch_priority_metadata(youtube_candidate)
+    github_metadata = fetch_priority_metadata(github_candidate)
+
+    assert requested_urls[0] == "https://docs.searxng.org/"
+    assert docs_metadata["fetch_priority_reason"] == "official_docs"
+    assert docs_metadata["source_quality_score"] > github_metadata["source_quality_score"]
+    assert docs_metadata["source_quality_score"] > reddit_metadata["source_quality_score"]
+    assert docs_metadata["source_quality_score"] > youtube_metadata["source_quality_score"]
 
 
 def test_acquisition_service_records_failed_attempt_without_snapshot_for_blocked_target(

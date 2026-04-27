@@ -121,6 +121,7 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
   const failedSources = Array.isArray(observability.failed_sources) ? observability.failed_sources : [];
   const parseDecisions = Array.isArray(observability.parse_decisions) ? observability.parse_decisions : [];
   const warnings = Array.isArray(observability.warnings) ? observability.warnings : [];
+  const qualitySummary = observability.source_quality_summary || null;
 
   return (
     <section style={{ border: '1px solid #e2e8f0', borderRadius: '8px', padding: '1rem', backgroundColor: '#fbfdff' }}>
@@ -135,6 +136,16 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
           {warnings.map((warning: string) => (
             <div key={warning}><strong>Warning:</strong> {warning}</div>
           ))}
+        </div>
+      )}
+      {qualitySummary && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <strong>Source Quality</strong>
+          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+            <li>Sources: {qualitySummary.source_count ?? 'n/a'} / high quality {qualitySummary.high_quality_source_count ?? 'n/a'}</li>
+            <li>Evidence domains: {qualitySummary.evidence_domain_count ?? 'n/a'}</li>
+            <li>Excluded chunks: {qualitySummary.excluded_chunk_count ?? 'n/a'}</li>
+          </ul>
         </div>
       )}
       {selectedSources.length > 0 && (

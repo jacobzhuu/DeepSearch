@@ -6,6 +6,12 @@ from services.orchestrator.app.parsing.extractors import (
     UnsupportedMimeTypeError,
     extract_parsed_content,
 )
+from services.orchestrator.app.parsing.quality import (
+    ChunkQuality,
+    SourceQuality,
+    assess_chunk_quality,
+    assess_source_quality,
+)
 from services.orchestrator.app.parsing.reasons import (
     PARSE_RESULT_REASON_VALUES,
     ParseResultReason,
@@ -16,7 +22,11 @@ __all__ = [
     "ParsedChunk",
     "ParsedContent",
     "ParseResultReason",
+    "ChunkQuality",
+    "SourceQuality",
     "UnsupportedMimeTypeError",
+    "assess_chunk_quality",
+    "assess_source_quality",
     "chunk_text",
     "extract_parsed_content",
 ]

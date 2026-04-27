@@ -15,7 +15,15 @@ from packages.db.repositories import (
     ResearchTaskRepository,
 )
 from packages.observability import get_logger, record_report_result
-from services.orchestrator.app.claims import is_claimable_excerpt, is_claimable_statement
+from services.orchestrator.app.claims import (
+    REPORT_CLAIM_QUALITY_THRESHOLD,
+    REPORT_QUERY_ANSWER_THRESHOLD,
+    ClaimCandidateScore,
+    classify_query_intent,
+    is_claimable_excerpt,
+    is_claimable_statement,
+    score_claim_statement,
+)
 from services.orchestrator.app.reporting import (
     ClaimStatus,
     EvidenceRelation,
@@ -225,8 +233,14 @@ class ReportSynthesisService:
 
         report_claims: list[ReportClaimItem] = []
         source_items: dict[UUID, ReportSourceItem] = {}
+        excluded_low_quality_claim_count = 0
         for claim in claims:
             if not is_claimable_statement(claim.statement, query=task.query):
+                excluded_low_quality_claim_count += 1
+                continue
+            claim_score = _report_claim_score(claim, query=task.query)
+            if not _report_claim_answer_relevant(claim_score, query=task.query):
+                excluded_low_quality_claim_count += 1
                 continue
             support_evidence: list[ReportEvidenceItem] = []
             contradict_evidence: list[ReportEvidenceItem] = []
@@ -235,6 +249,8 @@ class ReportSynthesisService:
                 if not is_claimable_excerpt(citation_span.excerpt):
                     continue
                 source_chunk = citation_span.source_chunk
+                if not _source_chunk_eligible_for_report(source_chunk):
+                    continue
                 source_document = source_chunk.source_document
                 report_evidence = ReportEvidenceItem(
                     claim_evidence_id=evidence.id,
@@ -281,6 +297,9 @@ class ReportSynthesisService:
                     rationale=self._extract_rationale(claim),
                     support_evidence=support_evidence,
                     contradict_evidence=contradict_evidence,
+                    claim_quality_score=claim_score.claim_quality_score,
+                    query_answer_score=claim_score.query_answer_score,
+                    claim_category=claim_score.claim_category,
                 )
             )
 
@@ -292,6 +311,8 @@ class ReportSynthesisService:
                 revision_no=task.revision_no,
                 claims=report_claims,
                 sources=sources,
+                answer_relevant_claim_count=len(report_claims),
+                excluded_low_quality_claim_count=excluded_low_quality_claim_count,
             ),
             claims=report_claims,
             sources=sources,
@@ -373,3 +394,73 @@ def create_report_synthesis_service(
         object_store=object_store,
         report_storage_bucket=report_storage_bucket,
     )
+
+
+def _source_chunk_eligible_for_report(source_chunk: object) -> bool:
+    metadata = getattr(source_chunk, "metadata_json", {}) or {}
+    if metadata.get("eligible_for_claims") is False:
+        return False
+    if metadata.get("should_generate_claims") is False:
+        return False
+    if metadata.get("is_reference_section") is True:
+        return False
+    if metadata.get("is_navigation_noise") is True:
+        return False
+    if metadata.get("reason") == "redirect_stub":
+        return False
+    quality_score = metadata.get("content_quality_score")
+    if isinstance(quality_score, int | float) and quality_score < 0.3:
+        return False
+    return True
+
+
+def _report_claim_score(claim: Claim, *, query: str) -> ClaimCandidateScore:
+    notes = claim.notes_json or {}
+    noted_score = _claim_score_from_notes(notes)
+    if noted_score is not None:
+        return noted_score
+    return score_claim_statement(statement=claim.statement, query=query)
+
+
+def _report_claim_answer_relevant(score: ClaimCandidateScore, *, query: str) -> bool:
+    if score.rejected_reason is not None:
+        return False
+    if score.claim_quality_score < REPORT_CLAIM_QUALITY_THRESHOLD:
+        return False
+    if score.query_answer_score < REPORT_QUERY_ANSWER_THRESHOLD:
+        return False
+
+    intent = classify_query_intent(query)
+    if intent.intent_name == "generic":
+        return score.claim_category not in intent.avoid_claim_types
+    if score.claim_category in intent.expected_claim_types:
+        return True
+    if score.claim_category in intent.avoid_claim_types:
+        return False
+    return score.query_answer_score >= 0.85 and score.claim_quality_score >= 0.7
+
+
+def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | None:
+    claim_quality_score = _numeric_note(notes.get("claim_quality_score"))
+    query_answer_score = _numeric_note(notes.get("query_answer_score"))
+    if claim_quality_score is None or query_answer_score is None:
+        return None
+
+    claim_category = notes.get("claim_category")
+    rejected_reason = notes.get("rejected_reason")
+    return ClaimCandidateScore(
+        claim_category=claim_category if isinstance(claim_category, str) else "other",
+        content_quality_score=_numeric_note(notes.get("content_quality_score")) or 0.6,
+        query_relevance_score=_numeric_note(notes.get("query_relevance_score")) or 0.0,
+        claim_quality_score=claim_quality_score,
+        query_answer_score=query_answer_score,
+        source_quality_score=_numeric_note(notes.get("source_quality_score")) or 0.5,
+        final_score=_numeric_note(notes.get("claim_selection_score")) or 0.0,
+        rejected_reason=rejected_reason if isinstance(rejected_reason, str) else None,
+    )
+
+
+def _numeric_note(value: object) -> float | None:
+    if isinstance(value, int | float):
+        return float(value)
+    return None

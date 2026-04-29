@@ -24,6 +24,7 @@ from services.orchestrator.app.api.schemas.pipeline import (
 )
 from services.orchestrator.app.db import get_db_session
 from services.orchestrator.app.indexing import ChunkIndexBackend
+from services.orchestrator.app.planning import create_research_planner_service
 from services.orchestrator.app.search import QueryExpansionStrategy, SearchProvider
 from services.orchestrator.app.services.acquisition import create_acquisition_service
 from services.orchestrator.app.services.claims import create_claim_drafting_service
@@ -117,12 +118,15 @@ def run_deepsearch_pipeline(
             object_store=snapshot_object_store,
             report_storage_bucket=settings.report_storage_bucket,
         ),
+        planner_service=create_research_planner_service(settings),
         dependencies=dependencies,
         fetch_limit=settings.acquisition_max_candidates_per_request,
         parse_limit=3,
         index_limit=10,
         claim_limit=5,
         target_successful_snapshots=settings.acquisition_target_successful_snapshots,
+        min_answer_sources=settings.acquisition_min_answer_sources,
+        max_supplemental_sources=settings.acquisition_max_supplemental_sources,
     )
 
     try:
@@ -182,10 +186,29 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
         "index_mode": "deterministic-local" if index_mode in {"local", "memory"} else index_mode,
         "opensearch_base_url": settings.opensearch_base_url,
         "opensearch_index_name": settings.opensearch_index_name,
-        "uses_llm_api": False,
-        "llm_mode": "no-LLM",
+        "uses_llm_api": bool(
+            settings.llm_enabled
+            and settings.research_planner_enabled
+            and settings.llm_provider.strip().lower() not in {"", "noop"}
+        ),
+        "llm_mode": _llm_mode(settings),
+        "llm_provider": settings.llm_provider.strip().lower() or "noop",
+        "llm_model": settings.llm_model.strip(),
+        "llm_base_url_configured": bool(settings.llm_base_url.strip()),
+        "research_planner_enabled": bool(
+            settings.research_planner_enabled and settings.llm_enabled
+        ),
         "uses_worker_or_queue": False,
     }
+
+
+def _llm_mode(settings: Any) -> str:
+    if not settings.research_planner_enabled or not settings.llm_enabled:
+        return "no-LLM"
+    normalized_provider = settings.llm_provider.strip().lower() or "noop"
+    if normalized_provider == "noop":
+        return "planner-noop"
+    return "planner-LLM"
 
 
 def _validate_required_configuration(dependencies: dict[str, Any]) -> None:

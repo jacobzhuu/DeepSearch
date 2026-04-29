@@ -104,13 +104,20 @@ _FEATURE_TERMS = (
     "opensearch",
     "over 70 different search engines",
     "supports",
-    "self-hosted",
-    "self hosted",
     "default search engine",
     "browser's search bar",
     "browser search bar",
     "categories",
     "engines",
+)
+_DEPLOYMENT_TERMS = (
+    "self-hosted",
+    "self hosted",
+    "self host",
+    "selfhost",
+    "deploy",
+    "deployed as",
+    "host your own",
 )
 _SETUP_TERMS = (
     "add your instance",
@@ -132,7 +139,11 @@ _COMMUNITY_TERMS = (
     "contribution",
     "contributions",
     "development",
+    "join matrix",
+    "make it better",
+    "make searxng better",
     "matrix",
+    "open community",
     "report issues",
     "send contributions",
     "source code",
@@ -144,6 +155,19 @@ _SLOGAN_TERMS = (
     "make the internet freer",
     "reclaim their privacy",
     "reclaim your privacy",
+    "search without being tracked",
+)
+_NAVIGATION_POINTER_TERMS = (
+    "developer documentation",
+    "documentation page",
+    "documentation pages",
+    "for more information",
+    "learn more",
+    "read the documentation",
+    "see installation",
+    "see the documentation",
+    "visit documentation",
+    "visit the documentation",
 )
 _IMPERATIVE_PREFIX_PATTERN = re.compile(
     r"^(?:"
@@ -161,6 +185,22 @@ _IMPERATIVE_PREFIX_PATTERN = re.compile(
 )
 _BROKEN_LINK_RESIDUE_PATTERN = re.compile(
     r"(?:\blisted\s+at\s+\.|\bsee\s+\.|\bat\s+\.|\bfrom\s+up\s+to\s+\d+\s+\.)",
+    re.IGNORECASE,
+)
+_FIGURE_OR_CAPTION_PATTERN = re.compile(
+    r"^(?:" r"fig\.?\s*\d+\b|" r"figure\s+\d+\b|" r"\d+\s+reference\s+architecture\b" r")",
+    re.IGNORECASE,
+)
+_DIAGRAM_OR_CONFIG_FRAGMENT_PATTERN = re.compile(
+    r"(?:"
+    r"\bdigraph\s+g\b|"
+    r"\bsubgraph\s+cluster\b|"
+    r"\bnode\s*\[\s*style\s*=|"
+    r"\b[a-z0-9_]+\s*->\s*[a-z0-9_]+\b|"
+    r"\bvalkey://|"
+    r"\buse_default_settings\s*:|"
+    r"\bsecret_key\s*:"
+    r")",
     re.IGNORECASE,
 )
 _SETUP_ALLOWED_QUERY_TERMS = {
@@ -187,12 +227,19 @@ _CATEGORY_PRIORITY = {
     "mechanism": 1,
     "privacy": 2,
     "feature": 3,
-    "other": 4,
-    "setup": 5,
-    "community": 6,
-    "slogan": 7,
-    "reference": 8,
+    "deployment/self_hosting": 4,
+    "other": 5,
+    "navigation": 6,
+    "setup": 7,
+    "community": 8,
+    "slogan": 9,
+    "reference": 10,
 }
+ANSWER_CLAIM_CATEGORIES = frozenset(
+    {"definition", "mechanism", "privacy", "feature", "deployment/self_hosting"}
+)
+CORE_OVERVIEW_CLAIM_CATEGORIES = frozenset({"definition", "mechanism", "privacy", "feature"})
+NON_ANSWER_CLAIM_CATEGORIES = frozenset({"navigation", "setup", "community", "slogan", "reference"})
 MIN_CLAIM_STATEMENT_CHARS = 32
 MIN_CLAIM_STATEMENT_TOKENS = 5
 MIN_DRAFT_CLAIM_QUALITY_SCORE = 0.45
@@ -225,6 +272,8 @@ class QueryIntent:
 @dataclass(frozen=True)
 class ClaimCandidateScore:
     claim_category: str
+    answer_role: str
+    answer_relevant: bool
     content_quality_score: float
     query_relevance_score: float
     claim_quality_score: float
@@ -236,6 +285,8 @@ class ClaimCandidateScore:
     def as_notes(self) -> dict[str, Any]:
         return {
             "claim_category": self.claim_category,
+            "answer_role": self.answer_role,
+            "answer_relevant": self.answer_relevant,
             "content_quality_score": self.content_quality_score,
             "query_relevance_score": self.query_relevance_score,
             "claim_quality_score": self.claim_quality_score,
@@ -277,6 +328,18 @@ def classify_query_intent(query: str | None) -> QueryIntent:
     subject_terms = _extract_subject_terms(normalized)
     setup_allowed = bool(query_tokens & _SETUP_ALLOWED_QUERY_TERMS)
     contribution_allowed = bool(query_tokens & _CONTRIBUTION_ALLOWED_QUERY_TERMS)
+    deployment_relevant = bool(
+        query_tokens
+        & {
+            "deploy",
+            "deployment",
+            "host",
+            "hosting",
+            "self",
+            "selfhost",
+            "selfhosting",
+        }
+    )
 
     if (
         subject_terms
@@ -284,9 +347,12 @@ def classify_query_intent(query: str | None) -> QueryIntent:
         and "how" in query_tokens
         and ("work" in query_tokens or "works" in query_tokens)
     ):
+        expected = ("definition", "mechanism", "privacy", "feature")
+        if deployment_relevant:
+            expected = (*expected, "deployment/self_hosting")
         return QueryIntent(
             intent_name="definition_mechanism",
-            expected_claim_types=("definition", "mechanism", "privacy", "feature"),
+            expected_claim_types=expected,
             avoid_claim_types=("setup", "community", "slogan", "reference", "navigation"),
             subject_terms=subject_terms,
             setup_allowed=setup_allowed,
@@ -294,9 +360,12 @@ def classify_query_intent(query: str | None) -> QueryIntent:
         )
 
     if subject_terms and ("what is" in lower or "what are" in lower):
+        expected = ("definition", "privacy", "feature", "mechanism")
+        if deployment_relevant:
+            expected = (*expected, "deployment/self_hosting")
         return QueryIntent(
             intent_name="definition",
-            expected_claim_types=("definition", "privacy", "feature", "mechanism"),
+            expected_claim_types=expected,
             avoid_claim_types=("setup", "community", "slogan", "reference", "navigation"),
             subject_terms=subject_terms,
             setup_allowed=setup_allowed,
@@ -335,10 +404,21 @@ def score_claim_statement(
     query_answer = _compute_query_answer_score(
         category=category, query_relevance=query_relevance, intent=intent
     )
+    answer_role = answer_role_for_claim_category(category, intent=intent)
+    answer_relevant = _is_answer_relevant_components(
+        category=category,
+        answer_role=answer_role,
+        rejected_reason=rejected_reason,
+        claim_quality_score=claim_quality,
+        query_answer_score=query_answer,
+        intent=intent,
+    )
 
     if rejected_reason is not None:
         claim_quality = min(claim_quality, 0.2)
         query_answer = min(query_answer, 0.2)
+        answer_role = "non_answer"
+        answer_relevant = False
 
     final_score = round(
         (content_score * 0.18)
@@ -350,6 +430,8 @@ def score_claim_statement(
     )
     return ClaimCandidateScore(
         claim_category=category,
+        answer_role=answer_role,
+        answer_relevant=answer_relevant,
         content_quality_score=round(content_score, 4),
         query_relevance_score=round(query_relevance, 4),
         claim_quality_score=round(claim_quality, 4),
@@ -370,15 +452,21 @@ def classify_claim_category(statement: str, *, intent: QueryIntent | None = None
         return "reference"
     if _contains_any(lower, _SLOGAN_TERMS):
         return "slogan"
+    if _looks_like_navigation_or_documentation_pointer(normalized):
+        return "navigation"
     if _contains_any(lower, _COMMUNITY_TERMS):
         return "community"
     if _IMPERATIVE_PREFIX_PATTERN.search(normalized) or _contains_any(lower, _SETUP_TERMS):
         return "setup"
     if any(pattern in padded for pattern in _DEFINITION_PATTERNS):
         return "definition"
+    if any(term in lower for term in _DEPLOYMENT_TERMS):
+        return "deployment/self_hosting"
     if any(term in lower for term in _PRIVACY_TERMS):
         return "privacy"
-    if "supports" in lower and any(term in lower for term in _FEATURE_TERMS):
+    if ("supports" in lower or "supported" in lower) and any(
+        term in lower for term in _FEATURE_TERMS
+    ):
         return "feature"
     if any(term in lower for term in _MECHANISM_TERMS):
         return "mechanism"
@@ -391,6 +479,42 @@ def classify_claim_category(statement: str, *, intent: QueryIntent | None = None
 
 def candidate_category_sort_key(category: str) -> int:
     return _CATEGORY_PRIORITY.get(category, 99)
+
+
+def is_overview_answer_intent(intent: QueryIntent) -> bool:
+    return intent.intent_name in {"definition", "definition_mechanism"}
+
+
+def is_answer_claim_category(category: str) -> bool:
+    return category in ANSWER_CLAIM_CATEGORIES
+
+
+def answer_role_for_claim_category(category: str, *, intent: QueryIntent) -> str:
+    if category in CORE_OVERVIEW_CLAIM_CATEGORIES:
+        return category
+    if category == "deployment/self_hosting":
+        if category in intent.expected_claim_types or is_overview_answer_intent(intent):
+            return category
+        if intent.intent_name == "generic":
+            return category
+    if intent.intent_name == "generic" and category not in intent.avoid_claim_types:
+        return category
+    return "non_answer"
+
+
+def is_answer_relevant_score(score: ClaimCandidateScore, *, query: str | None) -> bool:
+    intent = classify_query_intent(query)
+    answer_role = score.answer_role
+    if not answer_role or answer_role == "non_answer":
+        answer_role = answer_role_for_claim_category(score.claim_category, intent=intent)
+    return _is_answer_relevant_components(
+        category=score.claim_category,
+        answer_role=answer_role,
+        rejected_reason=score.rejected_reason,
+        claim_quality_score=score.claim_quality_score,
+        query_answer_score=score.query_answer_score,
+        intent=intent,
+    )
 
 
 def _claim_rejection_reason(
@@ -415,6 +539,10 @@ def _claim_rejection_reason(
         return "unbalanced_quotes"
     if _has_broken_link_residue(normalized):
         return "broken_link_residue"
+    if _looks_like_figure_caption(normalized):
+        return "figure_caption_or_diagram"
+    if _looks_like_diagram_or_config_fragment(normalized):
+        return "diagram_or_config_fragment"
     if _looks_like_reference_statement(normalized, query=query):
         return "reference_or_citation"
     if _TERMINAL_SENTENCE_PATTERN.search(normalized) is None:
@@ -430,10 +558,16 @@ def _claim_rejection_reason(
         return "promotional_or_imperative_exclamation"
     if category == "slogan":
         return "slogan_fragment"
+    if category == "navigation":
+        return "navigation_or_documentation_pointer"
     if category == "community" and not intent.contribution_allowed:
         return "community_or_contribution"
     if category == "setup" and not intent.setup_allowed and _is_setup_instruction(lower):
         return "setup_instruction"
+    if is_overview_answer_intent(intent) and category == "other":
+        return "not_answer_focused"
+    if category == "other" and _looks_like_caption_or_heading_fragment(normalized):
+        return "caption_or_heading_fragment"
     tokens = _tokenize(normalized)
     semantic_units = len(tokens) + (len(_CJK_CHAR_PATTERN.findall(normalized)) // 2)
     if semantic_units < MIN_CLAIM_STATEMENT_TOKENS and not (
@@ -700,7 +834,9 @@ def _compute_query_relevance_score(
         "mechanism": 0.85,
         "privacy": 0.75,
         "feature": 0.7,
+        "deployment/self_hosting": 0.65,
         "other": 0.0,
+        "navigation": 0.0,
         "setup": 0.2,
         "community": 0.1,
         "slogan": 0.1,
@@ -723,11 +859,11 @@ def _compute_claim_quality_score(statement: str, *, category: str) -> float:
         score += 0.1
     if any(verb in f" {lower} " for verb in (" is ", " are ", " provides ", " supports ")):
         score += 0.08
-    if category in {"definition", "mechanism", "privacy", "feature"}:
+    if category in ANSWER_CLAIM_CATEGORIES:
         score += 0.08
     if normalized.endswith("!"):
         score -= 0.2
-    if category in {"community", "slogan", "reference"}:
+    if category in {"community", "slogan", "reference", "navigation"}:
         score -= 0.35
     if category == "setup":
         score -= 0.2
@@ -750,12 +886,41 @@ def _compute_query_answer_score(
         "mechanism": 0.95,
         "privacy": 0.85,
         "feature": 0.75,
+        "deployment/self_hosting": 0.7,
     }
     if category in intent.expected_claim_types:
         return expected_scores.get(category, max(query_relevance, 0.6))
     if category in intent.avoid_claim_types:
         return 0.1
+    if category == "deployment/self_hosting" and is_overview_answer_intent(intent):
+        return _clamp_score(max(query_relevance * 0.55, 0.45))
+    if category == "other" and is_overview_answer_intent(intent):
+        return _clamp_score(min(query_relevance * 0.35, 0.25))
     return _clamp_score(query_relevance * 0.55)
+
+
+def _is_answer_relevant_components(
+    *,
+    category: str,
+    answer_role: str,
+    rejected_reason: str | None,
+    claim_quality_score: float,
+    query_answer_score: float,
+    intent: QueryIntent,
+) -> bool:
+    if rejected_reason is not None:
+        return False
+    if claim_quality_score < MIN_DRAFT_CLAIM_QUALITY_SCORE:
+        return False
+    if query_answer_score < MIN_DRAFT_QUERY_ANSWER_SCORE:
+        return False
+    if answer_role == "non_answer":
+        return False
+    if is_overview_answer_intent(intent):
+        return answer_role in ANSWER_CLAIM_CATEGORIES
+    if intent.intent_name == "generic":
+        return category not in intent.avoid_claim_types
+    return category in intent.expected_claim_types
 
 
 def _starts_with_lowercase_fragment(statement: str, *, intent: QueryIntent) -> bool:
@@ -802,6 +967,41 @@ def _is_setup_instruction(lower_statement: str) -> bool:
 
 def _has_broken_link_residue(statement: str) -> bool:
     return _BROKEN_LINK_RESIDUE_PATTERN.search(statement) is not None
+
+
+def _looks_like_figure_caption(statement: str) -> bool:
+    return _FIGURE_OR_CAPTION_PATTERN.search(statement.strip()) is not None
+
+
+def _looks_like_diagram_or_config_fragment(statement: str) -> bool:
+    return _DIAGRAM_OR_CONFIG_FRAGMENT_PATTERN.search(statement) is not None
+
+
+def _looks_like_caption_or_heading_fragment(statement: str) -> bool:
+    lower = statement.lower()
+    if _has_explanatory_claim_verb(lower):
+        return False
+    tokens = _tokenize(statement)
+    if len(tokens) <= 8 and any(
+        term in lower for term in ("architecture", "configuration", "diagram", "reference setup")
+    ):
+        return True
+    return bool(re.match(r"^\d+\s+[A-Z][A-Za-z0-9 -]{8,120}[.!]?$", statement))
+
+
+def _looks_like_navigation_or_documentation_pointer(statement: str) -> bool:
+    normalized = _normalize_whitespace(statement)
+    lower = normalized.lower()
+    if _contains_any(lower, _NAVIGATION_POINTER_TERMS):
+        return True
+    if lower in {"documentation", "developer documentation", "user documentation"}:
+        return True
+    if lower.startswith(("visit ", "read ", "see ")) and "documentation" in lower:
+        return True
+    if "documentation" in lower and not _has_explanatory_claim_verb(lower):
+        tokens = _tokenize(normalized)
+        return len(tokens) <= 8
+    return False
 
 
 def _contains_any(value: str, terms: Iterable[str]) -> bool:

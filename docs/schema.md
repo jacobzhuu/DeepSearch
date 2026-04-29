@@ -21,15 +21,21 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 ## Phase 11 schema note
 
 - Phase 11 adds no new relational fields, tables, or indexes
-- query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`
+- Research Planner v1 stores its output in existing `task_event.payload_json` rows with event types `research_plan.created` and `research_plan.failed`; no `research_plan` table or migration exists
+- planner guardrail, source-selection, answer-slot coverage, source-yield, evidence-yield, dropped-source, verifier-detail, supplemental-acquisition, and failure-diagnostic fields are stored in existing `task_event.payload_json`, `claim.notes_json`, `report_artifact.manifest_json`, and API observability payloads; no new planner, source-quality, answer-slot, evidence-candidate, or acquisition-retry table exists
+- query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `answer_role`, `answer_relevant`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`
+- claim drafting now also stores code-contract lineage fields in `claim.notes_json`, including `slot_ids`, `source_document_id`, `source_chunk_id`, `citation_span_id`, `claim_evidence_id`, `source_intent`, `evidence_candidate_id`, `evidence_quality_score`, `evidence_salience_score`, `evidence_rejection_reasons`, and a serialized `evidence_candidate` payload
+- verification stores deterministic lexical verifier metadata in `claim.notes_json["verification"]`, including `verifier_method`, strong and weak support counts, contradiction counts, insufficient-evidence count, relation details, shallow-overlap flags, numeric/date mismatch flags, and scope-mismatch flags
 - host-local operational closeout, optional compose wiring, init scripts, and smoke validation all reuse the existing Phase 10 schema as-is
+- `services/orchestrator/app/research_quality/` provides the current code-level source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, and slot-coverage contracts; these are not relational schema entities yet
+- the stable code-level diagnostics field names are `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, `evidence_yield_summary`, `slot_coverage_summary`, and `verification_summary`; older rows that lack these fields are interpreted as empty summaries rather than requiring a data migration
 - the latest relational schema change remains `20260424_0005_report_artifact_manifest_and_hash`
 - the current functional ledger loop is complete through:
   - `research_task -> search_query -> candidate_url -> fetch_job/fetch_attempt -> content_snapshot -> source_document/source_chunk -> claim/citation_span/claim_evidence -> report_artifact`
 - no additional schema has been introduced for:
   - OpenClaw
   - HTML/PDF artifacts
-  - planner / gap analyzer
+  - persisted planner / gap analyzer entities
   - richer verifier workflows
   - advanced retrieval optimization
 
@@ -186,6 +192,10 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `fallback_used`
   - `removed_boilerplate_count`
   - `extracted_text_length`
+  - `text_cleanup_applied`
+  - `dropped_broken_link_fragments`
+  - `preserved_link_text_count`
+  - `link_text_extraction_strategy`
 - the parser uses those metadata keys for HTML extractor observability only; no parse-history table or new relational schema was added
 - `reference_section` chunk metadata is reserved for chunks that begin with reference material or are mostly citation/reference text; a chunk with explanatory body prose followed by `See also` or `References` should remain claim-eligible when its quality score passes
 
@@ -237,7 +247,8 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - create or reuse the exact-offset citation span
   - create or reuse `claim_evidence(claim_id, citation_span_id, support)`
 - no-claims drafting diagnostics are carried in service return payloads and `pipeline.failed.details`, not stored in new database tables
-- repeated Phase 7 draft calls are guarded only by exact statement reuse plus existing citation and claim-evidence uniqueness boundaries; broader semantic claim deduplication is deferred
+- repeated Phase 7 draft calls are guarded by exact statement reuse plus existing citation and claim-evidence uniqueness boundaries
+- broader answer-level near-duplicate suppression is deterministic and service-level only; diagnostics report `near_duplicate_claims_removed`, while exact duplicate statements can still reuse the same claim and add additional citation evidence
 
 ## Phase 8 verification and conflict-handling usage
 
@@ -282,9 +293,9 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - supported claims appear as settled conclusions
   - mixed and unsupported claims are rendered only with explicit status labels and uncertainty sections
   - no new claims, verification decisions, or retrieval operations are introduced during report generation
-  - low-quality or off-query supported claims are filtered using persisted or recomputed claim-quality and query-answer scores before they can appear in the Executive Summary, key conclusions, evidence details, or claim mapping
+  - low-quality or off-query supported claims are filtered using persisted or recomputed claim-quality and query-answer scores before they can appear in the Executive Summary, Answer sections, Evidence Table, or claim evidence mapping
   - definition/mechanism reports also apply an answer-category gate so supported `other`, setup, community, slogan, reference, or navigation claims do not appear as conclusions by status alone
-  - the rendered Method and Source Scope section reports answer-relevant included claims and excluded low-quality/off-query claims
+  - the rendered Source Scope and Limitations section reports answer-relevant included claims and excluded low-quality/off-query claims
 - repeated report generation is currently guarded by byte-for-byte reuse of the latest stored Markdown artifact
   - if the newly rendered Markdown matches the latest stored artifact bytes, no new `report_artifact` row is created
   - otherwise a new Markdown artifact version is created for the task
@@ -297,13 +308,11 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - title
   - research question
   - executive summary
-  - method and source scope
-  - key conclusions
-  - conclusion details and evidence
-  - conflicts / uncertainty
-  - unresolved questions
-  - appendix: source list
-  - appendix: claim to citation spans mapping
+  - answer
+  - evidence table
+  - source scope and limitations
+  - unresolved / low coverage areas
+  - appendix: claim evidence mapping
 
 ## Phase 10 infrastructure-hardening usage
 
@@ -319,6 +328,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `query`
   - `report_title`
   - `claim_counts`
+  - `answer_slot_coverage`
   - `claim_snapshot`
   - `source_snapshot`
 - repeated report generation can now short-circuit on the latest artifact when the newly rendered Markdown still matches the latest stored content hash and bytes

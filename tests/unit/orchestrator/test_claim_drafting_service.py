@@ -134,6 +134,17 @@ def test_claim_drafting_service_creates_claim_citation_and_evidence(db_session: 
     assert len(claims) == 1
     assert len(citation_spans) == 1
     assert len(claim_evidence) == 1
+    notes = first_result.entries[0].claim.notes_json
+    assert notes["evidence_candidate_id"].startswith("ec_")
+    assert notes["source_document_id"] == str(seeded.source_document_id)
+    assert notes["source_chunk_id"] == str(seeded.source_chunk_id)
+    assert notes["citation_span_id"] == str(first_result.entries[0].citation_span.id)
+    assert notes["claim_evidence_id"] == str(first_result.entries[0].claim_evidence.id)
+    assert notes["evidence_candidate"]["citation_span_id"] == str(
+        first_result.entries[0].citation_span.id
+    )
+    assert "slot_ids" in notes
+    assert first_result.entries[0].evidence_candidate_id == notes["evidence_candidate_id"]
 
     assert second_result.created_claims == 0
     assert second_result.reused_claims == 1
@@ -373,6 +384,8 @@ def test_claim_drafting_service_ranks_query_answer_candidates_over_cta_text(
             source_document_id=source_document.id,
             chunk_no=0,
             text=(
+                "2 Reference architecture of a public SearXNG setup.\n\n"
+                "digraph G { rp -> uwsgi; node [style=filled]; secret_key: change-me }\n\n"
                 "SearXNG sources and run it yourself!\n\n"
                 "Track development, send contributions, and report issues at SearXNG sources.\n\n"
                 "SearXNG is a metasearch engine, aggregating the results of other search "
@@ -417,6 +430,10 @@ def test_claim_drafting_service_ranks_query_answer_candidates_over_cta_text(
     ]
     assert "Track development" not in " ".join(statements)
     assert "Come join" not in " ".join(statements)
+    assert "Reference architecture" not in " ".join(statements)
+    assert "digraph G" not in " ".join(statements)
+    assert result.diagnostics["rejection_reason_distribution"]["figure_caption_or_diagram"] >= 1
+    assert result.diagnostics["rejection_reason_distribution"]["diagram_or_config_fragment"] >= 1
     assert {claim.notes_json["claim_category"] for claim in claims} == {
         "definition",
         "privacy",
@@ -685,7 +702,9 @@ def test_claim_drafting_service_uses_docs_and_wikipedia_chunks_for_answer_claims
             text=(
                 "Welcome to SearXNG\n\n"
                 "Search without being tracked.\n\n"
-                "Get started with SearXNG by using one of the instances listed at ."
+                "Get started with SearXNG by using one of the instances listed at .\n\n"
+                "SearXNG does not generate a profile about users.\n\n"
+                "SearXNG aggregates results from multiple search services."
             ),
             token_count=28,
             metadata_json={
@@ -734,10 +753,25 @@ def test_claim_drafting_service_uses_docs_and_wikipedia_chunks_for_answer_claims
             },
         )
     )
+    wiki_duplicate_feature_chunk = source_chunk_repo.add(
+        SourceChunk(
+            source_document_id=wiki_document.id,
+            chunk_no=3,
+            text="More than 70 different search engines are supported by SearXNG.",
+            token_count=10,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "query_relevance_score": 1.0,
+                "eligible_for_claims": True,
+                "should_generate_claims": True,
+            },
+        )
+    )
     wiki_privacy_chunk = source_chunk_repo.add(
         SourceChunk(
             source_document_id=wiki_document.id,
-            chunk_no=2,
+            chunk_no=4,
             text=(
                 "Privacy\n\n"
                 "SearXNG removes private data from requests sent to search services. "
@@ -771,6 +805,7 @@ def test_claim_drafting_service_uses_docs_and_wikipedia_chunks_for_answer_claims
             docs_chunk.id,
             wiki_definition_chunk.id,
             wiki_mechanism_chunk.id,
+            wiki_duplicate_feature_chunk.id,
             wiki_privacy_chunk.id,
         ],
         limit=5,
@@ -783,14 +818,94 @@ def test_claim_drafting_service_uses_docs_and_wikipedia_chunks_for_answer_claims
     assert {"definition", "mechanism", "privacy"}.issubset(categories)
     assert any("metasearch engine" in statement for statement in statements)
     assert any(
-        "sending queries to upstream search engines" in statement for statement in statements
+        "sending queries to upstream search engines" in statement
+        or "aggregates results from multiple search services" in statement
+        for statement in statements
     )
-    assert any("removes private data" in statement for statement in statements)
+    assert any(
+        "does not generate a profile" in statement or "removes private data" in statement
+        for statement in statements
+    )
+    assert any(
+        entry.source_chunk.source_document_id == docs_document.id
+        for entry in result.entries
+        if entry.claim.notes_json["claim_category"] in {"mechanism", "privacy"}
+    )
     assert "Get started with SearXNG" not in joined_statements
     assert "listed at ." not in joined_statements
     assert "Search without being tracked" not in joined_statements
     assert "See also" not in joined_statements
     assert "References" not in joined_statements
+    assert sum("70 different search engines" in statement for statement in statements) <= 1
+
+
+def test_claim_drafting_service_collapses_near_duplicate_feature_claims(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://en.wikipedia.org/wiki/SearXNG",
+            domain="en.wikipedia.org",
+            title="SearXNG",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 1, tzinfo=UTC),
+            authority_score=0.78,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.78,
+        )
+    )
+    first_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text="SearXNG supports over 70 different search engines.",
+            token_count=8,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "eligible_for_claims": True,
+            },
+        )
+    )
+    duplicate_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=1,
+            text="More than 70 different search engines are supported by SearXNG.",
+            token_count=10,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "eligible_for_claims": True,
+            },
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[first_chunk.id, duplicate_chunk.id],
+        limit=5,
+    )
+
+    assert len(result.entries) == 1
+    assert result.diagnostics["near_duplicate_claims_removed"] >= 1
 
 
 def _seed_source_chunk(db_session: Session) -> SeededChunk:

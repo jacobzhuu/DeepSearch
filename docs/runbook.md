@@ -41,7 +41,8 @@ The current v1 path supports:
 - support-only claim drafting with citation span binding, query-aware deterministic claim scoring, and answer-focused top-K selection
 - minimal claim verification with `support` and `contradict` evidence
 - Markdown report synthesis backed by persisted report artifacts, with low-quality/off-query claim filtering and low answer-coverage warnings
-- task-event and task-detail observability for search result counts, selected sources, fetch success/failure counts, failed fetch reasons, parse decisions, and low-source warnings
+- shared deterministic source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, and slot-coverage contracts for source selection, diagnostics, verification, and report coverage
+- task-event and task-detail observability for planner guardrails, final search queries, source selection, answer slots, source yield, evidence yield, slot coverage, answer yield, answer coverage, verifier strong/weak support counts, supplemental acquisition, fetch success/failure counts, failed fetch reasons, parse decisions, and actionable failure diagnostics
 - report page HTML rendering plus Raw Markdown, Copy Markdown, and Download `.md` controls
 - JSON logs and basic metrics
 
@@ -50,7 +51,7 @@ The current v1 path supports:
 - OpenClaw
 - HTML export
 - PDF export
-- planner / gap analyzer
+- multi-round planner / gap analyzer
 - complex verifier logic
 - complex retrieval optimization
 - new worker or background execution semantics
@@ -88,6 +89,9 @@ The current v1 path supports:
 | `ACQUISITION_MAX_REDIRECTS` | Redirect cap | `3` |
 | `ACQUISITION_MAX_RESPONSE_BYTES` | Response byte cap | `1048576` |
 | `ACQUISITION_MAX_CANDIDATES_PER_REQUEST` | Max candidates per `POST /fetches` | `5` |
+| `ACQUISITION_TARGET_SUCCESSFUL_SNAPSHOTS` | Target successful snapshots before ordinary acquisition may stop | `2` |
+| `ACQUISITION_MIN_ANSWER_SOURCES` | Minimum answer-source target for planner-enabled overview runs | `3` |
+| `ACQUISITION_MAX_SUPPLEMENTAL_SOURCES` | Max unattempted high-value sources in one supplemental pass | `3` |
 | `ACQUISITION_USER_AGENT` | Acquisition user agent | `deepresearch-orchestrator/0.1` |
 
 ### Object storage
@@ -122,7 +126,7 @@ The current v1 path supports:
 
 Development-only note:
 
-- `SEARCH_PROVIDER=smoke` returns a clearly marked smoke search result for `https://example.com/`; it is not real search
+- `SEARCH_PROVIDER=smoke` returns clearly marked synthetic `deepsearch-smoke.local` fixture sources and uses a network-free smoke acquisition client; it is not real search
 - `INDEX_BACKEND=local` uses an in-process deterministic index; it is not durable and is not a replacement for OpenSearch
 - together these report `running_mode=smoke-search+deterministic-local+no-LLM`
 
@@ -133,9 +137,255 @@ Development-only note:
 | `CLAIM_DRAFTING_MAX_CANDIDATES_PER_REQUEST` | Max retrieval candidates for drafting | `5` |
 | `CLAIM_VERIFICATION_MAX_CLAIMS_PER_REQUEST` | Max claims per verification request | `5` |
 
-Claim drafting is deterministic and no-LLM. For definition/mechanism queries such as `What is SearXNG and how does it work?`, the selector now prefers definition, mechanism, privacy/design-goal, and feature sentences. It rejects contribution calls-to-action, community logistics, promotional slogans, lowercase fragments, setup/getting-started instructions, and broken-link residue such as `listed at .` before claim persistence. Scoring metadata is stored in `claim.notes_json` and regenerated reports use that metadata to exclude low-quality, setup, unsupported-category, or off-query supported claims from the report body.
+Claim drafting is deterministic and no-LLM. For definition/mechanism queries such as `What is SearXNG and how does it work?`, the selector now assigns an `answer_role` and prefers definition, mechanism, privacy/design-goal, feature, and low-priority deployment/self-hosting sentences. It rejects contribution calls-to-action, community logistics, documentation pointers, promotional slogans, lowercase fragments, setup/getting-started instructions, diagram/config fragments, and broken-link residue such as `listed at .` before claim persistence. Scoring metadata is stored in `claim.notes_json` and regenerated reports use that metadata to exclude low-quality, setup, unsupported-category, or off-query supported claims from the report body.
+
+Evidence-quality metadata is a code-level contract, not a new table. Claim notes and task/report diagnostics may include `evidence_candidate_id`, `slot_ids`, `source_intent`, citation span ids, claim evidence ids, source-yield rows, evidence-yield summaries, and slot-coverage summaries. Dropped-source reasons use this taxonomy: `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`.
+
+Backward compatibility note: old tasks and report artifacts may not have the newer diagnostics payloads. The API and benchmark script normalize missing `source_yield_summary`, `dropped_sources`, and `slot_coverage_summary` to `[]`, and missing `evidence_yield_summary` or `verification_summary` to `{}` whenever an observability payload exists. Older claim notes without `evidence_candidate_id` remain reportable through their persisted citation spans.
+
+Verification is deterministic lexical verification, not full entailment. It persists only the existing `supported`, `mixed`, and `unsupported` statuses, but records strong support, weak support, contradiction, shallow-overlap, numeric/date mismatch, and scope-mismatch details in `claim.notes_json["verification"]`. Reports keep weak lexical support out of the main answer sections.
 
 If strict claim filters produce no claims, the service runs a narrow deterministic fallback over explanatory definition, mechanism, privacy, or feature sentences only. It does not promote short slogans such as `Search without being tracked.`, contribution/community text, navigation, references, redirect stubs, or setup-only instructions unless the query explicitly asks for that material. Fallback claims are marked in `claim.notes_json` with `draft_mode = "fallback_relaxed"`, `fallback_reason`, and `original_rejected_reason`.
+
+The pipeline also computes answer-yield metrics per `source_document`, separating raw `candidate_sentence_count` from `answer_relevant_candidate_count` and final accepted claim counts. If claim drafting creates zero claims, or a what/how query produces only one claim without required definition/mechanism coverage, it runs at most one supplemental acquisition pass over unattempted high-value candidates such as official about pages, Wikipedia references, official home pages, GitHub README/repo pages, or generic articles. Developer, API, architecture, installation, social, forum, and video pages stay downranked unless the query explicitly asks for them.
+
+### Optional LLM planner
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `LLM_ENABLED` | Master switch for planner LLM provider construction | `false` |
+| `LLM_PROVIDER` | `noop` or OpenAI-compatible aliases: `openai-compatible`, `openai_compatible`, `openai` | `noop` |
+| `LLM_MODEL` | Provider model name | empty |
+| `LLM_API_KEY` | Provider API key from env or `.env`; never log or expose this value | empty |
+| `LLM_BASE_URL` | OpenAI-compatible API base URL, usually ending in `/v1` | empty |
+| `LLM_TIMEOUT_SECONDS` | LLM HTTP timeout | `30` |
+| `LLM_MAX_RETRIES` | Retry count for retryable LLM provider errors | `1` |
+| `LLM_MAX_OUTPUT_TOKENS` | Planner response token cap | `1200` |
+| `RESEARCH_PLANNER_ENABLED` | Run planner before search when `LLM_ENABLED=true` | `false` |
+| `RESEARCH_PLANNER_MAX_SUBQUESTIONS` | Planner subquestion cap | `5` |
+| `RESEARCH_PLANNER_MAX_SEARCH_QUERIES` | Planner search-query cap | `8` |
+
+The planner is disabled by default. When enabled, it emits `research_plan.created` before `SEARCHING` and lets search discovery use capped, deduped planner queries plus the original query. If planner generation fails, it emits `research_plan.failed`, falls back to the original query, and continues the deterministic pipeline.
+
+For definition and overview queries such as `What is SearXNG and how does it work?`,
+planner output is post-processed as a bounded suggestion. Wikipedia cannot be treated as a
+hard avoid domain for that query type. Final query planning always preserves the original
+query plus official documentation, about/how-it-works, Wikipedia, and software-project
+GitHub README searches when an entity can be extracted. SearXNG overview runs also add
+deterministic known-path candidates for `https://docs.searxng.org/user/about.html` and
+`https://en.wikipedia.org/wiki/SearXNG` when official SearXNG search results are present.
+Source selection prioritizes official about/reference pages over admin architecture,
+installation, API, or developer pages unless the user explicitly asks about those topics.
+
+The planner never writes claims or final reports. Claim drafting, evidence binding, verification, and Markdown report synthesis remain deterministic and source-backed.
+
+Noop planner validation:
+
+```bash
+LLM_ENABLED=true \
+LLM_PROVIDER=noop \
+RESEARCH_PLANNER_ENABLED=true \
+python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 8000
+```
+
+DeepSeek planner configuration uses the OpenAI-compatible provider. Both
+`https://api.deepseek.com` and `https://api.deepseek.com/v1` are accepted base URLs; the
+provider appends `/chat/completions` without duplicating path segments.
+
+OpenAI-compatible planner configuration uses placeholders only:
+
+```bash
+LLM_ENABLED=true
+LLM_PROVIDER=openai_compatible
+LLM_API_KEY=sk-...
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+RESEARCH_PLANNER_ENABLED=true
+```
+
+DeepSeek planner smoke test:
+
+```bash
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate deepsearch311
+cd /share/zhuzy/projects/DeepSearch
+python scripts/smoke_deepseek_planner.py
+```
+
+The script reads `.env`, calls only the planner/provider layer, and does not create a task or
+run the full pipeline. It prints provider, model, intent, subquestions, search queries, and
+warnings. It never prints `LLM_API_KEY`. Missing `LLM_API_KEY` exits with code `2`; sanitized
+provider/planner failures exit with code `1`.
+
+DeepSeek planner end-to-end manual validation:
+
+1. Set `.env` values:
+
+```bash
+LLM_ENABLED=true
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=https://api.deepseek.com
+LLM_API_KEY=<your real key; do not commit this>
+LLM_MODEL=deepseek-chat
+RESEARCH_PLANNER_ENABLED=true
+```
+
+2. Restart the orchestrator:
+
+```bash
+cd /share/zhuzy/projects/DeepSearch
+pkill -f "services.orchestrator.app.main:app" || true
+
+nohup bash -lc '
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate deepsearch311
+
+export HTTP_PROXY="http://127.0.0.1:7890"
+export HTTPS_PROXY="http://127.0.0.1:7890"
+export ALL_PROXY="socks5://127.0.0.1:7890"
+export NO_PROXY="127.0.0.1,localhost"
+
+cd /share/zhuzy/projects/DeepSearch
+PYTHONPATH=. uvicorn services.orchestrator.app.main:app --host 0.0.0.0 --port 8000
+' > /share/zhuzy/projects/DeepSearch/orchestrator.log 2>&1 &
+```
+
+3. Create a task and run it:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/v1/research/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What is SearXNG and how does it work?","constraints":{}}' \
+  | python3 -m json.tool
+
+TASK_ID=<task_id from the create response>
+
+curl -s -X POST http://127.0.0.1:8000/api/v1/research/tasks/$TASK_ID/run \
+  | python3 -m json.tool
+```
+
+4. Check planner events:
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/research/tasks/$TASK_ID/events \
+  | python3 -m json.tool \
+  | grep -E "research_plan|planner|subquestions|search_queries" -n
+```
+
+5. Check the deterministic report:
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/research/tasks/$TASK_ID/report \
+  | python3 -m json.tool
+```
+
+Full planner-pipeline smoke helper:
+
+```bash
+cd /share/zhuzy/projects/DeepSearch
+
+python scripts/smoke_planner_pipeline.py \
+  --query "What is SearXNG and how does it work?" \
+  --base-url http://127.0.0.1:8000
+```
+
+The helper reads `.env`, creates a task, runs `POST /api/v1/research/tasks/<task_id>/run`,
+and prints task id, status, running mode, planner status, final search queries, attempted
+sources, source documents, chunk count, claims by category, report preview, and failure
+details. It never prints API keys. Exit code `0` means the pipeline completed with at least
+three claims and a report; `1` means the pipeline failed or produced an insufficient report;
+`2` means the service or configuration is unavailable.
+
+Generalization benchmark query list:
+
+```bash
+python scripts/benchmark_queries.py --json
+```
+
+Run the benchmark against a live orchestrator and backing services:
+
+```bash
+python scripts/benchmark_queries.py \
+  --run \
+  --base-url http://127.0.0.1:8000 \
+  --json
+```
+
+The benchmark uses ten representative queries covering SearXNG, OpenSearch, LangGraph, MCP,
+Dify, privacy limitations, Docker deployment, vendor comparison, RAG limitations, and current
+Deep Research product comparison. It is a regression harness for source-intent, answer-slot,
+source-yield, evidence-yield, verifier, and report-structure generalization, not a golden-output
+text comparison. With `--run --json`, each row includes slot coverage, source yield, evidence
+yield, verification summary, and a non-SearXNG contamination check.
+
+Useful benchmark narrowing options:
+
+```bash
+python scripts/benchmark_queries.py --json --limit 2
+python scripts/benchmark_queries.py --json --query-id 3
+python scripts/benchmark_queries.py --run --limit 2 --output /tmp/deepsearch-benchmark.json
+```
+
+Before trusting the default `http://127.0.0.1:8000` service, check that it is the current
+working-tree process:
+
+```bash
+curl -s http://127.0.0.1:8000/versionz | python3 -m json.tool
+curl -s http://127.0.0.1:8000/openapi.json \
+  | rg 'source_yield_summary|evidence_yield_summary|slot_coverage_summary|verification_summary'
+```
+
+To restart the host-local backend and frontend from the current checkout, prefer the
+managed helper:
+
+```bash
+cd /share/zhuzy/projects/DeepSearch
+./dev.sh restart
+./dev.sh status
+```
+
+The helper is intentionally host-local first:
+
+- it binds backend and frontend to `127.0.0.1` unless `DEV_BACKEND_HOST` or
+  `DEV_FRONTEND_HOST` is set explicitly
+- it loads `.env` without shell evaluation and lets already-exported environment
+  variables override `.env` values
+- it stops only PID files that match the expected backend, frontend, or mock-search
+  commands
+- it starts processes in dedicated process groups so repeated `restart` and `stop`
+  calls converge cleanly
+- it writes diagnostics to `.logs/` and process metadata to `.run/`
+
+Common commands:
+
+```bash
+./dev.sh doctor
+./dev.sh logs backend
+./dev.sh logs frontend
+./dev.sh smoke http://127.0.0.1:8000
+./dev.sh stop
+```
+
+When `SEARCH_PROVIDER=smoke`, `./dev.sh smoke` automatically uses
+`deepsearch-smoke.local` as the allowed smoke domain and `smoke` as the claim query unless
+those options are passed explicitly.
+
+For a deterministic development run without real search or OpenSearch:
+
+```bash
+cd /share/zhuzy/projects/DeepSearch
+APP_ENV=development \
+SEARCH_PROVIDER=smoke \
+INDEX_BACKEND=local \
+SNAPSHOT_STORAGE_BACKEND=filesystem \
+./dev.sh restart
+```
+
+For direct LAN access, opt in explicitly and restrict ports with the host firewall:
+
+```bash
+DEV_BACKEND_HOST=0.0.0.0 DEV_FRONTEND_HOST=0.0.0.0 ./dev.sh restart
+```
 
 ## Host-local daily operator path
 
@@ -209,6 +459,11 @@ python3 scripts/init_index.py
 ```bash
 python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 8000
 ```
+
+For normal owner-operated development, `./dev.sh restart` can replace steps 4 through 9
+when the backing services in step 3 are already running. It runs migrations, initializes
+MinIO buckets when `SNAPSHOT_STORAGE_BACKEND=minio`, initializes the OpenSearch index when
+`INDEX_BACKEND=opensearch`, starts the backend, and starts the Vite frontend.
 
 ### 8. Health checks
 
@@ -317,6 +572,16 @@ python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 80
 
 If `SEARXNG_BASE_URL=http://127.0.0.1:8080` returns frontend HTML, it is misconfigured. Point it at a SearXNG-compatible `/search?format=json` endpoint, or use explicit smoke mode for development validation.
 
+For local web UI testing without a real SearXNG endpoint, use the deterministic smoke path and
+create a new task after any failed run:
+
+```bash
+SEARCH_PROVIDER=smoke INDEX_BACKEND=local SNAPSHOT_STORAGE_BACKEND=filesystem ./dev.sh restart
+```
+
+Failed tasks are kept as audit records and are not run again in place. The task detail page can
+create a replacement task with the same query so the old failure remains inspectable.
+
 The SearXNG client validates endpoint responses before storing search ledger rows. Common structured failures:
 
 - `searxng_html_response`: the configured endpoint returned HTML instead of JSON
@@ -419,6 +684,33 @@ At minimum, that route would still need:
 
 ## Troubleshooting
 
+### `./dev.sh restart` refuses to start because a port is occupied
+
+- run `./dev.sh status` to see PID files, expected commands, URLs, and port listeners
+- if the listener is a managed DeepSearch process, `./dev.sh stop` should remove it
+- if the listener is unrelated, either stop that process or choose `DEV_BACKEND_PORT` /
+  `DEV_FRONTEND_PORT`
+- the helper intentionally does not kill arbitrary processes that merely occupy port
+  `8000` or `5173`
+
+### `./dev.sh restart` fails during migration, bucket init, or index init
+
+- inspect `.logs/backend.log` only after backend startup has begun; init failures usually
+  print directly in the terminal
+- run the narrower step with `./dev.sh init` after fixing `DATABASE_URL`, MinIO, or
+  OpenSearch settings
+- for deterministic development without OpenSearch, use
+  `SEARCH_PROVIDER=smoke INDEX_BACKEND=local ./dev.sh restart`
+- to skip all init steps temporarily, use `DEV_RUN_INIT=false ./dev.sh restart`
+
+### `./dev.sh stop` leaves a process behind
+
+- new runs are started in their own process group, so repeated `./dev.sh stop` should be
+  idempotent
+- if the process was started by an older script version or by hand, check
+  `./dev.sh status` and stop the remaining PID manually only after confirming the command
+  line belongs to this checkout
+
 ### App fails at startup with `unsupported snapshot storage backend`
 
 - use only `filesystem` or `minio`
@@ -472,8 +764,9 @@ At minimum, that route would still need:
 
 - only `text/html` and `text/plain` are supported
 - inspect task events or `GET /api/v1/research/tasks/<task_id>` for `progress.observability.parse_decisions`
-- parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, `parser_error`, `extractor_strategy_used`, `fallback_used`, `removed_boilerplate_count`, and `extracted_text_length`
+- parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, `parser_error`, `extractor_strategy_used`, `fallback_used`, `removed_boilerplate_count`, `extracted_text_length`, `text_cleanup_applied`, `dropped_broken_link_fragments`, and `preserved_link_text_count`
 - for Wikipedia/MediaWiki pages, expected extraction is article-body text from `main`, `article`, `#content`, `#bodyContent`, `#mw-content-text`, or `.mw-parser-output`, with paragraph fallback from `.mw-parser-output p`, `#mw-content-text p`, or readable body paragraphs if strict extraction would otherwise be empty
+- for Sphinx docs pages, link text should be preserved when present; if a docs page still produces broken residue such as `from up to 251 .`, the extractor applies conservative cleanup and records cleanup metadata rather than fabricating missing content
 - a chunk that starts with `References` should remain ineligible, but a chunk with useful `Privacy` prose followed by trailing `See also` or `References` headings should remain eligible when its quality score passes
 - `skipped_empty`, `missing_blob`, `skipped_unsupported_mime`, and `parse_error` are distinct outcomes; a `PARSING` failure message lists these per snapshot instead of only reporting that no source documents were produced
 - `POST /api/v1/research/tasks/<task_id>/parse` remains status-gated; a FAILED task returns `409` and should be revised or recreated rather than rerun in place
@@ -482,7 +775,8 @@ At minimum, that route would still need:
 
 - inspect `GET /metrics`
 - inspect JSON logs from the orchestrator
-- if `DRAFTING_CLAIMS` fails with `claim drafting produced no claims`, inspect `pipeline.failed.details`; it should include `total_chunks_seen`, `eligible_chunks_seen`, `candidate_sentences_count`, `rejected_candidates_count`, `top_rejected_candidates`, `rejection_reason_distribution`, and per-chunk previews with quality/relevance fields
+- if `DRAFTING_CLAIMS` fails with `claim drafting produced no claims`, inspect `pipeline.failed.details`; it should include `why_supplemental_acquisition_triggered`, `supplemental_sources_attempted`, `supplemental_sources_skipped`, `unattempted_high_quality_sources`, `why_wikipedia_or_about_not_attempted`, `per_source_answer_yield`, `top_rejected_candidates`, `rejection_reason_distribution`, and an operator `next_action`
+- if a planner-enabled overview task only attempted low-yield home/developer pages, inspect `progress.observability.final_search_queries`, the Source Selection Table in Task Detail, and candidate metadata `source_category` / `downrank_reason`; official about and Wikipedia candidates should outrank `dev/index`, API, install, and architecture pages unless the query asks for those topics
 - query the intermediate resources:
   - `GET /candidate-urls`
   - `GET /content-snapshots`

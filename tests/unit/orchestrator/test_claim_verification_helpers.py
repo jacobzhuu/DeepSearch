@@ -26,6 +26,8 @@ def test_select_verification_span_prefers_exact_support_match() -> None:
 
     assert match is not None
     assert match.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT
+    assert match.relation_detail == "strong_support"
+    assert match.support_level == "strong"
     assert (
         match.excerpt
         == "This domain is for use in illustrative examples in documents and test content."
@@ -46,7 +48,36 @@ def test_select_verification_span_detects_negated_contradiction() -> None:
 
     assert match is not None
     assert match.relation_type == CLAIM_EVIDENCE_RELATION_CONTRADICT
+    assert match.relation_detail == "contradiction"
     assert match.excerpt == "This domain is not for use in illustrative examples in documents."
+
+
+def test_select_verification_span_marks_moderate_overlap_as_weak_support() -> None:
+    text = (
+        "OpenSearch indexes documents and can search them through a distributed engine. "
+        "It also provides dashboards for observability."
+    )
+
+    match = select_verification_span(
+        text,
+        "OpenSearch is a distributed engine for searching indexed documents.",
+    )
+
+    assert match is not None
+    assert match.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT
+    assert match.relation_detail == "weak_support"
+    assert match.support_level == "weak"
+
+
+def test_select_verification_span_rejects_numeric_mismatch() -> None:
+    text = "The system supports 10 engines in the default configuration."
+
+    match = select_verification_span(
+        text,
+        "The system supports 20 engines in the default configuration.",
+    )
+
+    assert match is None
 
 
 def test_resolve_verification_status_and_rationale_cover_minimum_phase8_states() -> None:

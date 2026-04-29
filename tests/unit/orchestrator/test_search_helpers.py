@@ -257,7 +257,8 @@ def test_smoke_search_provider_marks_results_as_development_only() -> None:
     )
 
     assert response.provider == "smoke-search"
-    assert response.result_count == 1
-    assert response.results[0].url == "https://example.com/"
+    assert response.result_count >= 3
+    assert response.results[0].url.startswith("https://deepsearch-smoke.local/")
     assert response.results[0].metadata["real_search"] is False
+    assert response.results[0].metadata["synthetic_fixture"] is True
     assert response.metadata["smoke_mode"] is True

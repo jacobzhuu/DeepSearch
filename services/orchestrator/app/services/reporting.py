@@ -19,7 +19,7 @@ from services.orchestrator.app.claims import (
     REPORT_CLAIM_QUALITY_THRESHOLD,
     REPORT_QUERY_ANSWER_THRESHOLD,
     ClaimCandidateScore,
-    classify_query_intent,
+    is_answer_relevant_score,
     is_claimable_excerpt,
     is_claimable_statement,
     score_claim_statement,
@@ -35,6 +35,12 @@ from services.orchestrator.app.reporting import (
     compute_report_content_hash,
     extract_report_title,
     render_markdown_report,
+)
+from services.orchestrator.app.research_quality import (
+    build_slot_coverage_summary,
+    contribution_level_for_counts,
+    slot_ids_for_claim_category,
+    summarize_evidence_yield,
 )
 from services.orchestrator.app.services.research_tasks import TaskNotFoundError
 from services.orchestrator.app.storage import SnapshotObjectStore
@@ -114,6 +120,11 @@ class ReportSynthesisService:
         rendered = prepared_report.rendered
         content_hash = compute_report_content_hash(rendered.markdown)
         markdown_bytes = rendered.markdown.encode("utf-8")
+        report_diagnostics = _build_report_diagnostics(
+            query=task.query,
+            claims=prepared_report.claims,
+            sources=prepared_report.sources,
+        )
         manifest = build_report_manifest(
             task_id=task.id,
             revision_no=task.revision_no,
@@ -121,6 +132,11 @@ class ReportSynthesisService:
             report_title=rendered.title,
             claims=prepared_report.claims,
             sources=prepared_report.sources,
+            slot_coverage_summary=report_diagnostics["slot_coverage_summary"],
+            evidence_yield_summary=report_diagnostics["evidence_yield_summary"],
+            source_yield_summary=report_diagnostics["source_yield_summary"],
+            verification_summary=report_diagnostics["verification_summary"],
+            dropped_sources=report_diagnostics["dropped_sources"],
         )
         latest_artifact = self.report_artifact_repository.get_latest_for_task_format(
             task.id,
@@ -244,6 +260,7 @@ class ReportSynthesisService:
                 continue
             support_evidence: list[ReportEvidenceItem] = []
             contradict_evidence: list[ReportEvidenceItem] = []
+            relation_metadata_by_span = _relation_metadata_by_citation_span(claim)
             for evidence in evidence_by_claim_id.get(claim.id, []):
                 citation_span = evidence.citation_span
                 if not is_claimable_excerpt(citation_span.excerpt):
@@ -252,6 +269,7 @@ class ReportSynthesisService:
                 if not _source_chunk_eligible_for_report(source_chunk):
                     continue
                 source_document = source_chunk.source_document
+                relation_metadata = relation_metadata_by_span.get(str(citation_span.id), {})
                 report_evidence = ReportEvidenceItem(
                     claim_evidence_id=evidence.id,
                     citation_span_id=citation_span.id,
@@ -265,6 +283,18 @@ class ReportSynthesisService:
                     start_offset=citation_span.start_offset,
                     end_offset=citation_span.end_offset,
                     excerpt=citation_span.excerpt,
+                    relation_detail=_string_or_none(relation_metadata.get("relation_detail")),
+                    support_level=_string_or_none(relation_metadata.get("support_level")),
+                    verifier_method=_string_or_none(relation_metadata.get("verifier_method")),
+                    reasons=(
+                        tuple(
+                            item
+                            for item in relation_metadata.get("reasons", [])
+                            if isinstance(item, str)
+                        )
+                        if isinstance(relation_metadata.get("reasons"), list)
+                        else ()
+                    ),
                 )
                 if evidence.relation_type == "support":
                     support_evidence.append(report_evidence)
@@ -300,6 +330,13 @@ class ReportSynthesisService:
                     claim_quality_score=claim_score.claim_quality_score,
                     query_answer_score=claim_score.query_answer_score,
                     claim_category=claim_score.claim_category,
+                    slot_ids=tuple(
+                        item
+                        for item in (claim.notes_json or {}).get("slot_ids", [])
+                        if isinstance(item, str)
+                    ),
+                    verifier_method=_claim_verifier_method(claim),
+                    support_level=_claim_support_level(claim),
                 )
             )
 
@@ -366,7 +403,10 @@ class ReportSynthesisService:
         return str(PurePosixPath(str(task_id), f"v{version}", "report.md"))
 
     def _extract_rationale(self, claim: Claim) -> str | None:
-        verification_notes = claim.notes_json.get("verification", {})
+        notes = claim.notes_json if isinstance(claim.notes_json, dict) else {}
+        verification_notes = notes.get("verification", {})
+        if not isinstance(verification_notes, dict):
+            return None
         rationale = verification_notes.get("rationale")
         if isinstance(rationale, str) and rationale.strip():
             return rationale.strip()
@@ -406,6 +446,8 @@ def _source_chunk_eligible_for_report(source_chunk: object) -> bool:
         return False
     if metadata.get("is_navigation_noise") is True:
         return False
+    if metadata.get("is_diagram_or_config_section") is True:
+        return False
     if metadata.get("reason") == "redirect_stub":
         return False
     quality_score = metadata.get("content_quality_score")
@@ -423,21 +465,11 @@ def _report_claim_score(claim: Claim, *, query: str) -> ClaimCandidateScore:
 
 
 def _report_claim_answer_relevant(score: ClaimCandidateScore, *, query: str) -> bool:
-    if score.rejected_reason is not None:
-        return False
     if score.claim_quality_score < REPORT_CLAIM_QUALITY_THRESHOLD:
         return False
     if score.query_answer_score < REPORT_QUERY_ANSWER_THRESHOLD:
         return False
-
-    intent = classify_query_intent(query)
-    if intent.intent_name == "generic":
-        return score.claim_category not in intent.avoid_claim_types
-    if score.claim_category in intent.expected_claim_types:
-        return True
-    if score.claim_category in intent.avoid_claim_types:
-        return False
-    return score.query_answer_score >= 0.85 and score.claim_quality_score >= 0.7
+    return is_answer_relevant_score(score, query=query)
 
 
 def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | None:
@@ -448,8 +480,12 @@ def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | N
 
     claim_category = notes.get("claim_category")
     rejected_reason = notes.get("rejected_reason")
+    answer_role = notes.get("answer_role")
+    answer_relevant = notes.get("answer_relevant")
     return ClaimCandidateScore(
         claim_category=claim_category if isinstance(claim_category, str) else "other",
+        answer_role=answer_role if isinstance(answer_role, str) else "non_answer",
+        answer_relevant=answer_relevant if isinstance(answer_relevant, bool) else False,
         content_quality_score=_numeric_note(notes.get("content_quality_score")) or 0.6,
         query_relevance_score=_numeric_note(notes.get("query_relevance_score")) or 0.0,
         claim_quality_score=claim_quality_score,
@@ -463,4 +499,214 @@ def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | N
 def _numeric_note(value: object) -> float | None:
     if isinstance(value, int | float):
         return float(value)
+    return None
+
+
+def _relation_metadata_by_citation_span(claim: Claim) -> dict[str, dict[str, object]]:
+    notes = claim.notes_json or {}
+    verification = notes.get("verification") if isinstance(notes, dict) else {}
+    if not isinstance(verification, dict):
+        return {}
+    relation_rows = verification.get("evidence_relations")
+    if not isinstance(relation_rows, list):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for row in relation_rows:
+        if not isinstance(row, dict):
+            continue
+        citation_span_id = row.get("citation_span_id")
+        if isinstance(citation_span_id, str) and citation_span_id.strip():
+            result[citation_span_id] = row
+    return result
+
+
+def _claim_verifier_method(claim: Claim) -> str | None:
+    notes = claim.notes_json or {}
+    verification = notes.get("verification") if isinstance(notes, dict) else {}
+    if not isinstance(verification, dict):
+        return None
+    return _string_or_none(verification.get("verifier_method") or verification.get("method"))
+
+
+def _claim_support_level(claim: Claim) -> str:
+    notes = claim.notes_json or {}
+    verification = notes.get("verification") if isinstance(notes, dict) else {}
+    if not isinstance(verification, dict):
+        return "strong"
+    strong = verification.get("strong_support_evidence_count")
+    weak = verification.get("weak_support_evidence_count")
+    if isinstance(weak, int | float) and weak > 0 and not strong:
+        return "weak"
+    return "strong"
+
+
+def _build_report_diagnostics(
+    *,
+    query: str,
+    claims: list[ReportClaimItem],
+    sources: list[ReportSourceItem],
+) -> dict[str, object]:
+    evidence_candidates = [
+        _evidence_candidate_from_claim(claim, query=query)
+        for claim in claims
+        if _evidence_candidate_from_claim(claim, query=query) is not None
+    ]
+    evidence_candidate_rows = [item for item in evidence_candidates if item is not None]
+    claim_rows = [
+        {
+            "claim_id": str(claim.claim_id),
+            "verification_status": claim.verification_status,
+            "slot_ids": list(claim.slot_ids)
+            or _slot_ids_from_claim_category(claim.claim_category, query=query),
+            "source_document_id": (
+                str(claim.support_evidence[0].source_document_id)
+                if claim.support_evidence
+                else None
+            ),
+            "support_level": claim.support_level or "strong",
+        }
+        for claim in claims
+    ]
+    accepted_candidate_ids = {
+        item["evidence_candidate_id"]
+        for item in evidence_candidate_rows
+        if isinstance(item.get("evidence_candidate_id"), str)
+    }
+    source_yield_summary = _report_source_yield_summary(
+        sources=sources,
+        claims=claims,
+        evidence_candidates=evidence_candidate_rows,
+    )
+    return {
+        "slot_coverage_summary": build_slot_coverage_summary(
+            query,
+            evidence_candidates=evidence_candidate_rows,
+            claim_rows=claim_rows,
+        ),
+        "evidence_yield_summary": summarize_evidence_yield(
+            evidence_candidate_rows,
+            accepted_candidate_ids=accepted_candidate_ids,
+            query=query,
+        ),
+        "source_yield_summary": source_yield_summary,
+        "verification_summary": _report_verification_summary(claims),
+        "dropped_sources": [
+            row
+            for row in source_yield_summary
+            if row.get("contribution_level") == "none" and row.get("dropped_reasons")
+        ],
+    }
+
+
+def _evidence_candidate_from_claim(
+    claim: ReportClaimItem,
+    *,
+    query: str,
+) -> dict[str, object] | None:
+    if not claim.support_evidence:
+        return None
+    evidence = claim.support_evidence[0]
+    return {
+        "evidence_candidate_id": f"claim_{claim.claim_id}",
+        "source_document_id": str(evidence.source_document_id),
+        "source_chunk_id": str(evidence.source_chunk_id),
+        "citation_span_id": str(evidence.citation_span_id),
+        "slot_ids": list(claim.slot_ids)
+        or _slot_ids_from_claim_category(claim.claim_category, query=query),
+        "source_intent": "report_evidence_source",
+        "excerpt": evidence.excerpt,
+        "start_offset": evidence.start_offset,
+        "end_offset": evidence.end_offset,
+        "salience_score": claim.query_answer_score or 0.0,
+        "quality_score": claim.claim_quality_score or 0.0,
+        "extraction_strategy": None,
+        "rejection_reasons": [],
+        "metadata": {
+            "claim_id": str(claim.claim_id),
+            "verification_status": claim.verification_status,
+            "support_level": claim.support_level,
+        },
+    }
+
+
+def _report_source_yield_summary(
+    *,
+    sources: list[ReportSourceItem],
+    claims: list[ReportClaimItem],
+    evidence_candidates: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for source in sources:
+        source_id = str(source.source_document_id)
+        source_claims = [
+            claim
+            for claim in claims
+            if any(str(item.source_document_id) == source_id for item in claim.support_evidence)
+        ]
+        candidate_count = sum(
+            1 for item in evidence_candidates if item.get("source_document_id") == source_id
+        )
+        accepted_evidence_count = sum(len(claim.support_evidence) for claim in source_claims)
+        contribution_level = contribution_level_for_counts(
+            accepted_evidence_count=accepted_evidence_count,
+            claim_count=len(source_claims),
+            candidate_count=candidate_count,
+        )
+        rows.append(
+            {
+                "source_document_id": source_id,
+                "url": source.canonical_url,
+                "canonical_url": source.canonical_url,
+                "domain": source.domain,
+                "title": source.title,
+                "source_intent": "report_evidence_source",
+                "attempted": True,
+                "fetched": True,
+                "parsed": True,
+                "indexed": True,
+                "candidate_count": candidate_count,
+                "accepted_evidence_count": accepted_evidence_count,
+                "claim_count": len(source_claims),
+                "rejected_count": 0,
+                "dropped_reasons": [],
+                "contribution_level": contribution_level,
+            }
+        )
+    return rows
+
+
+def _report_verification_summary(claims: list[ReportClaimItem]) -> dict[str, object]:
+    methods = sorted({claim.verifier_method for claim in claims if claim.verifier_method})
+    return {
+        "verifier_methods": methods,
+        "strong_supported_claim_count": sum(
+            1
+            for claim in claims
+            if claim.verification_status == "supported" and claim.support_level != "weak"
+        ),
+        "weak_supported_claim_count": sum(
+            1
+            for claim in claims
+            if claim.verification_status == "supported" and claim.support_level == "weak"
+        ),
+        "mixed_claim_count": sum(1 for claim in claims if claim.verification_status == "mixed"),
+        "unsupported_claim_count": sum(
+            1 for claim in claims if claim.verification_status == "unsupported"
+        ),
+        "limitations": [
+            "report uses persisted verifier metadata",
+            "weak support is not treated as a main-answer fact",
+        ],
+    }
+
+
+def _slot_ids_from_claim_category(category: str | None, *, query: str) -> list[str]:
+    if not category:
+        return []
+    return slot_ids_for_claim_category(category, query=query)
+
+
+def _string_or_none(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     return None

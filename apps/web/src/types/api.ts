@@ -9,6 +9,18 @@ export interface ResearchTaskProgress {
   events_total: number;
   latest_event_at: string;
   observability?: {
+    planner_enabled?: boolean | null;
+    planner_mode?: string | null;
+    planner_status?: string | null;
+    subquestion_count?: number | null;
+    search_query_count?: number | null;
+    research_plan?: Record<string, any> | null;
+    raw_planner_queries?: Array<Record<string, any>>;
+    final_search_queries?: Array<Record<string, any>>;
+    dropped_or_downweighted_planner_queries?: Array<Record<string, any>>;
+    planner_guardrail_warnings?: string[];
+    intent_classification?: string | null;
+    extracted_entity?: string | null;
     search_result_count: number | null;
     selected_sources_from_search: Array<Record<string, any>>;
     selected_sources: Array<Record<string, any>>;
@@ -19,6 +31,17 @@ export interface ResearchTaskProgress {
     failed_sources: Array<Record<string, any>>;
     parse_decisions: Array<Record<string, any>>;
     source_quality_summary?: Record<string, any> | null;
+    source_yield_summary?: Array<Record<string, any>>;
+    dropped_sources?: Array<Record<string, any>>;
+    answer_coverage?: Record<string, boolean> | null;
+    answer_slots?: Array<Record<string, any>>;
+    report_slot_coverage?: Array<Record<string, any>>;
+    slot_coverage_summary?: Array<Record<string, any>>;
+    answer_yield?: Array<Record<string, any>>;
+    evidence_yield_summary?: Record<string, any> | null;
+    verification_summary?: Record<string, any> | null;
+    supplemental_acquisition?: Record<string, any> | null;
+    failure_diagnostics?: Record<string, any> | null;
     warnings: string[];
   } | null;
 }

@@ -398,6 +398,16 @@ class ParsingService:
                         "removed_boilerplate_count"
                     ),
                     "extracted_text_length": parsed_content.metadata.get("extracted_text_length"),
+                    "text_cleanup_applied": parsed_content.metadata.get("text_cleanup_applied"),
+                    "dropped_broken_link_fragments": parsed_content.metadata.get(
+                        "dropped_broken_link_fragments"
+                    ),
+                    "preserved_link_text_count": parsed_content.metadata.get(
+                        "preserved_link_text_count"
+                    ),
+                    "link_text_extraction_strategy": parsed_content.metadata.get(
+                        "link_text_extraction_strategy"
+                    ),
                     "source_quality_score": source_quality.score,
                     "source_quality_reason": source_quality.reason,
                     "content_quality": chunk_quality.content_quality,
@@ -408,6 +418,7 @@ class ParsingService:
                     "should_generate_claims": chunk_quality.eligible_for_claims,
                     "is_navigation_noise": chunk_quality.is_navigation_noise,
                     "is_reference_section": chunk_quality.is_reference_section,
+                    "is_diagram_or_config_section": chunk_quality.is_diagram_or_config_section,
                     "quality_reasons": chunk_quality.reasons,
                 }
             )
@@ -500,6 +511,22 @@ def parse_entry_diagnostic(entry: ParseLedgerEntry) -> dict[str, object]:
         "extracted_text_length": _first_chunk_metadata(
             entry.source_document,
             "extracted_text_length",
+        ),
+        "text_cleanup_applied": _first_chunk_metadata(
+            entry.source_document,
+            "text_cleanup_applied",
+        ),
+        "dropped_broken_link_fragments": _first_chunk_metadata(
+            entry.source_document,
+            "dropped_broken_link_fragments",
+        ),
+        "preserved_link_text_count": _first_chunk_metadata(
+            entry.source_document,
+            "preserved_link_text_count",
+        ),
+        "link_text_extraction_strategy": _first_chunk_metadata(
+            entry.source_document,
+            "link_text_extraction_strategy",
         ),
         "source_quality_score": (
             entry.source_document.final_source_score if entry.source_document is not None else None

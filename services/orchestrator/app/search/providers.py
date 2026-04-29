@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from json import JSONDecodeError
 from typing import Any, Protocol
@@ -79,33 +80,178 @@ class SmokeSearchProvider:
     name = "smoke-search"
 
     def search(self, request: SearchRequest) -> SearchResponse:
-        del request
+        topic = _smoke_topic_for_query(request.query_text)
+        result_specs = _smoke_result_specs_for_query(request.query_text)
+        results = tuple(
+            SearchResultItem(
+                url=f"https://deepsearch-smoke.local/{topic.slug}/{spec.path}",
+                title=f"Synthetic development smoke source: {topic.label} {spec.title}",
+                snippet=spec.snippet,
+                source_engine="development-smoke",
+                rank=index,
+                metadata={
+                    "smoke_mode": True,
+                    "real_search": False,
+                    "synthetic_fixture": True,
+                    "fixture_topic": topic.slug,
+                    "fixture_intent": spec.intent,
+                },
+            )
+            for index, spec in enumerate(result_specs[: request.limit], start=1)
+        )
         return SearchResponse(
             provider=self.name,
             source_engines=("development-smoke",),
-            result_count=1,
-            results=(
-                SearchResultItem(
-                    url="https://example.com/",
-                    title="Development smoke source: Example Domain",
-                    snippet=(
-                        "Development smoke result. This is not real web search evidence; "
-                        "use SEARCH_PROVIDER=searxng for real search."
-                    ),
-                    source_engine="development-smoke",
-                    rank=1,
-                    metadata={
-                        "smoke_mode": True,
-                        "real_search": False,
-                    },
-                ),
-            ),
+            result_count=len(results),
+            results=results,
             metadata={
                 "smoke_mode": True,
                 "real_search": False,
-                "warning": "development smoke search provider; not real search",
+                "synthetic_fixture": True,
+                "fixture_topic": topic.slug,
+                "warning": (
+                    "development smoke search provider; synthetic fixture, not real search"
+                ),
             },
         )
+
+
+@dataclass(frozen=True)
+class _SmokeTopic:
+    slug: str
+    label: str
+
+
+@dataclass(frozen=True)
+class _SmokeResultSpec:
+    path: str
+    title: str
+    snippet: str
+    intent: str
+
+
+_KNOWN_SMOKE_TOPICS: tuple[tuple[str, str], ...] = (
+    ("searxng", "SearXNG"),
+    ("opensearch", "OpenSearch"),
+    ("langgraph", "LangGraph"),
+    ("model context protocol", "Model Context Protocol"),
+    ("mcp", "Model Context Protocol"),
+    ("dify", "Dify"),
+    ("retrieval-augmented generation", "Retrieval-Augmented Generation"),
+    ("rag", "Retrieval-Augmented Generation"),
+    ("chatgpt deep research", "ChatGPT Deep Research and Gemini Deep Research"),
+    ("gemini deep research", "ChatGPT Deep Research and Gemini Deep Research"),
+)
+
+
+def _smoke_topic_for_query(query: str) -> _SmokeTopic:
+    normalized_query = " ".join(query.split())
+    lower = normalized_query.lower()
+    if "brave search" in lower and "tavily" in lower:
+        return _SmokeTopic(slug="ai-search-comparison", label="AI search agent tools")
+    for marker, label in _KNOWN_SMOKE_TOPICS:
+        if marker in lower:
+            return _SmokeTopic(slug=_slugify(label), label=label)
+    match = re.search(r"\bwhat\s+is\s+(.+?)(?:\s+and\s+how|\?|$)", normalized_query, re.I)
+    if match is not None:
+        label = match.group(1).strip()
+        if label:
+            return _SmokeTopic(slug=_slugify(label), label=label)
+    return _SmokeTopic(slug="generic-research-topic", label="Generic research topic")
+
+
+def _smoke_result_specs_for_query(query: str) -> tuple[_SmokeResultSpec, ...]:
+    lower = query.lower()
+    if "compare" in lower or "difference" in lower:
+        return (
+            _SmokeResultSpec(
+                path="comparison",
+                title="comparison overview",
+                snippet="Synthetic comparison source with dimensions, tradeoffs, and source scope.",
+                intent="comparison",
+            ),
+            _SmokeResultSpec(
+                path="limitations",
+                title="limitations and risks",
+                snippet="Synthetic limitations source for deterministic smoke diagnostics.",
+                intent="limitations",
+            ),
+            _SmokeResultSpec(
+                path="overview",
+                title="overview",
+                snippet="Synthetic overview source for smoke-mode evidence extraction.",
+                intent="overview",
+            ),
+        )
+    if "docker" in lower or "deploy" in lower or "deployment" in lower:
+        return (
+            _SmokeResultSpec(
+                path="deployment",
+                title="deployment guide",
+                snippet=(
+                    "Synthetic deployment source with prerequisites, configuration, and caveats."
+                ),
+                intent="deployment",
+            ),
+            _SmokeResultSpec(
+                path="overview",
+                title="overview",
+                snippet="Synthetic overview source for smoke-mode evidence extraction.",
+                intent="overview",
+            ),
+            _SmokeResultSpec(
+                path="limitations",
+                title="limitations",
+                snippet="Synthetic caveats source for deployment smoke diagnostics.",
+                intent="limitations",
+            ),
+        )
+    if "privacy" in lower or "limitation" in lower or "limitations" in lower:
+        return (
+            _SmokeResultSpec(
+                path="privacy",
+                title="privacy and trust model",
+                snippet="Synthetic privacy source with advantages and limitations.",
+                intent="privacy",
+            ),
+            _SmokeResultSpec(
+                path="limitations",
+                title="limitations",
+                snippet="Synthetic limitations source for smoke-mode evidence extraction.",
+                intent="limitations",
+            ),
+            _SmokeResultSpec(
+                path="overview",
+                title="overview",
+                snippet="Synthetic overview source for smoke-mode evidence extraction.",
+                intent="overview",
+            ),
+        )
+    return (
+        _SmokeResultSpec(
+            path="overview",
+            title="overview",
+            snippet="Synthetic overview source with definition evidence for smoke-mode research.",
+            intent="overview",
+        ),
+        _SmokeResultSpec(
+            path="mechanism",
+            title="mechanism",
+            snippet="Synthetic mechanism source explaining how the topic works.",
+            intent="mechanism",
+        ),
+        _SmokeResultSpec(
+            path="limitations",
+            title="limitations",
+            snippet="Synthetic limitations source for smoke-mode coverage diagnostics.",
+            intent="limitations",
+        ),
+    )
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "generic-research-topic"
 
 
 class SearXNGSearchProvider:

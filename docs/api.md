@@ -30,6 +30,35 @@ Response `200 OK`:
 }
 ```
 
+### `GET /versionz`
+
+Purpose: lightweight process/version diagnostics for checking whether a running API process
+contains the current research-quality contract. This endpoint does not touch the database and
+does not require git to be available.
+
+Response `200 OK`:
+
+```json
+{
+  "service": "deepresearch-orchestrator",
+  "app_version": "0.1.0",
+  "git_commit": "commit-hash-or-null",
+  "git_commit_available": true,
+  "research_quality_diagnostics_fields": [
+    "selected_sources",
+    "attempted_sources",
+    "dropped_sources",
+    "source_yield_summary",
+    "evidence_yield_summary",
+    "slot_coverage_summary",
+    "verification_summary"
+  ],
+  "research_quality_diagnostics_enabled": true
+}
+```
+
+If `GET /versionz` returns `404`, the process is older than this diagnostics contract.
+
 ### `GET /metrics`
 
 Purpose: expose the minimum Prometheus-style metrics payload for the current process.
@@ -106,13 +135,31 @@ Response `200 OK`:
 
 When a task has run through the synchronous pipeline, `progress.observability` is derived from task events and may include:
 
+- planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`
 - `search_result_count`
-- `selected_sources`
+- `selected_sources`, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` metadata when applicable
 - `fetch_succeeded`
 - `fetch_failed`
 - `failed_sources` with URL, HTTP status, error code, and error reason when available
 - `parse_decisions` with per-snapshot parsing outcome details when parsing has run or failed
+- `answer_yield` per source document, including extracted text length, chunk counts, candidate sentence counts, answer-relevant candidate counts, accepted claim candidate counts, category coverage, and low-yield reasons
+- `answer_coverage` for definition, mechanism, privacy, and feature coverage
+- `answer_slots` and `report_slot_coverage`, derived from the query-specific deterministic answer-slot contract
+- `slot_coverage_summary`, with per-slot evidence candidate, accepted evidence, strong support, weak support, unsupported, source-count, and `covered|weak|missing` status fields
+- `source_yield_summary`, with per-source attempted/fetched/parsed/indexed flags, candidate/accepted/claim/rejected counts, contribution level, and dropped-source reasons
+- `dropped_sources`, using the stable reason taxonomy `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`
+- `evidence_yield_summary`, with total/accepted/rejected candidate counts plus by-slot, by-source, and top rejection-reason summaries
+- `verification_summary`, including deterministic verifier method names, strong support counts, weak support counts, contradiction counts, and explicit limitations
+- `supplemental_acquisition` with trigger status, reason, attempted sources, and skipped sources
+- `failure_diagnostics` with top rejected candidates, why required source intents were not attempted, backward-compatible about/Wikipedia details, unattempted high-quality sources, and next action when a stage fails with structured details
 - non-blocking `warnings`, such as fewer than two successful fetched sources
+
+Compatibility contract:
+
+- legacy tasks that predate source-yield, evidence-yield, slot-coverage, or verification summaries still return stable empty values when another observability field is present
+- list fields default to `[]`: `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, and `slot_coverage_summary`
+- object fields default to `{}`: `evidence_yield_summary` and `verification_summary`
+- clients must continue to tolerate `progress.observability = null` for tasks with no pipeline/search/report events
 
 ### `GET /api/v1/research/tasks/{task_id}/events`
 
@@ -1006,7 +1053,7 @@ Read contract:
 
 ### `POST /api/v1/research/tasks/{task_id}/claims/verify`
 
-Purpose: execute the minimal synchronous Phase 8 verification flow for existing task claims, reusing current retrieval to scan task-scoped `source_chunk` candidates, adding any new `support` or `contradict` evidence links, and updating each processed claim to `supported`, `mixed`, or `unsupported`.
+Purpose: execute the minimal synchronous Phase 8 verification flow for existing task claims, reusing current retrieval to scan task-scoped `source_chunk` candidates, adding any new `support` or `contradict` evidence links, and updating each processed claim to `supported`, `mixed`, or `unsupported`. The verifier remains deterministic and lexical; it records `strong_support`, `weak_support`, contradiction, numeric/date mismatch, shallow-overlap, and scope-mismatch metadata in `claim.notes_json["verification"]` without adding new persisted statuses.
 
 Request:
 
@@ -1207,13 +1254,11 @@ Response `200 OK`:
   - title
   - research question
   - executive summary
-  - method and source scope
-  - key conclusions
-  - conclusion details and evidence
-  - conflicts / uncertainty
-  - unresolved questions
-  - appendix: source list
-  - appendix: claim to citation spans mapping
+  - answer grouped by `What it is`, `How it works`, `Privacy / tracking behavior`, and `Key features / limitations`
+  - evidence table
+  - source scope and limitations
+  - unresolved / low coverage areas
+  - appendix: claim evidence mapping
 - current report synthesis never invents unsupported conclusions:
   - only `supported` claims appear as settled conclusions
   - `mixed` and `unsupported` claims are rendered only inside uncertainty-aware sections with explicit status labels
@@ -1222,8 +1267,8 @@ Response `200 OK`:
   - citation excerpts below the minimum claimable threshold are not rendered as support evidence
   - supported claims below the persisted or recomputed `claim_quality_score` and `query_answer_score` thresholds are excluded from the report instead of being promoted into the Executive Summary
   - for definition/mechanism queries, supported claims outside the expected definition, mechanism, privacy, or feature categories are excluded unless their answer score is very high
-  - the Method and Source Scope section reports answer-relevant included claim count and excluded low-quality/off-query claim count
-  - when fewer than two answer-relevant claims remain, the report includes `Low answer coverage: only N answer-relevant claims were generated.`
+  - the Source Scope and Limitations section reports answer-relevant included claim count and excluded low-quality/off-query claim count
+  - when category coverage is thin, the report explicitly states `Coverage is limited because no ... claims were generated.`
   - claims marked `supported` or `mixed` without remaining support evidence are downgraded to `unsupported` in the rendered report
 - current storage uses the existing object-store abstraction with the configured report bucket
 - Phase 10 now persists additional internal report-artifact provenance:
@@ -1243,8 +1288,11 @@ Purpose: run one existing `research_task` through the current synchronous DeepSe
 Execution contract:
 
 - starts only from `research_task.status = "PLANNED"`
-- does not use a worker, queue, Celery, LangGraph runner, or LLM
+- does not use a worker, queue, Celery, or LangGraph runner
+- may run optional Research Planner v1 before search only when `LLM_ENABLED=true` and `RESEARCH_PLANNER_ENABLED=true`
+- never uses an LLM to draft claims, verify evidence, or write the final report
 - reuses the existing service-layer seams:
+  - optional research planning
   - search discovery
   - HTTP acquisition
   - parsing and chunking
@@ -1264,12 +1312,18 @@ Execution contract:
   - `COMPLETED`
 - on stage failure, transitions the task to `FAILED`, emits `pipeline.failed`, and returns a structured failure object instead of an unstructured 500
 - emits `pipeline.started`, `pipeline.stage_started`, `pipeline.stage_completed`, `pipeline.failed`, and `pipeline.completed` task events
-- `pipeline.stage_completed` and `pipeline.failed` payloads include operator observability details for search, acquisition, and parsing:
-  - search result count and selected candidate source summaries
+- when planner is enabled, emits `research_plan.created`; when planner fails, emits `research_plan.failed` and continues with the original query
+- `pipeline.stage_completed` and `pipeline.failed` payloads include operator observability details for search, acquisition, parsing, claim drafting, and supplemental acquisition:
+  - planner intent, subquestion count, search-query count, raw/final planner query lists, downweighted planner queries, preferred/avoided domains, intent classification, extracted entity, and planner guardrail warnings when a plan exists
+  - search result count and selected candidate source summaries, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` when source-selection guardrails classify official about/home/reference, Wikipedia, GitHub, admin architecture, installation, API/developer, forum/social/video, generic, or low-quality pages
   - fetch success/failure counts
   - failed fetch URL summaries with HTTP status, error code, and error reason
   - parse decisions with snapshot id, canonical URL, MIME type, storage location, body length, decision, and parser error when present
-  - claim-drafting diagnostics when a no-claims failure occurs, including chunk summaries, candidate counts, top rejected candidates, rejection reason distribution, and scoring fields for rejected candidates
+  - per-source answer-yield metrics, source-yield summaries, dropped-source reasons, answer coverage by definition/mechanism/privacy/feature, accepted claims by category, rejected claims by rule, near-duplicate claim removals, and category coverage gaps
+  - evidence-yield summaries and slot-coverage summaries that link answer slots to candidate evidence, accepted evidence, strong/weak support, unsupported claims, and contributing source counts
+  - verification summaries that identify the deterministic lexical verifier method and distinguish strong support from weak lexical support
+  - supplemental acquisition trigger reason, attempted sources, skipped sources, and bounded retry status
+  - claim-drafting failure diagnostics when a no-claims failure remains after supplemental acquisition, including why supplemental acquisition triggered, top rejected candidates, unattempted high-quality sources, why about/Wikipedia was not attempted, per-source answer yield, and an operator `next_action`
   - warnings when fewer than two sources fetch successfully; this does not block completion when at least one source succeeds
 
 Response `200 OK` on completion:
@@ -1311,6 +1365,9 @@ Response `200 OK` on completion:
     "index_backend": "opensearch",
     "index_mode": "opensearch",
     "llm_mode": "no-LLM",
+    "research_planner_enabled": false,
+    "llm_provider": "noop",
+    "llm_base_url_configured": false,
     "uses_worker_or_queue": false
   }
 }
@@ -1361,7 +1418,7 @@ Response `200 OK` on a handled stage failure:
 
 Development modes:
 
-- `SEARCH_PROVIDER=smoke` uses a clearly marked smoke provider that returns `https://example.com/`; it is not real search
+- `SEARCH_PROVIDER=smoke` uses clearly marked synthetic `deepsearch-smoke.local` fixture sources and a network-free smoke acquisition client; it is not real search
 - `INDEX_BACKEND=local` uses a process-local deterministic index backend; it is not durable and is intended for development smoke only
 - a smoke/local run reports `running_mode = "smoke-search+deterministic-local+no-LLM"`
 
@@ -1413,8 +1470,9 @@ External dependencies:
 - `INDEX_BACKEND=opensearch`
 - `OPENSEARCH_BASE_URL`
 - `OPENSEARCH_INDEX_NAME`
+- optional planner-only OpenAI-compatible provider through `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`
 
-No LLM API is used by the current deterministic claim drafting and verification slices.
+No LLM API is used by the deterministic claim drafting, verification, or report-writing slices. Planner output is stored only in task-event payload JSON and task-detail observability summaries; there is no research-plan schema migration.
 
 ## Phase 10 infrastructure-hardening rules
 

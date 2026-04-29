@@ -68,6 +68,7 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
 - `.env.example`
 - `.env.compose.example`
 - `Makefile`
+- `dev.sh`
 - `services/orchestrator/Dockerfile`
 - `services/orchestrator/app/settings.py`
 - `services/orchestrator/app/indexing/backends.py`
@@ -116,6 +117,18 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
   - smoke flow against the narrowest realistic local stack
   - explicit documentation of any unvalidated compose behavior
 
+### Milestone 4
+- intent: harden the owner-operated host-local restart path
+- code changes:
+  - make `dev.sh` repeatable and safe around PID files, process groups, port checks, and
+    `.env` loading
+  - add diagnostics for status, doctor, logs, init, and smoke commands
+  - document the managed helper as the preferred local restart path
+- validation:
+  - shell syntax checks
+  - helper command checks
+  - isolated temporary-port start/stop validation where possible
+
 ## 7. Implementation log
 
 - 2026-04-24 research:
@@ -145,6 +158,25 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
   - repository goal shifted to a single-operator, host-local / self-hosted Linux path
   - compose artifacts remain optional tooling, not the primary definition of success for this plan
   - future closeout work should prefer docs, scripts, and operator recovery clarity over wider packaging scope
+- 2026-04-29 milestone 4:
+  - started hardening the root `dev.sh` helper as the preferred one-command host-local
+    backend/frontend restart path
+  - replaced shell-evaluated `.env` loading with a conservative parser that does not override
+    already-exported variables
+  - added managed process-group startup, stale/unowned PID handling, status/doctor/logs/init/smoke
+    commands, optional mock SearXNG startup, and `.logs` / `.run` git ignores
+  - updated the runbook and Phase 11 doc to make the helper the preferred owner-operated path
+  - validation found and fixed a Vite working-directory bug in the helper and a smoke-mode
+    default mismatch between `scripts/smoke_test.py` and `SEARCH_PROVIDER=smoke`
+  - isolated temporary-port restart, smoke, stop, and optional mock-search management now pass
+- 2026-04-29 web smoke fix:
+  - changed the local ignored `.env` used on this host from `SEARCH_PROVIDER=searxng` to
+    `SEARCH_PROVIDER=smoke` because `SEARXNG_BASE_URL=http://127.0.0.1:8080` was returning
+    frontend HTML during browser testing
+  - updated task detail behavior so a `FAILED` task offers a same-query replacement run instead
+    of presenting a disabled in-place rerun as the primary action
+  - added a task-detail diagnostic panel for `searxng_html_response` and precondition failures
+  - restarted the host-local backend/frontend with `./dev.sh restart`
 
 ## 8. Validation
 
@@ -164,6 +196,20 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
   - `curl -fsS http://127.0.0.1:8000/healthz` — passed
   - `curl -fsS http://127.0.0.1:8000/readyz` — passed
   - `curl -fsS http://127.0.0.1:8000/metrics | rg 'deepresearch_http_requests_total|deepresearch_report_results_total' -m 4` — passed
+  - `bash -n dev.sh` — passed
+  - `./dev.sh help` — passed
+  - `./dev.sh status` — passed against the existing managed 8000/5173 services
+  - `DEV_ENV_FILE=/tmp/deepsearch-devsh-noenv DEV_RUN_DIR=/tmp/deepsearch-devsh-run DEV_LOG_DIR=/tmp/deepsearch-devsh-logs DEV_BACKEND_PORT=18082 DEV_FRONTEND_PORT=15182 APP_ENV=development DATABASE_URL=sqlite:////tmp/deepsearch-devsh.db SEARCH_PROVIDER=smoke INDEX_BACKEND=local SNAPSHOT_STORAGE_BACKEND=filesystem ./dev.sh doctor` — passed
+  - same isolated env with `./dev.sh restart` — passed after fixing the Vite working directory; started backend on `127.0.0.1:18082` and frontend on `127.0.0.1:15182`
+  - same isolated env with `./dev.sh smoke` — passed after adding smoke-provider defaults for `deepsearch-smoke.local` and claim query `smoke`
+  - same isolated env with `./dev.sh stop` and `./dev.sh status` — passed; temporary backend/frontend were stopped and ports were clear
+  - `DEV_START_MOCK_SEARXNG=true DEV_SKIP_BACKEND=true DEV_SKIP_FRONTEND=true DEV_RUN_INIT=false DEV_MOCK_SEARXNG_PORT=18083 ... ./dev.sh restart` — passed; optional mock search started and readiness-checked
+  - same mock env with `./dev.sh stop` — passed
+  - `git diff --check` — passed
+  - `cd apps/web && npm run build` — passed
+  - `./dev.sh restart` — passed with `SEARCH_PROVIDER=smoke`, `INDEX_BACKEND=local`, and filesystem storage
+  - `./dev.sh smoke` — passed against `http://127.0.0.1:8000`
+  - manual API create plus `POST /api/v1/research/tasks/<task_id>/run` for `What is SearXNG and how does it work?` — passed with `COMPLETED`, `running_mode=smoke-search+deterministic-local+no-LLM`, 3 claims, and 1 report artifact
 - known host limitation:
   - `docker` is still unavailable on this machine, so `docker compose config/up` remains unvalidated in this turn
   - this is now acceptable because compose is optional tooling rather than the primary acceptance path
@@ -175,6 +221,8 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
 - compose syntax can be written correctly yet remain unvalidated without a local compose binary
 - the prod-like compose path assumes the operator supplies `infra/opensearch/certs/root-ca.pem`; this file is intentionally not generated in Phase 11
 - if the project later returns to a broader reproducible-deployment target, compose runtime validation will need a dedicated follow-up milestone
+- managed helper safety depends on PID files belonging to processes started by the helper; for
+  older manually started processes, the status output must be inspected before manual cleanup
 
 ## 10. Rollback / recovery
 

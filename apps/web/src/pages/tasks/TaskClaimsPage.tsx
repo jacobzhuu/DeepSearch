@@ -10,12 +10,12 @@ export const TaskClaimsPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
   const { claimsData, evidenceData, isLoading, error, refetch } = useClaims(taskId);
 
-  if (isLoading) return <PageLayout title="Task Claims"><LoadingState message="Loading claims and evidence..." /></PageLayout>;
+  if (isLoading) return <PageLayout title="任务结论与声明"><LoadingState message="正在加载结论和证据..." /></PageLayout>;
   
   if (error) return (
-    <PageLayout title="Task Claims">
+    <PageLayout title="任务结论与声明">
       <ErrorState error={error} onRetry={refetch} />
-      <Link to={`/tasks/${taskId}`}>Back to Task</Link>
+      <Link to={`/tasks/${taskId}`}>返回任务</Link>
     </PageLayout>
   );
 
@@ -24,17 +24,17 @@ export const TaskClaimsPage: React.FC = () => {
 
   if (claims.length === 0) {
     return (
-      <PageLayout title="Task Claims">
-        <EmptyState message="No claims have been drafted for this task yet." />
-        <Link to={`/tasks/${taskId}`}>Back to Task</Link>
+      <PageLayout title="任务结论与声明">
+        <EmptyState message="此任务尚未生成任何结论声明。" />
+        <Link to={`/tasks/${taskId}`}>返回任务</Link>
       </PageLayout>
     );
   }
 
   return (
     <PageLayout 
-      title="Task Claims"
-      actions={<Link to={`/tasks/${taskId}`}>Back to Task</Link>}
+      title="任务结论与声明"
+      actions={<Link to={`/tasks/${taskId}`}>返回任务</Link>}
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
         {claims.map((claim) => {
@@ -46,27 +46,27 @@ export const TaskClaimsPage: React.FC = () => {
               
               <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem', fontSize: '0.9rem' }}>
                 <span style={getStatusStyle(claim.verification_status)}>
-                  Status: {claim.verification_status}
+                  状态: {claim.verification_status === 'supported' ? '已支持' : claim.verification_status === 'mixed' ? '混合' : claim.verification_status === 'unsupported' ? '未支持' : claim.verification_status}
                 </span>
-                <span>Confidence: {claim.confidence !== null ? (claim.confidence * 100).toFixed(1) + '%' : 'N/A'}</span>
-                <span>Support: {claim.support_evidence_count}</span>
-                <span>Contradict: {claim.contradict_evidence_count}</span>
+                <span>置信度: {claim.confidence !== null ? (claim.confidence * 100).toFixed(1) + '%' : '无'}</span>
+                <span>支持证据: {claim.support_evidence_count}</span>
+                <span>反驳证据: {claim.contradict_evidence_count}</span>
               </div>
 
               {claim.rationale && (
                 <div style={{ backgroundColor: '#f9f9f9', padding: '0.75rem', borderRadius: '4px', marginBottom: '1rem' }}>
-                  <strong>Rationale:</strong> {claim.rationale}
+                  <strong>基本原理:</strong> {claim.rationale}
                 </div>
               )}
 
               {claimEvidence.length > 0 ? (
                 <div>
-                  <h4 style={{ fontSize: '1rem', marginBottom: '0.5rem' }}>Evidence Links:</h4>
+                  <h4 style={{ fontSize: '1rem', marginBottom: '0.5rem' }}>证据链接:</h4>
                   <ul style={{ margin: 0, paddingLeft: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                     {claimEvidence.map((ev) => (
                       <li key={ev.claim_evidence_id} style={{ fontSize: '0.9rem' }}>
                         <strong style={{ color: ev.relation_type === 'support' ? 'green' : 'red' }}>
-                          [{ev.relation_type.toUpperCase()}]
+                          [{ev.relation_type === 'support' ? '支持' : '反驳'}]
                         </strong>{' '}
                         {ev.excerpt}
                       </li>
@@ -74,7 +74,7 @@ export const TaskClaimsPage: React.FC = () => {
                   </ul>
                 </div>
               ) : (
-                <p style={{ color: '#888', fontSize: '0.9rem' }}>No evidence bound to this claim.</p>
+                <p style={{ color: '#888', fontSize: '0.9rem' }}>此声明没有绑定的证据。</p>
               )}
             </div>
           );

@@ -7,6 +7,7 @@ from services.orchestrator.app.acquisition.http_client import (
     HttpFetchResult,
     SocketHostResolver,
 )
+from services.orchestrator.app.acquisition.smoke import SmokeAcquisitionClient
 
 __all__ = [
     "AcquisitionPolicyError",
@@ -14,4 +15,5 @@ __all__ = [
     "HttpAcquisitionClient",
     "HttpFetchResult",
     "SocketHostResolver",
+    "SmokeAcquisitionClient",
 ]

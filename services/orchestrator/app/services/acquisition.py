@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -18,6 +17,10 @@ from packages.db.repositories import (
 )
 from packages.observability import get_logger, record_fetch_results
 from services.orchestrator.app.acquisition import HttpAcquisitionClient
+from services.orchestrator.app.research_quality import (
+    classify_source_intent,
+    source_intent_metadata,
+)
 from services.orchestrator.app.services.research_tasks import (
     PHASE2_ACTIVE_STATUS,
     TaskNotFoundError,
@@ -128,7 +131,7 @@ class AcquisitionService:
         selected_candidates_for_fetch = (
             selected_candidates_from_search
             if candidate_url_ids is not None
-            else _sort_candidates_for_fetch(selected_candidates_from_search)
+            else _sort_candidates_for_fetch(selected_candidates_from_search, query=task.query)
         )
         success_target = (
             max(target_successful_snapshots, 1) if target_successful_snapshots is not None else None
@@ -430,112 +433,48 @@ def _merge_trace(original_trace: dict[str, Any], patch: dict[str, Any]) -> dict[
     return merged_trace
 
 
-def _sort_candidates_for_fetch(candidates: list[CandidateUrl]) -> list[CandidateUrl]:
-    return sorted(candidates, key=_fetch_priority_key)
+def _sort_candidates_for_fetch(
+    candidates: list[CandidateUrl],
+    *,
+    query: str | None = None,
+) -> list[CandidateUrl]:
+    return sorted(candidates, key=lambda candidate: _fetch_priority_key(candidate, query=query))
 
 
-def _fetch_priority_key(candidate_url: CandidateUrl) -> tuple[int, int, str]:
+def _fetch_priority_key(
+    candidate_url: CandidateUrl,
+    *,
+    query: str | None = None,
+) -> tuple[int, int, str]:
     return (
-        _fetch_priority_score(candidate_url),
+        _fetch_priority_score(candidate_url, query=query),
         candidate_url.rank,
         str(candidate_url.id),
     )
 
 
-def _fetch_priority_score(candidate_url: CandidateUrl) -> int:
-    domain = (candidate_url.domain or "").strip().lower().removeprefix("www.")
-    parsed = urlsplit(candidate_url.canonical_url)
-    path = parsed.path.strip().lower()
-    title = (candidate_url.title or "").strip().lower()
-
-    if _is_docs_like(domain=domain, path=path, title=title):
-        return 0
-    if _is_project_homepage(domain=domain, path=path):
-        return 10
-    if domain.endswith("wikipedia.org"):
-        return 20
-    if domain == "github.com":
-        return 80
-    if _is_social_video_or_forum_domain(domain):
-        return 90
-    return 50
+def _fetch_priority_score(candidate_url: CandidateUrl, *, query: str | None = None) -> int:
+    return int(fetch_priority_metadata(candidate_url, query=query)["fetch_priority_score"])
 
 
-def fetch_priority_metadata(candidate_url: CandidateUrl) -> dict[str, object]:
-    score = _fetch_priority_score(candidate_url)
-    return {
-        "fetch_priority_score": score,
-        "fetch_priority_reason": _fetch_priority_reason(score),
-        "source_quality_score": _source_quality_score_for_fetch_priority(score),
-    }
-
-
-def _fetch_priority_reason(score: int) -> str:
-    if score == 0:
-        return "official_docs"
-    if score == 10:
-        return "project_homepage"
-    if score == 20:
-        return "wikipedia_article"
-    if score == 80:
-        return "github_repository_landing_page"
-    if score == 90:
-        return "social_video_or_forum"
-    return "generic_web_page"
-
-
-def _source_quality_score_for_fetch_priority(score: int) -> float:
-    if score == 0:
-        return 0.95
-    if score == 10:
-        return 0.72
-    if score == 20:
-        return 0.78
-    if score == 80:
-        return 0.45
-    if score == 90:
-        return 0.2
-    return 0.55
-
-
-def _is_docs_like(*, domain: str, path: str, title: str) -> bool:
-    if domain.startswith("docs.") or domain.startswith("documentation."):
-        return True
-    docs_markers = (
-        "/docs",
-        "/doc/",
-        "/documentation",
-        "/guide",
-        "/guides",
-        "/manual",
-        "/reference",
+def fetch_priority_metadata(
+    candidate_url: CandidateUrl,
+    *,
+    query: str | None = None,
+) -> dict[str, object]:
+    known_path_candidate = bool((candidate_url.metadata_json or {}).get("known_path_candidate"))
+    return source_intent_metadata(
+        canonical_url=candidate_url.canonical_url,
+        domain=candidate_url.domain,
+        title=candidate_url.title,
+        query=query,
+        known_path_candidate=known_path_candidate,
     )
-    if any(marker in path for marker in docs_markers):
-        return True
-    return "documentation" in title or "docs" in title
 
 
-def _is_project_homepage(*, domain: str, path: str) -> bool:
-    if not domain or domain.endswith("wikipedia.org"):
-        return False
-    normalized_path = path.rstrip("/")
-    return normalized_path in {"", "/"}
-
-
-def _is_social_video_or_forum_domain(domain: str) -> bool:
-    social_video_forum_domains = (
-        "reddit.com",
-        "youtube.com",
-        "youtu.be",
-        "x.com",
-        "twitter.com",
-        "facebook.com",
-        "instagram.com",
-        "tiktok.com",
-        "medium.com",
-        "news.ycombinator.com",
-        "stackoverflow.com",
-        "stackexchange.com",
-        "quora.com",
-    )
-    return any(domain == item or domain.endswith(f".{item}") for item in social_video_forum_domains)
+def _source_category(candidate_url: CandidateUrl) -> str:
+    return classify_source_intent(
+        canonical_url=candidate_url.canonical_url,
+        domain=candidate_url.domain,
+        title=candidate_url.title,
+    ).source_category

@@ -23,6 +23,8 @@ Close out the current v1 candidate around the primary host-local / self-hosted L
   - `scripts/mock_searxng.py` for deterministic local smoke without Docker
 - Docker image packaging that now includes `scripts/`
 - host-local runbook and smoke flow as the primary operator path
+- managed `dev.sh` host-local helper for repeatable backend/frontend restart, optional mock
+  search startup, initialization, status, logs, doctor checks, and smoke execution
 - runbook coverage for:
   - environment variables
   - startup order

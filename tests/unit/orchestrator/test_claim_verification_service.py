@@ -140,6 +140,16 @@ def test_claim_verification_service_marks_claim_mixed_when_support_and_contradic
     assert claim.notes_json["verification"]["rationale"] == (
         "Found 1 support evidence and 1 contradict evidence."
     )
+    assert (
+        claim.notes_json["verification"]["verifier_method"]
+        == "lexical_overlap_contradiction_scan_v2"
+    )
+    assert claim.notes_json["verification"]["strong_support_evidence_count"] == 1
+    assert claim.notes_json["verification"]["weak_support_evidence_count"] == 0
+    assert claim.notes_json["verification"]["evidence_relations"][0]["relation_detail"] in {
+        "strong_support",
+        "contradiction",
+    }
 
 
 def test_claim_verification_service_marks_claim_unsupported_when_only_contradict_evidence_exists(

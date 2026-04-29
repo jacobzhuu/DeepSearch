@@ -10,6 +10,7 @@ from packages.observability import configure_logging, get_logger, observe_http_r
 from services.orchestrator.app.api.routes.acquisition import router as acquisition_router
 from services.orchestrator.app.api.routes.claims import router as claims_router
 from services.orchestrator.app.api.routes.debug_pipeline import router as debug_pipeline_router
+from services.orchestrator.app.api.routes.health import APP_VERSION
 from services.orchestrator.app.api.routes.health import router as health_router
 from services.orchestrator.app.api.routes.indexing import router as indexing_router
 from services.orchestrator.app.api.routes.parsing import router as parsing_router
@@ -48,7 +49,7 @@ def create_app() -> FastAPI:
 
     application = FastAPI(
         title=settings.app_name,
-        version="0.1.0",
+        version=APP_VERSION,
     )
     application.add_middleware(
         CORSMiddleware,
@@ -79,6 +80,7 @@ def create_app() -> FastAPI:
             "opensearch_validate_connectivity_on_startup": (
                 settings.opensearch_validate_connectivity_on_startup
             ),
+            "llm": settings.llm_safe_summary(),
         },
     )
     return application

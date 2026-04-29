@@ -11,6 +11,7 @@ from packages.db.repositories import (
     ResearchRunRepository,
     SearchQueryRepository,
 )
+from services.orchestrator.app.planning import PlannedSearchQuery
 from services.orchestrator.app.search import (
     SearchProvider,
     SearchRequest,
@@ -225,3 +226,98 @@ def test_discover_candidates_rejects_paused_task(db_session: Session) -> None:
 
     with pytest.raises(SearchDiscoveryConflictError):
         service.discover_candidates(task.id)
+
+
+def test_discover_candidates_uses_deduped_planner_queries(db_session: Session) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is SearXNG and how does it work?",
+        constraints={"max_urls": 3},
+    )
+    provider = StaticSearchProvider(
+        responses={
+            "SearXNG official documentation what is SearXNG": (
+                SearchResultItem(
+                    url="https://docs.searxng.org/",
+                    title="SearXNG docs",
+                    snippet="Official docs",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            ),
+            "SearXNG privacy not storing user information": (
+                SearchResultItem(
+                    url="https://docs.searxng.org/user/about.html",
+                    title="SearXNG privacy",
+                    snippet="Privacy docs",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            ),
+            "What is SearXNG and how does it work?": (
+                SearchResultItem(
+                    url="https://en.wikipedia.org/wiki/SearXNG",
+                    title="SearXNG",
+                    snippet="Reference",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            ),
+        }
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(
+        task.id,
+        planned_search_queries=[
+            PlannedSearchQuery(
+                query_text="SearXNG official documentation what is SearXNG",
+                rationale="official overview",
+                expected_source_type="official_docs",
+                priority=1,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text="SearXNG official documentation what is SearXNG",
+                rationale="duplicate",
+                expected_source_type="official_docs",
+                priority=2,
+            ),
+            PlannedSearchQuery(
+                query_text="SearXNG privacy not storing user information",
+                rationale="privacy",
+                expected_source_type="official_docs",
+                priority=3,
+            ),
+        ],
+    )
+    persisted_queries = SearchQueryRepository(db_session).list_for_task(task.id)
+
+    assert [request.query_text for request in provider.requests] == [
+        "SearXNG official documentation what is SearXNG",
+        "SearXNG privacy not storing user information",
+        "What is SearXNG and how does it work?",
+    ]
+    assert [item.search_query.query_text for item in result.search_queries] == [
+        "SearXNG official documentation what is SearXNG",
+        "SearXNG privacy not storing user information",
+        "What is SearXNG and how does it work?",
+    ]
+    canonical_urls = [candidate.canonical_url for candidate in result.candidate_urls]
+    assert "https://docs.searxng.org/user/about.html" in canonical_urls
+    assert "https://en.wikipedia.org/wiki/SearXNG" in canonical_urls
+    about_candidate = next(
+        candidate
+        for candidate in result.candidate_urls
+        if candidate.canonical_url == "https://docs.searxng.org/user/about.html"
+    )
+    assert about_candidate.metadata_json["known_path_candidate"] is True
+    assert about_candidate.metadata_json["source_engine"] == "deterministic_known_path"
+    assert persisted_queries[0].raw_response_json["expansion_kind"] == "research_plan"
+    assert (
+        persisted_queries[0].raw_response_json["expansion_metadata"]["expected_source_type"]
+        == "official_docs"
+    )
+    assert persisted_queries[0].raw_response_json["expansion_metadata"]["query_source"] == (
+        "guardrail_query"
+    )

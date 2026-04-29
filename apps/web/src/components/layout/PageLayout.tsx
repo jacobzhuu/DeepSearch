@@ -20,7 +20,7 @@ export const PageLayout: React.FC<PageLayoutProps> = ({ title, children, actions
       </main>
       
       <footer style={{ marginTop: '3rem', paddingTop: '1rem', borderTop: '1px solid #eee', textAlign: 'center', color: '#999' }}>
-        <p><Link to="/tasks/new">Create New Task</Link> | DeepSearch Operator UI</p>
+        <p><Link to="/tasks/new">创建新任务</Link> | DeepSearch 操作台</p>
       </footer>
     </div>
   );

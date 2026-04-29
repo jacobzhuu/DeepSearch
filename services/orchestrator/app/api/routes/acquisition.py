@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from services.orchestrator.app.acquisition import HttpAcquisitionClient
+from services.orchestrator.app.acquisition import HttpAcquisitionClient, SmokeAcquisitionClient
 from services.orchestrator.app.api.schemas.acquisition import (
     AcquisitionEntryResponse,
     ContentSnapshotListResponse,
@@ -35,6 +35,8 @@ SessionDep = Annotated[Session, Depends(get_db_session)]
 
 def get_http_acquisition_client() -> HttpAcquisitionClient:
     settings = get_settings()
+    if settings.search_provider.strip().lower() == "smoke":
+        return SmokeAcquisitionClient()
     return HttpAcquisitionClient(
         timeout_seconds=settings.acquisition_timeout_seconds,
         max_redirects=settings.acquisition_max_redirects,

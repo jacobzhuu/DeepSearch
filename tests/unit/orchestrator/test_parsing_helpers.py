@@ -27,6 +27,53 @@ def test_extract_parsed_content_from_html_discards_script_and_keeps_title() -> N
     assert parsed.metadata["extractor"] == "html_main_content_v1"
 
 
+def test_extract_parsed_content_preserves_sphinx_link_text() -> None:
+    parsed = extract_parsed_content(
+        mime_type="text/html",
+        content=b"""
+        <html>
+          <body>
+            <div class="sidebar">Navigation</div>
+            <main>
+              <article>
+                <p>
+                  SearXNG is a free internet metasearch engine which aggregates
+                  results from up to <a href="/user/configured_engines.html">251 search engines</a>.
+                </p>
+                <p>
+                  Instances are listed at <a href="https://searx.space/">searx.space</a>;
+                  see <a href="/admin/installation.html">installation</a>.
+                </p>
+              </article>
+            </main>
+          </body>
+        </html>
+        """,
+    )
+
+    assert "251 search engines" in parsed.text
+    assert "searx.space" in parsed.text
+    assert "installation" in parsed.text
+    assert parsed.metadata["preserved_link_text_count"] >= 3
+    assert parsed.metadata["text_cleanup_applied"] is False
+
+
+def test_extract_parsed_content_cleans_broken_link_residue_conservatively() -> None:
+    parsed = extract_parsed_content(
+        mime_type="text/html",
+        content=b"""
+        <html><body><main><p>
+          SearXNG is a free internet metasearch engine which aggregates results from up to 251 .
+        </p></main></body></html>
+        """,
+    )
+
+    assert "from up to 251 ." not in parsed.text
+    assert "aggregates results." in parsed.text
+    assert parsed.metadata["text_cleanup_applied"] is True
+    assert "from up to <number> ." in parsed.metadata["dropped_broken_link_fragments"]
+
+
 def test_extract_parsed_content_prefers_main_article_and_discards_boilerplate() -> None:
     parsed = extract_parsed_content(
         mime_type="text/html",
@@ -303,3 +350,69 @@ def test_chunk_quality_keeps_privacy_body_eligible_before_reference_tail() -> No
     assert quality.eligible_for_claims is True
     assert quality.is_reference_section is False
     assert quality.content_quality_score >= 0.35
+
+
+def test_chunk_quality_marks_architecture_diagram_and_config_ineligible() -> None:
+    quality = assess_chunk_quality(
+        text=(
+            "2 Reference architecture of a public SearXNG setup.\n\n"
+            "digraph G {\n"
+            "  rp -> uwsgi\n"
+            "  uwsgi -> valkey\n"
+            "}\n\n"
+            "use_default_settings:\n"
+            "secret_key: change-me\n"
+            "valkey://localhost:6379/0"
+        ),
+        query="What is SearXNG and how does it work?",
+        source_quality_score=0.95,
+        parsed_metadata={},
+    )
+
+    assert quality.eligible_for_claims is False
+    assert quality.is_diagram_or_config_section is True
+    assert "diagram_or_config_section" in quality.reasons
+
+
+def test_chunk_quality_marks_developer_heading_only_page_ineligible() -> None:
+    quality = assess_chunk_quality(
+        text="Developer documentation",
+        query="What is SearXNG and how does it work?",
+        source_quality_score=0.95,
+        parsed_metadata={},
+    )
+
+    assert quality.eligible_for_claims is False
+    assert quality.content_quality == "low"
+    assert "very_short" in quality.reasons
+
+
+def test_chunk_quality_marks_documentation_pointer_and_project_meta_ineligible() -> None:
+    quality = assess_chunk_quality(
+        text=(
+            "For more information, visit the documentation. "
+            "Track development, send contributions, and join Matrix for project updates."
+        ),
+        query="What is SearXNG and how does it work?",
+        source_quality_score=0.95,
+        parsed_metadata={},
+    )
+
+    assert quality.eligible_for_claims is False
+    assert quality.is_navigation_noise is True
+    assert "pointer_or_project_meta_noise" in quality.reasons
+
+
+def test_chunk_quality_keeps_answer_prose_with_documentation_tail_eligible() -> None:
+    quality = assess_chunk_quality(
+        text=(
+            "SearXNG aggregates results from multiple search services and returns them "
+            "to the user. For more information, visit the documentation."
+        ),
+        query="What is SearXNG and how does it work?",
+        source_quality_score=0.95,
+        parsed_metadata={},
+    )
+
+    assert quality.eligible_for_claims is True
+    assert quality.is_navigation_noise is False

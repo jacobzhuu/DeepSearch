@@ -132,8 +132,9 @@ def main() -> int:
         markdown = _get_str(report, "markdown")
         required_sections = (
             "## Executive Summary",
-            "## Key Conclusions",
-            "## Appendix: Claim To Citation Spans Mapping",
+            "## Answer",
+            "## Evidence Table",
+            "## Appendix: Claim Evidence Mapping",
         )
         for section in required_sections:
             if section not in markdown:

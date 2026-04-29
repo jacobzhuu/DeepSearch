@@ -55,6 +55,14 @@ class Settings(BaseSettings):
         default=2,
         validation_alias="ACQUISITION_TARGET_SUCCESSFUL_SNAPSHOTS",
     )
+    acquisition_min_answer_sources: int = Field(
+        default=3,
+        validation_alias="ACQUISITION_MIN_ANSWER_SOURCES",
+    )
+    acquisition_max_supplemental_sources: int = Field(
+        default=3,
+        validation_alias="ACQUISITION_MAX_SUPPLEMENTAL_SOURCES",
+    )
     acquisition_user_agent: str = Field(
         default="deepresearch-orchestrator/0.1",
         validation_alias="ACQUISITION_USER_AGENT",
@@ -123,7 +131,49 @@ class Settings(BaseSettings):
         default=5,
         validation_alias="CLAIM_VERIFICATION_MAX_CLAIMS_PER_REQUEST",
     )
+    llm_enabled: bool = Field(default=False, validation_alias="LLM_ENABLED")
+    llm_provider: str = Field(default="noop", validation_alias="LLM_PROVIDER")
+    llm_model: str = Field(default="", validation_alias="LLM_MODEL")
+    llm_api_key: str = Field(default="", validation_alias="LLM_API_KEY", repr=False)
+    llm_base_url: str = Field(default="", validation_alias="LLM_BASE_URL")
+    llm_timeout_seconds: float = Field(default=30.0, validation_alias="LLM_TIMEOUT_SECONDS")
+    llm_max_retries: int = Field(default=1, validation_alias="LLM_MAX_RETRIES")
+    llm_max_output_tokens: int = Field(
+        default=1200,
+        validation_alias="LLM_MAX_OUTPUT_TOKENS",
+    )
+    research_planner_enabled: bool = Field(
+        default=False,
+        validation_alias="RESEARCH_PLANNER_ENABLED",
+    )
+    research_planner_max_subquestions: int = Field(
+        default=5,
+        validation_alias="RESEARCH_PLANNER_MAX_SUBQUESTIONS",
+    )
+    research_planner_max_search_queries: int = Field(
+        default=8,
+        validation_alias="RESEARCH_PLANNER_MAX_SEARCH_QUERIES",
+    )
     metrics_enabled: bool = Field(default=True, validation_alias="METRICS_ENABLED")
+
+    def llm_safe_summary(self) -> dict[str, object]:
+        normalized_provider = self.llm_provider.strip().lower() or "noop"
+        normalized_base_url = self.llm_base_url.strip()
+        return {
+            "llm_enabled": self.llm_enabled,
+            "llm_provider": normalized_provider,
+            "llm_model": self.llm_model.strip(),
+            "llm_base_url_configured": bool(normalized_base_url),
+            "llm_api_key_present": bool(self.llm_api_key.strip()),
+            "llm_timeout_seconds": self.llm_timeout_seconds,
+            "llm_max_retries": self.llm_max_retries,
+            "llm_max_output_tokens": self.llm_max_output_tokens,
+            "research_planner_enabled": self.research_planner_enabled,
+            "research_planner_max_subquestions": self.research_planner_max_subquestions,
+            "research_planner_max_search_queries": self.research_planner_max_search_queries,
+            "acquisition_min_answer_sources": self.acquisition_min_answer_sources,
+            "acquisition_max_supplemental_sources": self.acquisition_max_supplemental_sources,
+        }
 
 
 @lru_cache

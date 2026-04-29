@@ -14,7 +14,9 @@ from packages.db.repositories import (
     ResearchTaskRepository,
     SearchQueryRepository,
 )
+from services.orchestrator.app.planning import PlannedSearchQuery
 from services.orchestrator.app.search import (
+    ExpandedQuery,
     QueryExpansionStrategy,
     SearchProvider,
     SearchRequest,
@@ -78,13 +80,22 @@ class SearchDiscoveryService:
         self.max_results_per_query = max_results_per_query
         self.allowed_statuses = allowed_statuses
 
-    def discover_candidates(self, task_id: UUID) -> SearchDiscoveryResult:
+    def discover_candidates(
+        self,
+        task_id: UUID,
+        *,
+        planned_search_queries: list[PlannedSearchQuery] | None = None,
+    ) -> SearchDiscoveryResult:
         task = self._get_task(task_id)
         if task.status not in self.allowed_statuses:
             raise SearchDiscoveryConflictError(task.id, task.status)
 
         constraints = dict(task.constraints_json)
-        expanded_queries = self.query_expansion_strategy.expand(task.query, constraints=constraints)
+        expanded_queries = self._expand_queries(
+            task.query,
+            constraints=constraints,
+            planned_search_queries=planned_search_queries,
+        )
         if not expanded_queries:
             raise ValueError(f"task {task.id} does not have a valid searchable query")
 
@@ -183,6 +194,50 @@ class SearchDiscoveryService:
                 if remaining_slots <= 0:
                     break
 
+            known_path_candidates = _known_path_candidates_for_query(
+                query=task.query,
+                provider_results=provider_response.results,
+                constraints=constraints,
+            )
+            for known_path in known_path_candidates:
+                canonical = canonicalize_url(known_path["url"])
+                if canonical is None:
+                    filtered_for_query += 1
+                    continue
+                if canonical.canonical_url in existing_candidates:
+                    duplicates_for_query += 1
+                    continue
+                candidate = self.candidate_url_repository.add(
+                    CandidateUrl(
+                        task_id=task.id,
+                        search_query_id=search_query.id,
+                        original_url=canonical.original_url,
+                        canonical_url=canonical.canonical_url,
+                        domain=canonical.domain,
+                        title=known_path["title"],
+                        rank=int(known_path["rank"]),
+                        selected=False,
+                        metadata_json={
+                            "provider": provider_response.provider,
+                            "source_engine": "deterministic_known_path",
+                            "snippet": known_path["snippet"],
+                            "result_metadata": {
+                                "known_path_candidate": True,
+                                "known_path_reason": known_path["reason"],
+                            },
+                            "task_revision_no": task.revision_no,
+                            "expansion_kind": expanded_query.expansion_kind,
+                            "expansion_metadata": expanded_query.metadata,
+                            "query_text": expanded_query.query_text,
+                            "known_path_candidate": True,
+                            "source_selection_reason": known_path["reason"],
+                        },
+                    )
+                )
+                discovered_candidates.append(candidate)
+                existing_candidates.add(canonical.canonical_url)
+                added_for_query += 1
+
             duplicates_skipped += duplicates_for_query
             filtered_out += filtered_for_query
             persisted_queries.append(
@@ -248,6 +303,45 @@ class SearchDiscoveryService:
                 },
             )
         )
+
+    def _expand_queries(
+        self,
+        query: str,
+        *,
+        constraints: dict[str, Any],
+        planned_search_queries: list[PlannedSearchQuery] | None,
+    ) -> list[ExpandedQuery]:
+        base_expanded = self.query_expansion_strategy.expand(query, constraints=constraints)
+        if not planned_search_queries:
+            return base_expanded
+
+        expanded_queries: list[ExpandedQuery] = []
+        seen_query_texts: set[str] = set()
+        for planned_query in sorted(planned_search_queries, key=lambda item: item.priority):
+            query_text = planned_query.query_text.strip()
+            if not query_text or query_text in seen_query_texts:
+                continue
+            expanded_queries.append(
+                ExpandedQuery(
+                    query_text=query_text,
+                    expansion_kind="research_plan",
+                    metadata={
+                        "rationale": planned_query.rationale,
+                        "expected_source_type": planned_query.expected_source_type,
+                        "priority": planned_query.priority,
+                        "query_source": planned_query.query_source,
+                    },
+                )
+            )
+            seen_query_texts.add(query_text)
+
+        for expanded_query in base_expanded:
+            if expanded_query.query_text in seen_query_texts:
+                continue
+            expanded_queries.append(expanded_query)
+            seen_query_texts.add(expanded_query.query_text)
+
+        return expanded_queries
 
 
 def create_search_discovery_service(
@@ -318,6 +412,71 @@ def _resolve_total_candidate_limit(raw_limit: Any, *, default_limit: int) -> int
     if isinstance(raw_limit, int) and raw_limit > 0:
         return raw_limit
     return default_limit
+
+
+def _known_path_candidates_for_query(
+    *,
+    query: str,
+    provider_results: tuple[Any, ...],
+    constraints: dict[str, Any],
+) -> list[dict[str, object]]:
+    if not _is_searxng_overview_query(query):
+        return []
+
+    saw_searxng_official = False
+    for result in provider_results:
+        canonical = canonicalize_url(result.url)
+        if canonical is None:
+            continue
+        normalized_domain = canonical.domain.removeprefix("www.")
+        if normalized_domain in {"searxng.org", "docs.searxng.org"}:
+            saw_searxng_official = True
+            break
+    if not saw_searxng_official:
+        return []
+
+    allow_domains = _resolve_domains(constraints.get("domains_allow"))
+    deny_domains = _resolve_domains(constraints.get("domains_deny"))
+    candidates = [
+        {
+            "url": "https://docs.searxng.org/user/about.html",
+            "title": "SearXNG about",
+            "snippet": "Deterministic known overview path for SearXNG documentation.",
+            "rank": 10001,
+            "reason": "known_path_candidate: official about page for SearXNG overview query",
+        },
+        {
+            "url": "https://en.wikipedia.org/wiki/SearXNG",
+            "title": "SearXNG - Wikipedia",
+            "snippet": "Deterministic stable reference candidate for SearXNG overview query.",
+            "rank": 10002,
+            "reason": "known_path_candidate: Wikipedia reference for SearXNG overview query",
+        },
+    ]
+    filtered: list[dict[str, object]] = []
+    for candidate in candidates:
+        canonical = canonicalize_url(str(candidate["url"]))
+        if canonical is None:
+            continue
+        if not is_domain_allowed(
+            canonical.domain,
+            allow_domains=allow_domains,
+            deny_domains=deny_domains,
+        ):
+            continue
+        filtered.append(candidate)
+    return filtered
+
+
+def _is_searxng_overview_query(query: str) -> bool:
+    lower = query.lower()
+    return "searxng" in lower and (
+        "what is" in lower
+        or "overview" in lower
+        or "how does" in lower
+        or "how it works" in lower
+        or lower.startswith("explain ")
+    )
 
 
 def _run_revision_no(run: ResearchRun) -> int | None:

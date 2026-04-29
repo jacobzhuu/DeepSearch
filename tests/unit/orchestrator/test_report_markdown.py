@@ -73,14 +73,14 @@ def test_render_markdown_report_contains_required_sections_and_status_labels() -
     assert "# Research Report: What is currently known?" in report.markdown
     assert "## Research Question" in report.markdown
     assert "## Executive Summary" in report.markdown
-    assert "## Method And Source Scope" in report.markdown
-    assert "## Key Conclusions" in report.markdown
-    assert "## Conclusion Details And Evidence" in report.markdown
-    assert "## Conflicts / Uncertainty" in report.markdown
-    assert "## Unresolved Questions" in report.markdown
-    assert "## Appendix: Source List" in report.markdown
-    assert "## Appendix: Claim To Citation Spans Mapping" in report.markdown
-    assert "[MIXED] A mixed conclusion remains under dispute." in report.markdown
+    assert "## Answer" in report.markdown
+    assert "### " in report.markdown
+    assert "## Answer Slot Coverage" in report.markdown
+    assert "## Evidence Table" in report.markdown
+    assert "## Source Scope and Limitations" in report.markdown
+    assert "## Unresolved / Low Coverage Areas" in report.markdown
+    assert "## Appendix: Claim Evidence Mapping" in report.markdown
+    assert "[MIXED]: A mixed conclusion remains under dispute." in report.markdown
     assert "Contradict evidence excerpt." in report.markdown
     assert report.supported_count == 0
     assert report.mixed_count == 1

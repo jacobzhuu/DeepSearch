@@ -16,7 +16,7 @@ from packages.db.repositories import (
     ResearchRunRepository,
     SearchQueryRepository,
 )
-from services.orchestrator.app.acquisition import HttpAcquisitionClient
+from services.orchestrator.app.acquisition import HttpAcquisitionClient, SmokeAcquisitionClient
 from services.orchestrator.app.services.acquisition import (
     FETCH_MODE_HTTP,
     FETCH_STATUS_FAILED,
@@ -37,6 +37,18 @@ class StaticResolver:
     def resolve(self, host: str, port: int) -> tuple[str, ...]:
         del host, port
         return self.addresses
+
+
+def test_smoke_acquisition_client_returns_synthetic_html_without_network() -> None:
+    result = SmokeAcquisitionClient().fetch("https://deepsearch-smoke.local/opensearch/overview")
+
+    assert result.http_status == 200
+    assert result.error_code is None
+    assert result.mime_type == "text/html"
+    assert result.content is not None
+    assert b"Synthetic development smoke source" in result.content
+    assert b"OpenSearch is an open-source distributed search and analytics engine" in result.content
+    assert result.trace["synthetic_fixture"] is True
 
 
 def _create_acquisition_service(
@@ -384,8 +396,8 @@ def test_acquisition_service_prioritizes_stable_html_sources_for_fetch(
         "https://github.com/searxng/searxng"
     )
     assert requested_urls[:2] == [
-        "https://searxng.org/",
         "https://en.wikipedia.org/wiki/SearXNG",
+        "https://searxng.org/",
     ]
     assert requested_urls.index("https://github.com/searxng/searxng") > requested_urls.index(
         "https://en.wikipedia.org/wiki/SearXNG"
@@ -453,10 +465,95 @@ def test_acquisition_service_prioritizes_official_docs_over_social_and_repo_page
     github_metadata = fetch_priority_metadata(github_candidate)
 
     assert requested_urls[0] == "https://docs.searxng.org/"
-    assert docs_metadata["fetch_priority_reason"] == "official_docs"
+    assert docs_metadata["fetch_priority_reason"] == "official_docs_reference"
+    assert docs_metadata["source_category"] == "official_home"
     assert docs_metadata["source_quality_score"] > github_metadata["source_quality_score"]
     assert docs_metadata["source_quality_score"] > reddit_metadata["source_quality_score"]
     assert docs_metadata["source_quality_score"] > youtube_metadata["source_quality_score"]
+
+
+def test_acquisition_service_prioritizes_searxng_about_and_wikipedia_over_admin_pages(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task, architecture_candidate = _seed_candidate(
+        db_session,
+        query="What is SearXNG and how does it work?",
+        canonical_url="https://docs.searxng.org/admin/architecture.html",
+    )
+    architecture_candidate.domain = "docs.searxng.org"
+    architecture_candidate.title = "SearXNG architecture"
+    about_candidate = _add_candidate(
+        db_session,
+        architecture_candidate,
+        canonical_url="https://docs.searxng.org/user/about.html",
+        domain="docs.searxng.org",
+        rank=2,
+        title="SearXNG about",
+    )
+    wikipedia_candidate = _add_candidate(
+        db_session,
+        architecture_candidate,
+        canonical_url="https://en.wikipedia.org/wiki/SearXNG",
+        domain="en.wikipedia.org",
+        rank=3,
+        title="SearXNG - Wikipedia",
+    )
+    home_candidate = _add_candidate(
+        db_session,
+        architecture_candidate,
+        canonical_url="https://docs.searxng.org/",
+        domain="docs.searxng.org",
+        rank=4,
+        title="SearXNG docs",
+    )
+    installation_candidate = _add_candidate(
+        db_session,
+        architecture_candidate,
+        canonical_url="https://docs.searxng.org/admin/installation.html",
+        domain="docs.searxng.org",
+        rank=5,
+        title="SearXNG installation",
+    )
+    db_session.commit()
+
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, content=b"ok", request=request
+        )
+
+    service = _create_acquisition_service(
+        db_session,
+        transport=httpx.MockTransport(handler),
+        snapshot_root=tmp_path,
+        resolver=StaticResolver("93.184.216.34"),
+    )
+
+    service.acquire_candidates(task.id, candidate_url_ids=None, limit=5)
+
+    assert requested_urls[:5] == [
+        about_candidate.canonical_url,
+        wikipedia_candidate.canonical_url,
+        home_candidate.canonical_url,
+        architecture_candidate.canonical_url,
+        installation_candidate.canonical_url,
+    ]
+    about_metadata = fetch_priority_metadata(about_candidate, query=task.query)
+    wikipedia_metadata = fetch_priority_metadata(wikipedia_candidate, query=task.query)
+    architecture_metadata = fetch_priority_metadata(architecture_candidate, query=task.query)
+    assert about_metadata["source_intent"] == "official_about"
+    assert wikipedia_metadata["source_intent"] == "wikipedia_reference"
+    assert architecture_metadata["source_intent"] == "official_architecture_admin"
+    assert architecture_metadata["downrank_reason"] == (
+        "architecture_page_downranked_for_overview_query"
+    )
+    assert about_metadata["fetch_priority_score"] < architecture_metadata["fetch_priority_score"]
+    assert (
+        wikipedia_metadata["fetch_priority_score"] < architecture_metadata["fetch_priority_score"]
+    )
 
 
 def test_acquisition_service_records_failed_attempt_without_snapshot_for_blocked_target(

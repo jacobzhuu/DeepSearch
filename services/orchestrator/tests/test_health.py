@@ -18,6 +18,17 @@ def test_readyz_returns_service_metadata() -> None:
     assert response.json()["service"] == "deepresearch-orchestrator"
 
 
+def test_versionz_reports_research_quality_contract_fields() -> None:
+    response = TestClient(app).get("/versionz")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["app_version"] == "0.1.0"
+    assert payload["research_quality_diagnostics_enabled"] is True
+    assert "source_yield_summary" in payload["research_quality_diagnostics_fields"]
+    assert "verification_summary" in payload["research_quality_diagnostics_fields"]
+
+
 def test_metrics_returns_prometheus_payload() -> None:
     client = TestClient(app)
     client.get("/healthz")

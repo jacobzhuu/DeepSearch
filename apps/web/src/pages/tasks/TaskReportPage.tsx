@@ -13,29 +13,29 @@ export const TaskReportPage: React.FC = () => {
   const [viewMode, setViewMode] = useState<'html' | 'raw'>('html');
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
 
-  if (isLoading) return <PageLayout title="Task Report"><LoadingState message="Loading report..." /></PageLayout>;
+  if (isLoading) return <PageLayout title="任务报告"><LoadingState message="正在加载报告..." /></PageLayout>;
   
   if (error) {
     return (
-      <PageLayout title="Task Report">
+      <PageLayout title="任务报告">
         <ErrorState error={error} onRetry={refetch} />
-        <Link to={`/tasks/${taskId}`}>Back to Task</Link>
+        <Link to={`/tasks/${taskId}`}>返回任务</Link>
       </PageLayout>
     );
   }
 
   if (!report) {
     return (
-      <PageLayout title="Task Report">
-        <EmptyState message="No report has been generated for this task yet." />
-        <Link to={`/tasks/${taskId}`}>Back to Task</Link>
+      <PageLayout title="任务报告">
+        <EmptyState message="此任务尚未生成任何报告。" />
+        <Link to={`/tasks/${taskId}`}>返回任务</Link>
       </PageLayout>
     );
   }
 
   const copyMarkdown = async () => {
     await navigator.clipboard.writeText(report.markdown);
-    setCopyStatus('Copied');
+    setCopyStatus('已复制');
     window.setTimeout(() => setCopyStatus(null), 1800);
   };
 
@@ -53,7 +53,7 @@ export const TaskReportPage: React.FC = () => {
 
   return (
     <PageLayout 
-      title="Task Report"
+      title="任务报告"
       actions={
         <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
           <button
@@ -61,30 +61,30 @@ export const TaskReportPage: React.FC = () => {
             onClick={() => setViewMode('html')}
             style={viewMode === 'html' ? activeButtonStyle : secondaryButtonStyle}
           >
-            HTML
+            网页视图 (HTML)
           </button>
           <button
             type="button"
             onClick={() => setViewMode('raw')}
             style={viewMode === 'raw' ? activeButtonStyle : secondaryButtonStyle}
           >
-            Raw Markdown
+            原始 Markdown
           </button>
           <button type="button" onClick={copyMarkdown} style={secondaryButtonStyle}>
-            {copyStatus || 'Copy Markdown'}
+            {copyStatus || '复制 Markdown'}
           </button>
           <button type="button" onClick={downloadMarkdown} style={secondaryButtonStyle}>
-            Download .md
+            下载 .md
           </button>
-          <Link to={`/tasks/${taskId}`}>Back to Task</Link>
+          <Link to={`/tasks/${taskId}`}>返回任务</Link>
         </div>
       }
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
         <section style={{ backgroundColor: '#f0f7ff', padding: '1rem', borderRadius: '4px' }}>
-          <strong>Title:</strong> {report.title} <br />
-          <strong>Format:</strong> {report.format} <br />
-          <strong>Created At:</strong> {new Date(report.created_at).toLocaleString()}
+          <strong>标题:</strong> {report.title} <br />
+          <strong>格式:</strong> {report.format} <br />
+          <strong>创建时间:</strong> {new Date(report.created_at).toLocaleString()}
         </section>
 
         <section style={{ backgroundColor: '#fff', border: '1px solid #eee', padding: '2rem', borderRadius: '8px' }}>

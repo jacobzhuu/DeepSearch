@@ -52,6 +52,7 @@ def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
             text = title
             extractor_strategy_used = "title_text_fallback"
             fallback_used = True
+        text, dropped_broken_link_fragments = _cleanup_broken_link_fragments(text)
         metadata: dict[str, object] = {
             "mime_type": normalized_mime_type,
             "extractor": "html_main_content_v1",
@@ -60,6 +61,10 @@ def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
             "fallback_used": fallback_used,
             "removed_boilerplate_count": parser.removed_boilerplate_count,
             "extracted_text_length": len(text),
+            "text_cleanup_applied": bool(dropped_broken_link_fragments),
+            "dropped_broken_link_fragments": dropped_broken_link_fragments,
+            "preserved_link_text_count": parser.preserved_link_text_count,
+            "link_text_extraction_strategy": "html_parser_data_nodes",
         }
         redirect_stub = _detect_redirect_stub(text=text, raw_html=decoded_content)
         if redirect_stub is not None:
@@ -173,6 +178,9 @@ class _MinimalHtmlTextExtractor(HTMLParser):
         self._main_depth = 0
         self._main_stack: list[int] = []
         self._in_title = False
+        self._anchor_depth = 0
+        self._anchor_parts: list[str] = []
+        self.preserved_link_text_count = 0
 
     @property
     def all_text(self) -> str:
@@ -208,6 +216,10 @@ class _MinimalHtmlTextExtractor(HTMLParser):
             return
         if normalized_tag == "title":
             self._in_title = True
+        if normalized_tag == "a":
+            self._anchor_depth += 1
+            if self._anchor_depth == 1:
+                self._anchor_parts = []
         if self._is_main_start(normalized_tag, attrs_by_name):
             self._main_depth += 1
             self._main_stack.append(self._element_depth)
@@ -223,6 +235,12 @@ class _MinimalHtmlTextExtractor(HTMLParser):
             return
         if normalized_tag == "title":
             self._in_title = False
+        if normalized_tag == "a" and self._anchor_depth > 0:
+            if self._anchor_depth == 1 and _normalize_single_line("".join(self._anchor_parts)):
+                self.preserved_link_text_count += 1
+            self._anchor_depth -= 1
+            if self._anchor_depth == 0:
+                self._anchor_parts = []
         if normalized_tag in self._BLOCK_TAGS:
             self._append_text("\n")
         if (
@@ -247,6 +265,8 @@ class _MinimalHtmlTextExtractor(HTMLParser):
         if self._in_title:
             self.title_parts.append(data)
             return
+        if self._anchor_depth > 0:
+            self._anchor_parts.append(data)
         self._append_text(data)
 
     def _append_text(self, value: str) -> None:
@@ -418,6 +438,24 @@ def _derive_text_title(text: str) -> str | None:
     if not first_line:
         return None
     return first_line[:200]
+
+
+def _cleanup_broken_link_fragments(text: str) -> tuple[str, list[str]]:
+    dropped: list[str] = []
+    cleaned = text
+    replacements = (
+        (r"\s+from\s+up\s+to\s+\d+\s+\.", ".", "from up to <number> ."),
+        (r"\s+listed\s+at\s+\.", ".", "listed at ."),
+        (r"\s+see\s+\.", ".", "see ."),
+        (r"\s+at\s+\.", ".", "at ."),
+    )
+    for pattern, replacement, label in replacements:
+        if re.search(pattern, cleaned, flags=re.IGNORECASE):
+            dropped.append(label)
+            cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+    if dropped:
+        cleaned = _normalize_plain_text(cleaned)
+    return cleaned, dropped
 
 
 def _looks_like_mediawiki_html(raw_html: str) -> bool:

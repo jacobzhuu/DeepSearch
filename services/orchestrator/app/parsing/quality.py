@@ -51,6 +51,21 @@ _NAVIGATION_PHRASES = (
     "terms of use",
     "navigation menu",
 )
+_POINTER_PROJECT_META_PHRASES = (
+    "developer documentation",
+    "for more information",
+    "join matrix",
+    "make it better",
+    "make searxng better",
+    "open community",
+    "read the documentation",
+    "report issues",
+    "see installation",
+    "send contributions",
+    "track development",
+    "visit documentation",
+    "weblate",
+)
 _REFERENCE_PHRASES = (
     "references",
     "bibliography",
@@ -72,6 +87,14 @@ _STRONG_REFERENCE_PHRASES = (
     "doi:",
     "retrieved from",
     "implementación de un prototipo",
+)
+_DIAGRAM_CONFIG_PHRASES = (
+    "digraph g",
+    "subgraph cluster",
+    "node [style=",
+    "valkey://",
+    "use_default_settings:",
+    "secret_key:",
 )
 _SOCIAL_VIDEO_FORUM_DOMAINS = (
     "reddit.com",
@@ -103,6 +126,7 @@ class ChunkQuality:
     eligible_for_claims: bool
     is_navigation_noise: bool
     is_reference_section: bool
+    is_diagram_or_config_section: bool
     content_quality: str
     reasons: list[str]
 
@@ -147,6 +171,9 @@ def assess_chunk_quality(
     redirect_stub = metadata.get("reason") == "redirect_stub" or _looks_like_redirect_stub(lower)
     is_reference_section = _looks_like_reference_section(lower)
     is_navigation_noise = _looks_like_navigation_noise(lower)
+    is_pointer_or_project_meta_noise = _looks_like_pointer_or_project_meta_noise(lower)
+    is_navigation_noise = is_navigation_noise or is_pointer_or_project_meta_noise
+    is_diagram_or_config_section = _looks_like_diagram_or_config_section(normalized)
     boilerplate_score = _boilerplate_score(lower)
     query_relevance_score = _query_relevance_score(normalized, query)
     explanatory_score = 0.16 if _contains_explanatory_terms(lower) else 0.0
@@ -159,7 +186,12 @@ def assess_chunk_quality(
     if is_reference_section:
         reasons.append("reference_section")
     if is_navigation_noise:
-        reasons.append("navigation_noise")
+        if is_pointer_or_project_meta_noise:
+            reasons.append("pointer_or_project_meta_noise")
+        else:
+            reasons.append("navigation_noise")
+    if is_diagram_or_config_section:
+        reasons.append("diagram_or_config_section")
     if len(normalized) < 48:
         reasons.append("very_short")
     if repetition_penalty:
@@ -179,6 +211,8 @@ def assess_chunk_quality(
         score = min(score, 0.12)
     if is_reference_section or is_navigation_noise:
         score = min(score, 0.24)
+    if is_diagram_or_config_section:
+        score = min(score, 0.18)
     score = round(min(1.0, max(0.0, score)), 2)
 
     eligible = (
@@ -186,6 +220,7 @@ def assess_chunk_quality(
         and not redirect_stub
         and not is_reference_section
         and not is_navigation_noise
+        and not is_diagram_or_config_section
         and len(normalized) >= 48
     )
     if eligible:
@@ -202,6 +237,7 @@ def assess_chunk_quality(
         eligible_for_claims=eligible,
         is_navigation_noise=is_navigation_noise,
         is_reference_section=is_reference_section,
+        is_diagram_or_config_section=is_diagram_or_config_section,
         content_quality=quality,
         reasons=reasons,
     )
@@ -271,6 +307,30 @@ def _looks_like_navigation_noise(lower_text: str) -> bool:
         for term in ("menu", "sidebar", "navigation", "footer", "privacy", "cookie", "edit")
     )
     return token_count <= 80 and nav_token_hits / token_count >= 0.12
+
+
+def _looks_like_pointer_or_project_meta_noise(lower_text: str) -> bool:
+    phrase_hits = sum(1 for phrase in _POINTER_PROJECT_META_PHRASES if phrase in lower_text)
+    if phrase_hits <= 0:
+        return False
+    if _contains_explanatory_terms(lower_text):
+        return False
+    token_count = max(1, len(_tokenize(lower_text)))
+    return token_count <= 90 or phrase_hits / token_count >= 0.04
+
+
+def _looks_like_diagram_or_config_section(text: str) -> bool:
+    lower_text = text.lower()
+    if any(phrase in lower_text for phrase in _DIAGRAM_CONFIG_PHRASES):
+        return True
+    line_count = max(1, len(text.splitlines()))
+    arrow_lines = sum(1 for line in text.splitlines() if "->" in line)
+    colon_config_lines = sum(
+        1
+        for line in text.splitlines()
+        if line.strip().endswith(":") or re.match(r"^\s*[a-z0-9_]+\s*:", line.lower())
+    )
+    return arrow_lines >= 2 or (line_count >= 4 and colon_config_lines / line_count >= 0.4)
 
 
 def _contains_explanatory_terms(lower_text: str) -> bool:

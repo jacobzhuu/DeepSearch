@@ -53,6 +53,18 @@ class ResearchTaskMutationResponse(BaseModel):
 
 
 class ResearchTaskObservabilityResponse(BaseModel):
+    planner_enabled: bool | None = None
+    planner_mode: str | None = None
+    planner_status: str | None = None
+    subquestion_count: int | None = None
+    search_query_count: int | None = None
+    research_plan: dict[str, Any] | None = None
+    raw_planner_queries: list[dict[str, Any]] = Field(default_factory=list)
+    final_search_queries: list[dict[str, Any]] = Field(default_factory=list)
+    dropped_or_downweighted_planner_queries: list[dict[str, Any]] = Field(default_factory=list)
+    planner_guardrail_warnings: list[str] = Field(default_factory=list)
+    intent_classification: str | None = None
+    extracted_entity: str | None = None
     search_result_count: int | None = None
     selected_sources_from_search: list[dict[str, Any]] = Field(default_factory=list)
     selected_sources: list[dict[str, Any]] = Field(default_factory=list)
@@ -63,6 +75,17 @@ class ResearchTaskObservabilityResponse(BaseModel):
     failed_sources: list[dict[str, Any]] = Field(default_factory=list)
     parse_decisions: list[dict[str, Any]] = Field(default_factory=list)
     source_quality_summary: dict[str, Any] | None = None
+    source_yield_summary: list[dict[str, Any]] = Field(default_factory=list)
+    dropped_sources: list[dict[str, Any]] = Field(default_factory=list)
+    answer_coverage: dict[str, bool] | None = None
+    answer_slots: list[dict[str, Any]] = Field(default_factory=list)
+    report_slot_coverage: list[dict[str, Any]] = Field(default_factory=list)
+    slot_coverage_summary: list[dict[str, Any]] = Field(default_factory=list)
+    answer_yield: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_yield_summary: dict[str, Any] = Field(default_factory=dict)
+    verification_summary: dict[str, Any] = Field(default_factory=dict)
+    supplemental_acquisition: dict[str, Any] | None = None
+    failure_diagnostics: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
 
 

@@ -21,6 +21,7 @@ from services.orchestrator.app.claims import (
     CLAIM_VERIFICATION_STATUS_DRAFT,
     MIN_DRAFT_CLAIM_QUALITY_SCORE,
     MIN_DRAFT_QUERY_ANSWER_SCORE,
+    VERIFIER_METHOD_LEXICAL_HEURISTIC_V2,
     ClaimCandidateScore,
     SupportingSpan,
     build_verification_rationale,
@@ -28,6 +29,7 @@ from services.orchestrator.app.claims import (
     classify_query_intent,
     compute_claim_confidence,
     draft_claim_statement,
+    is_answer_relevant_score,
     is_claimable_statement,
     iter_supporting_spans,
     normalize_claim_identity,
@@ -38,6 +40,12 @@ from services.orchestrator.app.claims import (
     validate_citation_span,
 )
 from services.orchestrator.app.indexing import ChunkIndexBackend, IndexedChunkRecord
+from services.orchestrator.app.research_quality import (
+    EvidenceCandidate,
+    classify_source_intent,
+    evidence_candidate_id,
+    slot_ids_for_candidate_category,
+)
 from services.orchestrator.app.services.research_tasks import (
     PHASE2_ACTIVE_STATUS,
     TaskNotFoundError,
@@ -95,6 +103,7 @@ class DraftClaimEntry:
     reused_citation_span: bool
     reused_claim_evidence: bool
     retrieval_score: float | None
+    evidence_candidate_id: str
 
 
 @dataclass(frozen=True)
@@ -237,6 +246,7 @@ class ClaimDraftingService:
             supporting_span = candidate.supporting_span
             retrieval_score = candidate.retrieval_score
             statement = candidate.statement
+            evidence_candidate = _evidence_candidate_payload(candidate, query=effective_query)
             confidence = compute_claim_confidence(
                 query=effective_query,
                 statement=statement,
@@ -249,6 +259,7 @@ class ClaimDraftingService:
                 candidate=candidate,
                 selection_rank=selection_rank,
                 relation_type=CLAIM_EVIDENCE_RELATION_SUPPORT,
+                evidence_candidate=evidence_candidate,
             )
 
             claim_identity = normalize_claim_identity(statement)
@@ -295,6 +306,15 @@ class ClaimDraftingService:
             else:
                 created_claim_evidence += 1
 
+            claim.notes_json = self._merge_claim_notes(
+                claim.notes_json,
+                _claim_lineage_notes(
+                    evidence_candidate=evidence_candidate,
+                    citation_span_id=str(citation_span.id),
+                    claim_evidence_id=str(claim_evidence.id),
+                ),
+            )
+
             entries.append(
                 DraftClaimEntry(
                     claim=claim,
@@ -305,6 +325,7 @@ class ClaimDraftingService:
                     reused_citation_span=reused_citation_span,
                     reused_claim_evidence=reused_evidence,
                     retrieval_score=retrieval_score,
+                    evidence_candidate_id=str(evidence_candidate["evidence_candidate_id"]),
                 )
             )
 
@@ -390,6 +411,7 @@ class ClaimDraftingService:
         entries: list[VerifiedClaimEntry] = []
 
         for claim in claims:
+            evidence_relation_details: list[dict[str, object]] = []
             retrieval_hits = self.index_backend.retrieve_chunks(
                 task_id=task.id,
                 query=claim.statement,
@@ -415,34 +437,57 @@ class ClaimDraftingService:
                     else:
                         created_citation_spans += 1
 
-                    _, reused_evidence = self._ensure_claim_evidence(
+                    claim_evidence, reused_evidence = self._ensure_claim_evidence(
                         claim=claim,
                         citation_span=citation_span,
                         relation_type=matched_span.relation_type,
                         score=matched_span.score,
+                    )
+                    evidence_relation_details.append(
+                        {
+                            "claim_evidence_id": str(claim_evidence.id),
+                            "claim_evidence_reused": reused_evidence,
+                            "claim_id": str(claim.id),
+                            "citation_span_id": str(citation_span.id),
+                            "source_chunk_id": str(source_chunk.id),
+                            "source_document_id": str(source_chunk.source_document_id),
+                            **matched_span.to_metadata(),
+                        }
                     )
                     if reused_evidence:
                         reused_claim_evidence += 1
                     else:
                         created_claim_evidence += 1
 
-            support_count, contradict_count = self._count_claim_evidence(claim.id)
+            support_count, weak_support_count, contradict_count = self._count_claim_evidence(
+                claim.id,
+                relation_details=evidence_relation_details,
+            )
             verification_status = resolve_verification_status(
                 support_count=support_count,
                 contradict_count=contradict_count,
+                weak_support_count=weak_support_count,
             )
             rationale = build_verification_rationale(
                 support_count=support_count,
                 contradict_count=contradict_count,
+                weak_support_count=weak_support_count,
             )
             claim.verification_status = verification_status
             claim.notes_json = {
                 **claim.notes_json,
                 "verification": {
-                    "method": "retrieval_conflict_scan_v1",
+                    "method": VERIFIER_METHOD_LEXICAL_HEURISTIC_V2,
+                    "verifier_method": VERIFIER_METHOD_LEXICAL_HEURISTIC_V2,
                     "verification_query": claim.statement,
                     "support_evidence_count": support_count,
+                    "strong_support_evidence_count": support_count,
+                    "weak_support_evidence_count": weak_support_count,
                     "contradict_evidence_count": contradict_count,
+                    "insufficient_evidence_count": (
+                        1 if support_count == 0 and weak_support_count == 0 else 0
+                    ),
+                    "evidence_relations": evidence_relation_details,
                     "rationale": rationale,
                 },
             }
@@ -612,6 +657,7 @@ class ClaimDraftingService:
         diagnostics = _build_claim_drafting_diagnostics(
             chunks_seen=chunks_seen,
             candidates=candidates,
+            query=query,
         )
         if not candidates:
             return [], diagnostics
@@ -631,45 +677,46 @@ class ClaimDraftingService:
                 return [], diagnostics
             ordered_fallback_candidates = sorted(
                 fallback_candidates,
-                key=lambda candidate: (
-                    -candidate.score.final_score,
-                    candidate_category_sort_key(candidate.score.claim_category),
-                    -candidate.score.query_answer_score,
-                    -candidate.score.claim_quality_score,
-                    str(candidate.source_chunk.source_document_id),
-                    candidate.source_chunk.chunk_no,
-                    candidate.supporting_span.start_offset,
-                ),
+                key=_candidate_selection_sort_key,
             )
+            diversified, near_duplicate_removed = self._diversify_claim_candidates(
+                candidates=ordered_fallback_candidates,
+                query=query,
+                limit=limit,
+            )
+            diagnostics = {
+                **diagnostics,
+                "accepted_claims_by_category": _accepted_candidates_by_category(diversified),
+                "category_coverage_missing": _category_coverage_missing(query, diversified),
+                "near_duplicate_claims_removed": near_duplicate_removed,
+                "accepted_evidence_candidate_ids": [
+                    _candidate_evidence_id(candidate) for candidate in diversified
+                ],
+            }
             return (
-                self._diversify_claim_candidates(
-                    candidates=ordered_fallback_candidates,
-                    query=query,
-                    limit=limit,
-                ),
+                diversified,
                 diagnostics,
             )
 
         ordered_candidates = sorted(
             strict_candidates,
-            key=lambda candidate: (
-                -candidate.score.final_score,
-                candidate_category_sort_key(candidate.score.claim_category),
-                -candidate.score.query_answer_score,
-                -candidate.score.claim_quality_score,
-                str(candidate.source_chunk.source_document_id),
-                candidate.source_chunk.chunk_no,
-                candidate.supporting_span.start_offset,
-            ),
+            key=_candidate_selection_sort_key,
         )
-        return (
-            self._diversify_claim_candidates(
-                candidates=ordered_candidates,
-                query=query,
-                limit=limit,
-            ),
-            diagnostics,
+        diversified, near_duplicate_removed = self._diversify_claim_candidates(
+            candidates=ordered_candidates,
+            query=query,
+            limit=limit,
         )
+        diagnostics = {
+            **diagnostics,
+            "accepted_claims_by_category": _accepted_candidates_by_category(diversified),
+            "category_coverage_missing": _category_coverage_missing(query, diversified),
+            "near_duplicate_claims_removed": near_duplicate_removed,
+            "accepted_evidence_candidate_ids": [
+                _candidate_evidence_id(candidate) for candidate in diversified
+            ],
+        }
+        return (diversified, diagnostics)
 
     def _fallback_claim_candidates(
         self,
@@ -677,10 +724,9 @@ class ClaimDraftingService:
         candidates: list[DraftClaimCandidate],
         query: str,
     ) -> list[DraftClaimCandidate]:
-        del query
         fallback_candidates: list[DraftClaimCandidate] = []
         for candidate in candidates:
-            if not _fallback_candidate_allowed(candidate):
+            if not _fallback_candidate_allowed(candidate, query=query):
                 continue
             fallback_candidates.append(
                 DraftClaimCandidate(
@@ -704,10 +750,12 @@ class ClaimDraftingService:
         candidates: list[DraftClaimCandidate],
         query: str,
         limit: int,
-    ) -> list[DraftClaimCandidate]:
+    ) -> tuple[list[DraftClaimCandidate], int]:
         selected: list[DraftClaimCandidate] = []
         selected_keys: set[tuple[UUID, int, int]] = set()
+        selected_semantic_identities: dict[str, str] = {}
         used_paragraphs: set[tuple[UUID, int]] = set()
+        near_duplicate_removed = [0]
         intent = classify_query_intent(query)
 
         def candidate_key(candidate: DraftClaimCandidate) -> tuple[UUID, int, int]:
@@ -727,10 +775,17 @@ class ClaimDraftingService:
             key = candidate_key(candidate)
             if key in selected_keys:
                 return False
+            semantic_key = _semantic_duplicate_key(candidate)
+            claim_identity = normalize_claim_identity(candidate.statement)
+            existing_identity = selected_semantic_identities.get(semantic_key)
+            if existing_identity is not None and existing_identity != claim_identity:
+                near_duplicate_removed[0] += 1
+                return False
             if enforce_paragraph_diversity and candidate.paragraph_key in used_paragraphs:
                 return False
             selected.append(candidate)
             selected_keys.add(key)
+            selected_semantic_identities.setdefault(semantic_key, claim_identity)
             used_paragraphs.add(candidate.paragraph_key)
             return True
 
@@ -749,7 +804,7 @@ class ClaimDraftingService:
             for candidate in candidates:
                 add_candidate(candidate, enforce_paragraph_diversity=False)
 
-        return selected[:limit]
+        return selected[:limit], near_duplicate_removed[0]
 
     def _build_claim_notes(
         self,
@@ -760,6 +815,7 @@ class ClaimDraftingService:
         candidate: DraftClaimCandidate,
         selection_rank: int,
         relation_type: str,
+        evidence_candidate: dict[str, object],
     ) -> dict[str, object]:
         return {
             "draft_query": query,
@@ -773,6 +829,13 @@ class ClaimDraftingService:
             "relation_type": relation_type,
             "selection_rank": selection_rank,
             "paragraph_index": candidate.paragraph_key[1],
+            "slot_ids": list(evidence_candidate.get("slot_ids", [])),
+            "source_intent": evidence_candidate.get("source_intent"),
+            "evidence_candidate_id": evidence_candidate.get("evidence_candidate_id"),
+            "evidence_quality_score": evidence_candidate.get("quality_score"),
+            "evidence_salience_score": evidence_candidate.get("salience_score"),
+            "evidence_rejection_reasons": evidence_candidate.get("rejection_reasons", []),
+            "evidence_candidate": evidence_candidate,
             **candidate.score.as_notes(),
         }
 
@@ -876,16 +939,31 @@ class ClaimDraftingService:
             )
         return summaries
 
-    def _count_claim_evidence(self, claim_id: UUID) -> tuple[int, int]:
+    def _count_claim_evidence(
+        self,
+        claim_id: UUID,
+        *,
+        relation_details: list[dict[str, object]] | None = None,
+    ) -> tuple[int, int, int]:
         claim_evidence = self.claim_evidence_repository.list_for_claim(claim_id)
+        weak_citation_ids = {
+            detail.get("citation_span_id")
+            for detail in relation_details or []
+            if detail.get("relation_type") == CLAIM_EVIDENCE_RELATION_SUPPORT
+            and detail.get("support_level") == "weak"
+        }
         support_count = 0
+        weak_support_count = 0
         contradict_count = 0
         for evidence in claim_evidence:
             if evidence.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT:
-                support_count += 1
+                if str(evidence.citation_span_id) in weak_citation_ids:
+                    weak_support_count += 1
+                else:
+                    support_count += 1
             elif evidence.relation_type == CLAIM_EVIDENCE_RELATION_CONTRADICT:
                 contradict_count += 1
-        return support_count, contradict_count
+        return support_count, weak_support_count, contradict_count
 
     def _ensure_citation_span(
         self,
@@ -990,6 +1068,8 @@ def _source_chunk_eligible_for_claims(source_chunk: SourceChunk) -> bool:
         return False
     if metadata.get("is_navigation_noise") is True:
         return False
+    if metadata.get("is_diagram_or_config_section") is True:
+        return False
     if metadata.get("reason") == "redirect_stub":
         return False
     quality_score = metadata.get("content_quality_score")
@@ -1006,6 +1086,8 @@ def _source_chunk_hard_excluded_for_claims(source_chunk: SourceChunk) -> bool:
     if metadata.get("is_reference_section") is True:
         return True
     if metadata.get("is_navigation_noise") is True:
+        return True
+    if metadata.get("is_diagram_or_config_section") is True:
         return True
     if metadata.get("reason") == "redirect_stub":
         return True
@@ -1028,12 +1110,34 @@ def _strict_rejected_rules(
         rejected_rules.append("insufficient_claim_quality")
     if score.query_answer_score < MIN_DRAFT_QUERY_ANSWER_SCORE:
         rejected_rules.append("insufficient_answer_score")
+    if not is_answer_relevant_score(score, query=query):
+        rejected_rules.append("not_answer_relevant")
     if not is_claimable_statement(statement, query=query) and score.rejected_reason is None:
         rejected_rules.append("not_claimable_statement")
     return list(dict.fromkeys(rejected_rules))
 
 
-def _fallback_candidate_allowed(candidate: DraftClaimCandidate) -> bool:
+def _candidate_selection_sort_key(
+    candidate: DraftClaimCandidate,
+) -> tuple[int, int, float, float, float, float, str, int, int]:
+    return (
+        candidate_category_sort_key(candidate.score.answer_role),
+        candidate_category_sort_key(candidate.score.claim_category),
+        -candidate.score.source_quality_score,
+        -candidate.score.query_answer_score,
+        -candidate.score.claim_quality_score,
+        -candidate.score.final_score,
+        str(candidate.source_chunk.source_document_id),
+        candidate.source_chunk.chunk_no,
+        candidate.supporting_span.start_offset,
+    )
+
+
+def _fallback_candidate_allowed(
+    candidate: DraftClaimCandidate,
+    *,
+    query: str | None = None,
+) -> bool:
     statement = " ".join(candidate.statement.split())
     if len(statement) < 40 or len(statement) > 300:
         return False
@@ -1041,9 +1145,15 @@ def _fallback_candidate_allowed(candidate: DraftClaimCandidate) -> bool:
         return False
     if candidate.score.rejected_reason is not None:
         return False
-    if candidate.score.claim_category in {"setup", "community", "slogan", "reference"}:
+    if candidate.score.claim_category in {
+        "navigation",
+        "setup",
+        "community",
+        "slogan",
+        "reference",
+    }:
         return False
-    if candidate.score.claim_category not in {"definition", "mechanism", "privacy", "feature"}:
+    if not is_answer_relevant_score(candidate.score, query=query):
         return False
     if (
         candidate.score.query_answer_score < MIN_DRAFT_QUERY_ANSWER_SCORE
@@ -1051,6 +1161,50 @@ def _fallback_candidate_allowed(candidate: DraftClaimCandidate) -> bool:
     ):
         return False
     return True
+
+
+def _accepted_candidates_by_category(candidates: list[DraftClaimCandidate]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        category = candidate.score.claim_category
+        counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _category_coverage_missing(query: str, candidates: list[DraftClaimCandidate]) -> list[str]:
+    coverage = {candidate.score.claim_category for candidate in candidates}
+    intent = classify_query_intent(query)
+    expected = list(intent.expected_claim_types)
+    if intent.intent_name == "definition_mechanism":
+        expected = ["definition", "mechanism"]
+    return [category for category in dict.fromkeys(expected) if category not in coverage]
+
+
+def _semantic_duplicate_key(candidate: DraftClaimCandidate) -> str:
+    statement = candidate.statement.lower()
+    category = candidate.score.claim_category
+    if (
+        category == "feature"
+        and "search engine" in statement
+        and ("support" in statement or "supported" in statement)
+    ):
+        return "feature:search_engines_supported"
+    if category == "definition" and "metasearch engine" in statement:
+        return "definition:metasearch_engine"
+    if (
+        category == "mechanism"
+        and "search engine" in statement
+        and ("aggregat" in statement or "send" in statement or "return" in statement)
+    ):
+        return "mechanism:upstream_search_engines"
+    if category == "privacy" and (
+        "private data" in statement
+        or "tracking" in statement
+        or "profile" in statement
+        or "stores little" in statement
+    ):
+        return "privacy:data_minimization"
+    return f"{category}:{normalize_claim_identity(candidate.statement)}"
 
 
 def _first_rejection_reason(
@@ -1066,12 +1220,18 @@ def _build_claim_drafting_diagnostics(
     *,
     chunks_seen: list[tuple[SourceChunk, float | None]],
     candidates: list[DraftClaimCandidate],
+    query: str,
 ) -> dict[str, object]:
     rejected_candidates = [candidate for candidate in candidates if candidate.rejected_rules]
     distribution: dict[str, int] = {}
     for candidate in rejected_candidates:
         for rule in candidate.rejected_rules:
             distribution[rule] = distribution.get(rule, 0) + 1
+    answer_relevant_candidates = [
+        candidate
+        for candidate in candidates
+        if is_answer_relevant_score(candidate.score, query=query)
+    ]
 
     return {
         "total_chunks_seen": len(chunks_seen),
@@ -1079,9 +1239,16 @@ def _build_claim_drafting_diagnostics(
             1 for source_chunk, _ in chunks_seen if _source_chunk_eligible_for_claims(source_chunk)
         ),
         "candidate_sentences_count": len(candidates),
+        "answer_relevant_candidate_count": len(answer_relevant_candidates),
+        "answer_candidate_count_by_category": _accepted_candidates_by_category(
+            answer_relevant_candidates
+        ),
+        "evidence_candidates": [
+            _evidence_candidate_payload(candidate, query=query) for candidate in candidates
+        ],
         "rejected_candidates_count": len(rejected_candidates),
         "top_rejected_candidates": [
-            _candidate_diagnostic(candidate)
+            _candidate_diagnostic(candidate, query=query)
             for candidate in sorted(
                 rejected_candidates,
                 key=lambda item: (-item.score.final_score, item.source_chunk.chunk_no),
@@ -1094,12 +1261,19 @@ def _build_claim_drafting_diagnostics(
     }
 
 
-def _candidate_diagnostic(candidate: DraftClaimCandidate) -> dict[str, object]:
+def _candidate_diagnostic(
+    candidate: DraftClaimCandidate,
+    *,
+    query: str | None = None,
+) -> dict[str, object]:
     rejected_reason = _first_rejection_reason(list(candidate.rejected_rules), candidate.score)
     return {
+        **_evidence_candidate_payload(candidate, query=query),
         "candidate_text": candidate.statement,
         "source_chunk_id": str(candidate.source_chunk.id),
         "claim_category": candidate.score.claim_category,
+        "answer_role": candidate.score.answer_role,
+        "answer_relevant": candidate.score.answer_relevant,
         "claim_quality_score": candidate.score.claim_quality_score,
         "query_answer_score": candidate.score.query_answer_score,
         "query_relevance_score": candidate.score.query_relevance_score,
@@ -1120,6 +1294,84 @@ def _chunk_diagnostic(source_chunk: SourceChunk) -> dict[str, object]:
         "content_quality_score": metadata.get("content_quality_score"),
         "query_relevance_score": metadata.get("query_relevance_score"),
         "text_preview": " ".join(source_chunk.text.split())[:240],
+    }
+
+
+def _evidence_candidate_payload(
+    candidate: DraftClaimCandidate,
+    *,
+    query: str | None,
+) -> dict[str, object]:
+    source_chunk = candidate.source_chunk
+    source_document = source_chunk.source_document
+    metadata = source_chunk.metadata_json or {}
+    source_intent = classify_source_intent(
+        canonical_url=source_document.canonical_url,
+        domain=source_document.domain,
+        title=source_document.title,
+        query=query,
+    ).source_intent
+    payload = EvidenceCandidate(
+        evidence_candidate_id=_candidate_evidence_id(candidate),
+        source_document_id=str(source_document.id),
+        source_chunk_id=str(source_chunk.id),
+        citation_span_id=None,
+        slot_ids=slot_ids_for_candidate_category(candidate.score.claim_category, query=query),
+        source_intent=source_intent,
+        excerpt=candidate.supporting_span.excerpt,
+        start_offset=candidate.supporting_span.start_offset,
+        end_offset=candidate.supporting_span.end_offset,
+        salience_score=candidate.score.final_score,
+        quality_score=candidate.score.claim_quality_score,
+        extraction_strategy=(
+            metadata.get("strategy") if isinstance(metadata.get("strategy"), str) else None
+        ),
+        rejection_reasons=tuple(candidate.rejected_rules),
+        metadata={
+            "claim_category": candidate.score.claim_category,
+            "answer_role": candidate.score.answer_role,
+            "answer_relevant": candidate.score.answer_relevant,
+            "content_quality_score": candidate.score.content_quality_score,
+            "query_relevance_score": candidate.score.query_relevance_score,
+            "query_answer_score": candidate.score.query_answer_score,
+            "source_quality_score": candidate.score.source_quality_score,
+            "claim_selection_score": candidate.score.final_score,
+            "retrieval_score": candidate.retrieval_score,
+            "draft_mode": candidate.draft_mode,
+            "fallback_reason": candidate.fallback_reason,
+            "original_rejected_reason": candidate.original_rejected_reason,
+            "source_url": source_document.canonical_url,
+            "source_domain": source_document.domain,
+            "chunk_no": source_chunk.chunk_no,
+        },
+    ).to_payload()
+    return payload
+
+
+def _candidate_evidence_id(candidate: DraftClaimCandidate) -> str:
+    return evidence_candidate_id(
+        source_chunk_id=str(candidate.source_chunk.id),
+        start_offset=candidate.supporting_span.start_offset,
+        end_offset=candidate.supporting_span.end_offset,
+        excerpt=candidate.supporting_span.excerpt,
+    )
+
+
+def _claim_lineage_notes(
+    *,
+    evidence_candidate: dict[str, object],
+    citation_span_id: str,
+    claim_evidence_id: str,
+) -> dict[str, object]:
+    candidate_with_links = {
+        **evidence_candidate,
+        "citation_span_id": citation_span_id,
+        "claim_evidence_id": claim_evidence_id,
+    }
+    return {
+        "citation_span_id": citation_span_id,
+        "claim_evidence_id": claim_evidence_id,
+        "evidence_candidate": candidate_with_links,
     }
 
 

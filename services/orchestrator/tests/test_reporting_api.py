@@ -46,7 +46,7 @@ def test_report_endpoints_generate_and_return_latest_markdown(
         assert generate_response.json()["mixed_claims"] == 1
         assert generate_response.json()["unsupported_claims"] == 1
         assert "## Executive Summary" in generate_response.json()["markdown"]
-        assert "[UNSUPPORTED] The unsupported claim currently lacks support evidence." in (
+        assert "[UNSUPPORTED]: The unsupported claim currently lacks support evidence." in (
             generate_response.json()["markdown"]
         )
 

@@ -11,8 +11,6 @@ export const NewTaskPage: React.FC = () => {
   const { runTask, isRunning, result: runResult, error: runError } = useRunTask();
   
   const [query, setQuery] = useState('');
-  // For simplicity in this version, we only handle the required query field.
-  // Constraints could be added as more complex form fields later.
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -34,19 +32,19 @@ export const NewTaskPage: React.FC = () => {
   const busy = isCreating || isRunning;
 
   return (
-    <PageLayout title="Create New Task">
+    <PageLayout title="创建新任务">
       <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxWidth: '500px' }}>
         <ErrorState error={error} />
         <ErrorState error={runError} />
         <PipelineRunSummary result={runResult} />
         
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <label htmlFor="query" style={{ fontWeight: 'bold' }}>Research Query</label>
+          <label htmlFor="query" style={{ fontWeight: 'bold' }}>研究问题</label>
           <textarea
             id="query"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="e.g., 近30天 NVIDIA 在开源模型生态上的关键发布与影响"
+            placeholder="例如：近30天 NVIDIA 在开源模型生态上的关键发布与影响"
             rows={4}
             style={{ padding: '0.5rem', fontFamily: 'inherit' }}
             required
@@ -59,7 +57,7 @@ export const NewTaskPage: React.FC = () => {
           disabled={busy || !query.trim()}
           style={{ padding: '0.75rem', cursor: busy ? 'not-allowed' : 'pointer', fontWeight: 'bold' }}
         >
-          {isCreating ? 'Creating...' : isRunning ? 'Running DeepSearch...' : 'Create And Run DeepSearch'}
+          {isCreating ? '创建中...' : isRunning ? '运行 DeepSearch 中...' : '创建并运行 DeepSearch'}
         </button>
       </form>
     </PageLayout>
@@ -71,14 +69,14 @@ const PipelineRunSummary: React.FC<{ result: PipelineRunResponse | null }> = ({ 
 
   return (
     <section style={{ border: '1px solid #ddd', borderRadius: '4px', padding: '1rem', backgroundColor: '#fafafa' }}>
-      <strong>Pipeline:</strong> {result.running_mode} <br />
-      <strong>Status:</strong> {result.status} <br />
-      <strong>Stages:</strong> {result.stages_completed.join(' -> ') || 'none'} <br />
+      <strong>流程模式:</strong> {result.running_mode} <br />
+      <strong>状态:</strong> {result.status} <br />
+      <strong>已完成阶段:</strong> {result.stages_completed.join(' -> ') || '无'} <br />
       {result.failure && (
         <>
-          <strong>Failed Stage:</strong> {result.failure.failed_stage} <br />
-          <strong>Reason:</strong> {result.failure.reason} <br />
-          <strong>Next Action:</strong> {result.failure.next_action}
+          <strong>失败阶段:</strong> {result.failure.failed_stage} <br />
+          <strong>原因:</strong> {result.failure.reason} <br />
+          <strong>下一步建议:</strong> {result.failure.next_action}
         </>
       )}
     </section>

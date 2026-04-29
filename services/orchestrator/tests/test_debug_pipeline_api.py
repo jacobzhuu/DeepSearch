@@ -4,9 +4,11 @@ from collections.abc import Generator, Sequence
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from packages.db.repositories import TaskEventRepository
 from services.orchestrator.app.acquisition import HttpFetchResult
 from services.orchestrator.app.api.routes.acquisition import (
     get_http_acquisition_client,
@@ -28,7 +30,17 @@ from services.orchestrator.app.search import (
     SearchResponse,
     SearchResultItem,
 )
+from services.orchestrator.app.settings import get_settings
 from services.orchestrator.app.storage import FilesystemSnapshotObjectStore
+
+
+@pytest.fixture(autouse=True)
+def _disable_planner_for_baseline_pipeline_tests(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LLM_ENABLED", "false")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "false")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 class FakeSearchProvider:
@@ -186,6 +198,33 @@ class ShortSloganHttpAcquisitionClient:
             mime_type="text/html",
             content=body,
             content_hash="sha256:short-slogan",
+            trace={"test_fetch": True},
+        )
+
+
+class SearXNGExplanatoryHttpAcquisitionClient:
+    def fetch(self, url: str) -> HttpFetchResult:
+        body = b"""
+        <html>
+          <head><title>SearXNG overview</title></head>
+          <body>
+            <main>
+              <p>SearXNG is a free and open-source metasearch engine.</p>
+              <p>As a metasearch engine, SearXNG functions by sending queries to upstream
+              search engines and returning results to the user.</p>
+              <p>SearXNG removes private data from requests sent to search services.</p>
+            </main>
+          </body>
+        </html>
+        """
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=body,
+            content_hash="sha256:searxng-explanatory",
             trace={"test_fetch": True},
         )
 
@@ -387,12 +426,56 @@ def test_pipeline_run_endpoint_completes_task_and_records_product_events(
         assert len(observability["selected_sources"]) == 2
         assert observability["fetch_succeeded"] == 2
         assert observability["fetch_failed"] == 0
+        assert "source_yield_summary" in observability
+        assert "evidence_yield_summary" in observability
+        assert "slot_coverage_summary" in observability
+        assert "verification_summary" in observability
 
         event_types = [event["event_type"] for event in events_response.json()["events"]]
         assert "pipeline.started" in event_types
         assert "pipeline.stage_started" in event_types
         assert "pipeline.stage_completed" in event_types
         assert "pipeline.completed" in event_types
+    finally:
+        client_generator.close()
+
+
+def test_task_detail_observability_defaults_for_legacy_pipeline_events(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(session_factory, tmp_path, index_backend)
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "Legacy diagnostics should remain readable"},
+        )
+        task_id = UUID(create_response.json()["task_id"])
+        with session_factory() as session:
+            TaskEventRepository(session).record(
+                task_id=task_id,
+                event_type="pipeline.stage_completed",
+                payload_json={
+                    "stage": "REPORTING",
+                    "result": {
+                        "source_quality_summary": {"source_count": 1},
+                    },
+                },
+            )
+            session.commit()
+
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+
+        assert detail_response.status_code == 200
+        observability = detail_response.json()["progress"]["observability"]
+        assert observability["source_quality_summary"] == {"source_count": 1}
+        assert observability["source_yield_summary"] == []
+        assert observability["dropped_sources"] == []
+        assert observability["slot_coverage_summary"] == []
+        assert observability["evidence_yield_summary"] == {}
+        assert observability["verification_summary"] == {}
     finally:
         client_generator.close()
 
@@ -690,6 +773,160 @@ def test_pipeline_claim_drafting_failure_includes_candidate_diagnostics(
         assert failed_events[-1]["payload"]["details"]["candidate_sentences_count"] >= 2
     finally:
         client_generator.close()
+
+
+def test_pipeline_planner_disabled_records_no_research_plan_event(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "false")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "false")
+    get_settings.cache_clear()
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(session_factory, tmp_path, index_backend)
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "Planner disabled baseline"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+
+        assert pipeline_response.status_code == 200
+        assert pipeline_response.json()["completed"] is True
+        event_types = [event["event_type"] for event in events_response.json()["events"]]
+        assert "research_plan.created" not in event_types
+        assert "research_plan.failed" not in event_types
+    finally:
+        client_generator.close()
+        monkeypatch.delenv("LLM_ENABLED", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_ENABLED", raising=False)
+        get_settings.cache_clear()
+
+
+def test_pipeline_noop_planner_records_plan_and_uses_planner_queries(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_PROVIDER", "noop")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "true")
+    monkeypatch.setenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", "3")
+    get_settings.cache_clear()
+
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(
+        session_factory,
+        tmp_path,
+        index_backend,
+        http_client=SearXNGExplanatoryHttpAcquisitionClient(),
+    )
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is SearXNG and how does it work?"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+        search_queries_response = client.get(f"/api/v1/research/tasks/{task_id}/search-queries")
+
+        assert pipeline_response.status_code == 200
+        assert pipeline_response.json()["completed"] is True
+        assert pipeline_response.json()["running_mode"].endswith("+planner-noop")
+
+        events_payload = events_response.json()
+        event_types = [event["event_type"] for event in events_payload["events"]]
+        assert "research_plan.created" in event_types
+        assert "test-api-key" not in str(events_payload)
+
+        observability = detail_response.json()["progress"]["observability"]
+        assert observability["planner_enabled"] is True
+        assert observability["planner_status"] == "created"
+        assert observability["planner_mode"] == "noop"
+        assert observability["subquestion_count"] >= 3
+        assert observability["search_query_count"] >= 5
+        assert observability["research_plan"]["intent"] == "definition_how_it_works"
+        assert observability["intent_classification"] == "overview_definition_intent"
+        assert observability["extracted_entity"] == "SearXNG"
+
+        persisted_queries = search_queries_response.json()["search_queries"]
+        query_texts = [item["query_text"] for item in persisted_queries]
+        assert "What is SearXNG and how does it work?" in query_texts
+        assert "SearXNG official documentation" in query_texts
+        assert "SearXNG about how does it work" in query_texts
+        assert "SearXNG Wikipedia" in query_texts
+        assert len(query_texts) == len(set(query_texts))
+    finally:
+        client_generator.close()
+        monkeypatch.delenv("LLM_ENABLED", raising=False)
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_ENABLED", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", raising=False)
+        get_settings.cache_clear()
+
+
+def test_pipeline_llm_planner_failure_falls_back_to_original_query(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "true")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    get_settings.cache_clear()
+
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(session_factory, tmp_path, index_backend)
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "Planner provider failure should not fail the pipeline"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+        search_queries_response = client.get(f"/api/v1/research/tasks/{task_id}/search-queries")
+
+        assert pipeline_response.status_code == 200
+        assert pipeline_response.json()["completed"] is True
+
+        events_payload = events_response.json()
+        event_types = [event["event_type"] for event in events_payload["events"]]
+        assert "research_plan.failed" in event_types
+        assert "test-api-key" not in str(events_payload)
+
+        observability = detail_response.json()["progress"]["observability"]
+        assert observability["planner_status"] == "failed"
+        assert any("research planner failed" in item for item in observability["warnings"])
+
+        persisted_queries = search_queries_response.json()["search_queries"]
+        assert [item["query_text"] for item in persisted_queries] == [
+            "Planner provider failure should not fail the pipeline"
+        ]
+    finally:
+        client_generator.close()
+        monkeypatch.delenv("LLM_ENABLED", raising=False)
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_ENABLED", raising=False)
+        get_settings.cache_clear()
 
 
 def _build_client(

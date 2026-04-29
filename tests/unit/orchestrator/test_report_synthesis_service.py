@@ -66,11 +66,17 @@ def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
     assert first_result.artifact.manifest_json["claim_counts"]["supported"] == 1
     assert first_result.artifact.manifest_json["claim_counts"]["mixed"] == 1
     assert first_result.artifact.manifest_json["claim_counts"]["unsupported"] == 1
+    assert "slot_coverage_summary" in first_result.artifact.manifest_json
+    assert "source_yield_summary" in first_result.artifact.manifest_json
+    assert "evidence_yield_summary" in first_result.artifact.manifest_json
+    assert "verification_summary" in first_result.artifact.manifest_json
     assert "## Executive Summary" in first_result.markdown
-    assert "## Appendix: Claim To Citation Spans Mapping" in first_result.markdown
-    assert "[MIXED] The mixed claim remains under dispute." in first_result.markdown
+    assert "## Answer" in first_result.markdown
+    assert "## Answer Slot Coverage" in first_result.markdown
+    assert "## Appendix: Claim Evidence Mapping" in first_result.markdown
+    assert "[MIXED]: The mixed claim remains under dispute." in first_result.markdown
     assert (
-        "[UNSUPPORTED] The unsupported claim currently lacks support evidence."
+        "[UNSUPPORTED]: The unsupported claim currently lacks support evidence."
         in first_result.markdown
     )
     assert stored_bytes.decode("utf-8") == first_result.markdown
@@ -104,6 +110,95 @@ def test_get_latest_report_returns_stored_artifact_even_if_ledger_later_changes(
     assert latest_result.mixed_claims == 0
     assert latest_result.unsupported_claims == 0
     assert latest_result.draft_claims == 0
+
+
+def test_report_synthesis_accepts_legacy_claim_notes_without_lineage(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is OpenSearch and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.opensearch.org/latest/getting-started/intro/",
+            domain="docs.opensearch.org",
+            title="Intro to OpenSearch",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=None,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=None,
+        )
+    )
+    chunk_text = (
+        "OpenSearch is a distributed search and analytics engine that lets users store, "
+        "search, and analyze data."
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=chunk_text,
+            token_count=18,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.9},
+        )
+    )
+    legacy_claim = Claim(
+        task_id=task.id,
+        statement=chunk_text,
+        claim_type="fact",
+        confidence=0.9,
+        verification_status="supported",
+        notes_json={},
+    )
+    db_session.add(legacy_claim)
+    db_session.flush()
+    span = CitationSpan(
+        source_chunk_id=source_chunk.id,
+        start_offset=0,
+        end_offset=len(chunk_text),
+        excerpt=chunk_text,
+        normalized_excerpt_hash="sha256:legacy-opensearch",
+    )
+    db_session.add(span)
+    db_session.flush()
+    db_session.add(
+        ClaimEvidence(
+            claim_id=legacy_claim.id,
+            citation_span_id=span.id,
+            relation_type="support",
+            score=0.9,
+        )
+    )
+    db_session.commit()
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = service.generate_markdown_report(task.id)
+
+    assert result.supported_claims == 1
+    assert chunk_text in result.markdown
+    manifest = result.artifact.manifest_json
+    assert manifest["source_yield_summary"][0]["contribution_level"] == "medium"
+    assert manifest["evidence_yield_summary"]["accepted_candidates"] == 1
+    assert manifest["verification_summary"]["strong_supported_claim_count"] == 1
+    definition_slot = next(
+        row for row in manifest["slot_coverage_summary"] if row["slot_id"] == "definition"
+    )
+    assert definition_slot["status"] == "covered"
 
 
 def test_get_latest_report_detects_content_hash_mismatch(
@@ -332,7 +427,10 @@ def test_report_synthesis_excludes_low_quality_supported_claims_and_warns(
     assert result.supported_claims == 1
     assert good_chunk.text in result.markdown
     assert bad_chunk.text not in result.markdown
-    assert "Low answer coverage: only 1 answer-relevant claims were generated." in result.markdown
+    assert (
+        "Coverage is limited because no mechanism/privacy/feature claims were generated."
+        in result.markdown
+    )
     assert "Answer-relevant claims included: 1." in result.markdown
     assert "Excluded low-quality or off-query claims: 1." in result.markdown
 

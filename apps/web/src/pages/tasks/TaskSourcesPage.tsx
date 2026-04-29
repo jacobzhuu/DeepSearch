@@ -10,12 +10,12 @@ export const TaskSourcesPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
   const { documentsData, chunksData, isLoading, error, refetch } = useSources(taskId);
 
-  if (isLoading) return <PageLayout title="Task Sources"><LoadingState message="Loading documents and chunks..." /></PageLayout>;
+  if (isLoading) return <PageLayout title="任务来源"><LoadingState message="正在加载文档和分块..." /></PageLayout>;
   
   if (error) return (
-    <PageLayout title="Task Sources">
+    <PageLayout title="任务来源">
       <ErrorState error={error} onRetry={refetch} />
-      <Link to={`/tasks/${taskId}`}>Back to Task</Link>
+      <Link to={`/tasks/${taskId}`}>返回任务</Link>
     </PageLayout>
   );
 
@@ -24,17 +24,17 @@ export const TaskSourcesPage: React.FC = () => {
 
   if (documents.length === 0) {
     return (
-      <PageLayout title="Task Sources">
-        <EmptyState message="No source documents have been processed for this task yet." />
-        <Link to={`/tasks/${taskId}`}>Back to Task</Link>
+      <PageLayout title="任务来源">
+        <EmptyState message="此任务尚未处理任何来源文档。" />
+        <Link to={`/tasks/${taskId}`}>返回任务</Link>
       </PageLayout>
     );
   }
 
   return (
     <PageLayout 
-      title="Task Sources"
-      actions={<Link to={`/tasks/${taskId}`}>Back to Task</Link>}
+      title="任务来源"
+      actions={<Link to={`/tasks/${taskId}`}>返回任务</Link>}
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
         {documents.map((doc) => {
@@ -49,14 +49,14 @@ export const TaskSourcesPage: React.FC = () => {
               </h3>
               
               <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 1rem 0', fontSize: '0.9rem', color: '#555', display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
-                <li><strong>Domain:</strong> {doc.domain}</li>
-                <li><strong>Type:</strong> {doc.source_type}</li>
-                <li><strong>Fetched At:</strong> {new Date(doc.fetched_at).toLocaleString()}</li>
+                <li><strong>域名:</strong> {doc.domain}</li>
+                <li><strong>类型:</strong> {doc.source_type}</li>
+                <li><strong>获取时间:</strong> {new Date(doc.fetched_at).toLocaleString()}</li>
               </ul>
 
               <div>
                 <h4 style={{ fontSize: '1rem', marginBottom: '0.75rem', borderBottom: '1px solid #ccc', paddingBottom: '0.25rem' }}>
-                  Extracted Chunks ({docChunks.length})
+                  提取的分块 ({docChunks.length})
                 </h4>
                 
                 {docChunks.length > 0 ? (
@@ -64,10 +64,10 @@ export const TaskSourcesPage: React.FC = () => {
                     {docChunks.map((chunk) => (
                       <div key={chunk.source_chunk_id} style={{ backgroundColor: '#fff', border: '1px solid #ddd', borderRadius: '4px', padding: '1rem' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: '#888', marginBottom: '0.5rem' }}>
-                          <span><strong>Chunk No:</strong> {chunk.chunk_no}</span>
-                          <span><strong>Tokens:</strong> {chunk.token_count}</span>
+                          <span><strong>分块编号:</strong> {chunk.chunk_no}</span>
+                          <span><strong>词元数:</strong> {chunk.token_count}</span>
                           {chunk.metadata?.strategy && (
-                            <span><strong>Strategy:</strong> {chunk.metadata.strategy}</span>
+                            <span><strong>策略:</strong> {chunk.metadata.strategy}</span>
                           )}
                         </div>
                         <p style={{ margin: 0, fontSize: '0.95rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
@@ -77,7 +77,7 @@ export const TaskSourcesPage: React.FC = () => {
                     ))}
                   </div>
                 ) : (
-                  <p style={{ color: '#888', fontSize: '0.9rem' }}>No chunks extracted from this document.</p>
+                  <p style={{ color: '#888', fontSize: '0.9rem' }}>未能从该文档中提取分块。</p>
                 )}
               </div>
             </div>

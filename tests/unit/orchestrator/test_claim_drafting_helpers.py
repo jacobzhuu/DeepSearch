@@ -7,6 +7,7 @@ from services.orchestrator.app.claims import (
     classify_query_intent,
     compute_claim_confidence,
     draft_claim_statement,
+    is_answer_relevant_score,
     is_claimable_statement,
     normalize_claim_identity,
     normalized_excerpt_hash,
@@ -218,3 +219,45 @@ def test_answer_focused_scores_rank_definition_above_contribution_text() -> None
     assert privacy.final_score > contribution.final_score
     assert definition.claim_category == "definition"
     assert privacy.claim_category == "privacy"
+
+
+def test_answer_role_classifies_official_about_style_sentences() -> None:
+    query = "What is SearXNG and how does it work?"
+    expected = [
+        ("SearXNG does not generate a profile about users.", "privacy"),
+        (
+            "SearXNG mixes queries with searches on other platforms without storing "
+            "search data.",
+            "privacy",
+        ),
+        ("SearXNG aggregates results from multiple search services.", "mechanism"),
+        ("SearXNG is free software and can be self-hosted.", "deployment/self_hosting"),
+    ]
+
+    for sentence, category in expected:
+        score = score_claim_statement(statement=sentence, query=query)
+        assert score.rejected_reason is None
+        assert score.claim_category == category
+        assert score.answer_role == category
+        assert score.answer_relevant is True
+        assert is_answer_relevant_score(score, query=query)
+
+
+def test_answer_role_rejects_navigation_project_meta_and_documentation_pointers() -> None:
+    query = "What is SearXNG and how does it work?"
+    rejected = [
+        "For more information, visit the documentation.",
+        "Read the documentation page to continue.",
+        "SearXNG has an open community that makes it better.",
+        "Join Matrix and send contributions to the source code.",
+    ]
+
+    for sentence in rejected:
+        score = score_claim_statement(statement=sentence, query=query)
+        assert not is_claimable_statement(sentence, query=query)
+        assert not is_answer_relevant_score(score, query=query)
+        assert score.answer_role == "non_answer"
+        assert score.rejected_reason in {
+            "navigation_or_documentation_pointer",
+            "community_or_contribution",
+        }

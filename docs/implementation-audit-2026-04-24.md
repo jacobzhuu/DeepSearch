@@ -2,13 +2,19 @@
 
 Scope: audit the current implementation state of search, acquisition, parsing, indexing, LLM configuration, report generation, and database migrations. This document records observed code reality only. It does not introduce worker execution, LangGraph wiring, mocks as production behavior, or new architecture.
 
+Current correction as of 2026-04-28: this audit is historical. The codebase now includes a
+planner-only LLM provider seam under `services/orchestrator/app/llm/`, a Research Planner v1
+under `services/orchestrator/app/planning/`, and a deterministic quality layer under
+`services/orchestrator/app/research_quality/`. The LLM boundary remains planner-only; claim
+drafting, verification, and report generation are still deterministic and evidence-backed.
+
 ## Summary
 
 The current codebase has a real synchronous host-local pipeline through:
 
 `research_task -> search -> fetch -> parse -> index -> draft -> verify -> report`
 
-The implemented path is not background worker based. It is also not LLM based. Claim drafting and verification are deterministic heuristics over stored chunks and OpenSearch retrieval.
+The implemented path is not background worker based. Claim drafting and verification are deterministic heuristics over stored chunks and OpenSearch retrieval. LLM use is now limited to optional research planning.
 
 Current local development environment status on this machine:
 
@@ -26,7 +32,7 @@ Current local development environment status on this machine:
 | Web acquisition | Yes, via policy-guarded real HTTP GET, redirect handling, DNS/IP checks, and snapshot storage | Not a stub | Code path is runnable, but depends on candidate URLs from search and globally reachable URLs | Search must produce allowed public URLs; target URLs must pass SSRF policy | After search endpoint is fixed, run fetch smoke against a known public HTML/plain-text URL |
 | Parsing | Yes, for stored `text/html` and `text/plain` snapshots | Not a stub, but intentionally minimal; no Tika/PDF/Office parser | Runnable after successful fetch creates snapshots | Needs successful content snapshots; unsupported MIME types are skipped | Keep as-is for current phase; next improvement would be clearer operator fixture for HTML/plain parsing |
 | OpenSearch/index backend | Yes, real REST backend creates index, upserts chunks, lists and retrieves by task | Not a stub | Not currently runnable because `127.0.0.1:9200` refuses connection | Start/configure OpenSearch and run `scripts/init_index.py` | Bring up OpenSearch host-local and validate `init_index.py`, `/index`, `/retrieve` |
-| LLM API key/client | No | No LLM stub found; there is simply no LLM client/config in current code | Not applicable | Missing env vars, dependency, client abstraction, and product decision | Do not add until a phase explicitly requires LLM-backed drafting/verifier |
+| LLM API key/client | Planner-only provider seam exists | No LLM claim/report path; noop and OpenAI-compatible planner providers exist | Runnable when `LLM_ENABLED=true` and `RESEARCH_PLANNER_ENABLED=true` with valid provider config | Missing or invalid provider config falls back only at planner execution boundaries | Keep LLM scoped to planning until evidence quality and verification are stronger |
 | Report generation service | Yes, deterministic Markdown synthesis from persisted claims/evidence and object storage | Not a stub; no external dedicated reporter service | Runnable after claims/evidence exist; can also generate empty-ledger Markdown for an existing task | Needs object store configuration and useful claim/evidence ledger for meaningful output | After index/search are fixed, validate full `draft -> verify -> report` smoke |
 | Database tables/migrations | Mostly complete for current Phase 11 synchronous loop | Not a stub | Current dev DB is at head | No worker/job tables beyond fetch job; no parse/index/report job ledgers by design | Keep schema frozen unless implementing a real worker or richer provenance requires migration |
 
@@ -78,11 +84,14 @@ Current local development environment status on this machine:
 
 ### LLM
 
-- no code files found for LLM client configuration
-- no `OPENAI`, `ANTHROPIC`, `LLM`, `API_KEY`, `langgraph`, or `LangGraph` references found in `services/`, `packages/`, `.env.example`, or `pyproject.toml`
-- env vars: none
-- external services: none currently integrated
-- database tables: none
+- `services/orchestrator/app/llm/providers.py`
+- `services/orchestrator/app/llm/client.py`
+- `services/orchestrator/app/planning/planner.py`
+- providers: noop and OpenAI-compatible aliases
+- env vars: `LLM_ENABLED`, `LLM_PROVIDER`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_MAX_OUTPUT_TOKENS`, `RESEARCH_PLANNER_ENABLED`, `RESEARCH_PLANNER_MAX_SUBQUESTIONS`, `RESEARCH_PLANNER_MAX_SEARCH_QUERIES`
+- external services: optional OpenAI-compatible chat completions endpoint
+- database tables: none; planner output is persisted through task events
+- boundary: planner-only; no LLM-written claims, verification decisions, or reports
 
 ### Reporting
 
@@ -111,7 +120,7 @@ Current local development environment status on this machine:
 
 - `python3 -m pytest ... -q` for targeted search, acquisition, parsing, indexing, reporting, migration, and repository tests: passed, 58 tests
 - `python3 -m ruff check ...`: passed
-- LLM grep check over `services/`, `packages/`, `.env.example`, `pyproject.toml`: no LLM/API-key/LangGraph references found
+- LLM status in this historical validation is stale; current code has planner-only LLM references and tests
 - `python3 - <<'PY' ... create_app() ... PY`: passed; startup validation succeeds with filesystem storage and OpenSearch live validation disabled
 - `curl -fsS --max-time 2 http://127.0.0.1:8000/healthz`: passed
 - `curl -fsS --max-time 2 http://127.0.0.1:8000/readyz`: passed
@@ -124,7 +133,7 @@ Current local development environment status on this machine:
 
 - no worker implementation was audited as runnable because worker execution is not implemented
 - no LangGraph runtime exists in the current codebase
-- no LLM client or API-key configuration exists
+- no LLM claim drafting, verification, or report-writing path exists
 - no Tika/PDF/Office parsing exists
 - no HTML/PDF report export exists
 - no parse-job, index-job, or report-job ledger tables exist; current phase uses synchronous endpoint/service execution

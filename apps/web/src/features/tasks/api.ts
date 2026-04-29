@@ -3,7 +3,9 @@ import { ResearchTask } from '../../types/api';
 import {
   CreateTaskRequest,
   CreateTaskResponse,
+  PlanTaskRequest,
   PipelineRunResponse,
+  ResearchPlanResponse,
   TaskEventListResponse,
 } from './types';
 
@@ -24,6 +26,16 @@ export const taskApi = {
   getTaskEvents: async (taskId: string): Promise<TaskEventListResponse> => {
     return fetchApi<TaskEventListResponse>(`/api/v1/research/tasks/${taskId}/events`, {
       method: 'GET',
+    });
+  },
+
+  planTask: async (
+    taskId: string,
+    data: PlanTaskRequest = {},
+  ): Promise<ResearchPlanResponse> => {
+    return fetchApi<ResearchPlanResponse>(`/api/v1/research/tasks/${taskId}/plan`, {
+      method: 'POST',
+      body: JSON.stringify(data),
     });
   },
 

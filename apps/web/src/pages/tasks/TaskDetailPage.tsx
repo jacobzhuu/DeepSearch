@@ -1,8 +1,9 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useParams, Link, useLocation, useNavigate } from 'react-router-dom';
 import { PageLayout } from '../../components/layout/PageLayout';
 import { LoadingState } from '../../components/common/LoadingState';
 import { ErrorState } from '../../components/common/ErrorState';
+import { RuntimeModeBanner } from '../../components/common/RuntimeModeBanner';
 import { PipelineCounts, PipelineFailure, PipelineRunResponse, ResearchTask, TaskEvent } from '../../features/tasks/types';
 import { useCreateTask, useRunTask, useTask, useTaskEvents } from '../../features/tasks/hooks';
 
@@ -16,6 +17,15 @@ export const TaskDetailPage: React.FC = () => {
   const { createTask, isCreating, error: createError } = useCreateTask();
   const initialPipelineResult = (location.state as { pipelineResult?: PipelineRunResponse } | null)?.pipelineResult || null;
   const pipelineResult = runResult || initialPipelineResult;
+
+  useEffect(() => {
+    if (!taskId || !task || !activeTaskStatuses.has(task.status)) return;
+    const timer = window.setInterval(() => {
+      void refetch(true);
+      void refetchEvents(true);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [taskId, task?.status, refetch, refetchEvents]);
 
   const handleRun = async () => {
     if (!taskId || task?.status !== 'PLANNED') return;
@@ -71,6 +81,7 @@ export const TaskDetailPage: React.FC = () => {
       : '运行 DeepSearch';
   const primaryActionDisabled = actionBusy || (!canRun && !canCreateReplacement);
   const handlePrimaryAction = canCreateReplacement ? handleCreateReplacementAndRun : handleRun;
+  const observability = task.progress?.observability || null;
 
   return (
     <PageLayout 
@@ -101,6 +112,11 @@ export const TaskDetailPage: React.FC = () => {
       <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
         <ErrorState error={createError} />
         <ErrorState error={runError} />
+        <RuntimeModeBanner
+          runningMode={pipelineResult?.running_mode || observability?.running_mode}
+          dependencies={pipelineResult?.dependencies || observability?.dependencies || null}
+          warnings={observability?.warnings || []}
+        />
         <PipelineFailureHelp failure={latestPipelineFailure} dependencies={pipelineResult?.dependencies || null} />
         <PipelineResultPanel result={pipelineResult} />
         
@@ -121,7 +137,7 @@ export const TaskDetailPage: React.FC = () => {
           </ul>
         </section>
 
-        <TaskObservabilityPanel observability={task.progress?.observability || null} />
+        <TaskObservabilityPanel observability={observability} />
 
         <section>
           <h3 style={{ borderBottom: '1px solid #eee', paddingBottom: '0.5rem' }}>探索</h3>
@@ -154,6 +170,19 @@ const emptyCounts: PipelineCounts = {
   claim_evidence: 0,
   report_artifacts: 0,
 };
+
+const activeTaskStatuses = new Set<ResearchTask['status']>([
+  'QUEUED',
+  'RUNNING',
+  'SEARCHING',
+  'ACQUIRING',
+  'PARSING',
+  'INDEXING',
+  'DRAFTING_CLAIMS',
+  'VERIFYING',
+  'RESEARCHING_MORE',
+  'REPORTING',
+]);
 
 const latestFailureFromEvents = (events: TaskEvent[]): PipelineFailure | null => {
   const failedEvent = events
@@ -234,6 +263,8 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
   const answerSlots = asObjectArray(observability.answer_slots || observability.report_slot_coverage);
   const answerYield = asObjectArray(observability.answer_yield);
   const supplementalAcquisition = observability.supplemental_acquisition || null;
+  const gapAnalysis = observability.gap_analysis || null;
+  const gapRounds = asObjectArray(observability.gap_rounds);
   const failureDiagnostics = observability.failure_diagnostics || null;
   const planSubquestions = Array.isArray(researchPlan?.subquestions) ? researchPlan.subquestions : [];
   const planSearchQueries = Array.isArray(researchPlan?.search_queries) ? researchPlan.search_queries : [];
@@ -367,6 +398,7 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
       <DroppedSourcesPanel rows={droppedSources} />
       <AnswerSlotCoveragePanel rows={answerSlots} />
       <SlotCoverageSummaryPanel rows={slotCoverageSummary} />
+      <GapAnalysisPanel analysis={gapAnalysis} rounds={gapRounds} />
       <EvidenceYieldSummaryPanel summary={evidenceYieldSummary} />
       <VerificationSummaryPanel summary={verificationSummary} />
       <AnswerYieldPanel rows={answerYield} />
@@ -631,6 +663,47 @@ const SupplementalAcquisitionPanel: React.FC<{ supplemental: Record<string, any>
   );
 };
 
+const GapAnalysisPanel: React.FC<{ analysis: Record<string, any> | null; rounds: Array<Record<string, any>> }> = ({ analysis, rounds }) => {
+  if (!analysis && rounds.length === 0) return null;
+  const missing = asObjectArray(analysis?.required_slots_missing);
+  const weak = asObjectArray(analysis?.required_slots_weak);
+  const queries = asObjectArray(analysis?.supplemental_queries);
+
+  return (
+    <div style={{ marginTop: '0.75rem' }}>
+      <strong>缺口分析</strong>
+      {analysis && (
+        <div style={{ marginTop: '0.5rem', color: '#475569' }}>
+          触发: {String(Boolean(analysis.triggered))}
+          {analysis.reason ? ` / ${analysis.reason}` : ''}
+          {typeof analysis.round_no === 'number' ? ` / 第 ${analysis.round_no} 轮` : ''}
+        </div>
+      )}
+      {(missing.length > 0 || weak.length > 0) && (
+        <div style={{ marginTop: '0.35rem', color: '#7a4b00' }}>
+          缺失: {missing.map((slot: any) => slot.label || slot.slot_id).join(', ') || '无'}
+          {weak.length > 0 ? ` / 弱覆盖: ${weak.map((slot: any) => slot.label || slot.slot_id).join(', ')}` : ''}
+        </div>
+      )}
+      {queries.length > 0 && (
+        <ol style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+          {queries.slice(0, 5).map((query: any, index: number) => (
+            <li key={`${index}-${query.query_text || query.slot_ids}`}>
+              {query.query_text || '补充查询'}
+              {Array.isArray(query.slot_ids) ? <span style={{ color: '#64748b' }}> / {query.slot_ids.join(', ')}</span> : null}
+            </li>
+          ))}
+        </ol>
+      )}
+      {rounds.length > 0 && (
+        <div style={{ marginTop: '0.35rem', color: '#64748b' }}>
+          已执行补充轮次: {rounds.length}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const FailureDiagnosticsPanel: React.FC<{ diagnostics: Record<string, any> | null }> = ({ diagnostics }) => {
   if (!diagnostics) return null;
   const topRejected = asObjectArray(diagnostics.top_rejected_candidates);
@@ -753,6 +826,8 @@ const PipelineResultPanel: React.FC<{ result: PipelineRunResponse | null }> = ({
       <h3 style={{ marginTop: 0 }}>流程执行结果</h3>
       <p style={{ marginTop: 0 }}>
         <strong>模式:</strong> {result.running_mode}
+        <br />
+        <strong>状态:</strong> {result.status}
       </p>
       <CountsGrid counts={result.counts} />
       {result.failure && (

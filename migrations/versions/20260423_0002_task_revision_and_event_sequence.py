@@ -104,6 +104,24 @@ def _backfill_revision_and_event_sequence() -> None:
         )
 
 
+def _normalize_runtime_states_for_downgrade() -> None:
+    connection = op.get_bind()
+    metadata = sa.MetaData()
+    research_task = sa.Table("research_task", metadata, autoload_with=connection)
+    research_run = sa.Table("research_run", metadata, autoload_with=connection)
+
+    connection.execute(
+        sa.update(research_task)
+        .where(research_task.c.status.in_(("QUEUED", "RUNNING")))
+        .values(status="PLANNED")
+    )
+    connection.execute(
+        sa.update(research_run)
+        .where(research_run.c.current_state.in_(("QUEUED", "RUNNING")))
+        .values(current_state="PLANNED")
+    )
+
+
 def upgrade() -> None:
     with op.batch_alter_table("research_task") as batch_op:
         batch_op.add_column(
@@ -184,6 +202,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _normalize_runtime_states_for_downgrade()
+
     with op.batch_alter_table("task_event") as batch_op:
         batch_op.drop_index("ix_task_event_task_id_sequence_no")
         batch_op.drop_constraint("uq_task_event_task_id_sequence_no", type_="unique")

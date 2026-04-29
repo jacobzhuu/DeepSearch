@@ -12,6 +12,7 @@ class CreateResearchTaskRequest(BaseModel):
 
     query: str
     constraints: dict[str, Any] = Field(default_factory=dict)
+    report_language: str | None = None
 
     @field_validator("query")
     @classmethod
@@ -21,12 +22,23 @@ class CreateResearchTaskRequest(BaseModel):
             raise ValueError("query must not be empty")
         return normalized
 
+    @field_validator("report_language")
+    @classmethod
+    def validate_report_language(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("report_language must not be empty")
+        return normalized
+
 
 class ReviseResearchTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str | None = None
     constraints: dict[str, Any] | None = None
+    report_language: str | None = None
 
     @field_validator("query")
     @classmethod
@@ -38,11 +50,29 @@ class ReviseResearchTaskRequest(BaseModel):
             raise ValueError("query must not be empty")
         return normalized
 
+    @field_validator("report_language")
+    @classmethod
+    def validate_report_language(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("report_language must not be empty")
+        return normalized
+
     @model_validator(mode="after")
     def validate_revision_payload(self) -> ReviseResearchTaskRequest:
-        if self.query is None and self.constraints is None:
-            raise ValueError("at least one of query or constraints must be provided")
+        if self.query is None and self.constraints is None and self.report_language is None:
+            raise ValueError(
+                "at least one of query, constraints, or report_language must be provided"
+            )
         return self
+
+
+class PlanResearchTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_plan: dict[str, Any] | None = None
 
 
 class ResearchTaskMutationResponse(BaseModel):
@@ -52,7 +82,23 @@ class ResearchTaskMutationResponse(BaseModel):
     updated_at: datetime
 
 
+class ResearchPlanMutationResponse(BaseModel):
+    task_id: UUID
+    status: str
+    revision_no: int
+    updated_at: datetime
+    planner_status: str
+    planner_mode: str
+    plan_source: str
+    research_plan: dict[str, Any]
+    running_mode: str
+    dependencies: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ResearchTaskObservabilityResponse(BaseModel):
+    running_mode: str | None = None
+    dependencies: dict[str, Any] | None = None
     planner_enabled: bool | None = None
     planner_mode: str | None = None
     planner_status: str | None = None
@@ -85,6 +131,8 @@ class ResearchTaskObservabilityResponse(BaseModel):
     evidence_yield_summary: dict[str, Any] = Field(default_factory=dict)
     verification_summary: dict[str, Any] = Field(default_factory=dict)
     supplemental_acquisition: dict[str, Any] | None = None
+    gap_analysis: dict[str, Any] | None = None
+    gap_rounds: list[dict[str, Any]] = Field(default_factory=list)
     failure_diagnostics: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
 

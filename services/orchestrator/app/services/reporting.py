@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -24,9 +24,12 @@ from services.orchestrator.app.claims import (
     is_claimable_statement,
     score_claim_statement,
 )
+from services.orchestrator.app.llm import LLMError, LLMProvider
 from services.orchestrator.app.reporting import (
+    DEFAULT_REPORT_LANGUAGE,
     ClaimStatus,
     EvidenceRelation,
+    GroundedLLMReportValidationError,
     RenderedMarkdownReport,
     ReportClaimItem,
     ReportEvidenceItem,
@@ -34,7 +37,9 @@ from services.orchestrator.app.reporting import (
     build_report_manifest,
     compute_report_content_hash,
     extract_report_title,
+    render_grounded_llm_report,
     render_markdown_report,
+    resolve_report_language,
 )
 from services.orchestrator.app.research_quality import (
     build_slot_coverage_summary,
@@ -81,6 +86,9 @@ class ReportSynthesisResult:
     title: str
     markdown: str
     reused_existing: bool
+    report_language: str
+    writer_mode: str
+    llm_writer_status: str | None
     supported_claims: int
     mixed_claims: int
     unsupported_claims: int
@@ -92,6 +100,8 @@ class PreparedReport:
     rendered: RenderedMarkdownReport
     claims: list[ReportClaimItem]
     sources: list[ReportSourceItem]
+    report_language: str
+    report_writer: dict[str, object]
 
 
 class ReportSynthesisService:
@@ -105,6 +115,10 @@ class ReportSynthesisService:
         report_artifact_repository: ReportArtifactRepository,
         object_store: SnapshotObjectStore,
         report_storage_bucket: str,
+        llm_provider: LLMProvider | None = None,
+        llm_model: str = "",
+        llm_report_writer_enabled: bool = False,
+        llm_report_max_output_tokens: int = 2400,
     ) -> None:
         self.session = session
         self.task_repository = task_repository
@@ -113,6 +127,10 @@ class ReportSynthesisService:
         self.report_artifact_repository = report_artifact_repository
         self.object_store = object_store
         self.report_storage_bucket = report_storage_bucket
+        self.llm_provider = llm_provider
+        self.llm_model = llm_model
+        self.llm_report_writer_enabled = llm_report_writer_enabled
+        self.llm_report_max_output_tokens = llm_report_max_output_tokens
 
     def generate_markdown_report(self, task_id: UUID) -> ReportSynthesisResult:
         task = self._get_task(task_id)
@@ -130,13 +148,30 @@ class ReportSynthesisService:
             revision_no=task.revision_no,
             query=task.query,
             report_title=rendered.title,
+            report_language=prepared_report.report_language,
+            report_writer=prepared_report.report_writer,
             claims=prepared_report.claims,
             sources=prepared_report.sources,
-            slot_coverage_summary=report_diagnostics["slot_coverage_summary"],
-            evidence_yield_summary=report_diagnostics["evidence_yield_summary"],
-            source_yield_summary=report_diagnostics["source_yield_summary"],
-            verification_summary=report_diagnostics["verification_summary"],
-            dropped_sources=report_diagnostics["dropped_sources"],
+            slot_coverage_summary=cast(
+                list[dict[str, Any]],
+                report_diagnostics["slot_coverage_summary"],
+            ),
+            evidence_yield_summary=cast(
+                dict[str, Any],
+                report_diagnostics["evidence_yield_summary"],
+            ),
+            source_yield_summary=cast(
+                list[dict[str, Any]],
+                report_diagnostics["source_yield_summary"],
+            ),
+            verification_summary=cast(
+                dict[str, Any],
+                report_diagnostics["verification_summary"],
+            ),
+            dropped_sources=cast(
+                list[dict[str, Any]],
+                report_diagnostics["dropped_sources"],
+            ),
         )
         latest_artifact = self.report_artifact_repository.get_latest_for_task_format(
             task.id,
@@ -163,6 +198,8 @@ class ReportSynthesisService:
                 task=task,
                 artifact=latest_artifact,
                 rendered=rendered,
+                report_language=prepared_report.report_language,
+                report_writer=prepared_report.report_writer,
                 reused_existing=True,
             )
 
@@ -202,6 +239,8 @@ class ReportSynthesisService:
             task=task,
             artifact=artifact,
             rendered=rendered,
+            report_language=prepared_report.report_language,
+            report_writer=prepared_report.report_writer,
             reused_existing=False,
         )
 
@@ -228,12 +267,20 @@ class ReportSynthesisService:
             and artifact.content_hash != compute_report_content_hash(markdown)
         ):
             raise ReportArtifactContentMismatchError(task.id, artifact.id)
+        manifest = artifact.manifest_json if isinstance(artifact.manifest_json, dict) else {}
+        writer = manifest.get("report_writer") if isinstance(manifest, dict) else {}
+        writer = writer if isinstance(writer, dict) else {}
         return ReportSynthesisResult(
             task=task,
             artifact=artifact,
             title=extract_report_title(markdown),
             markdown=markdown,
             reused_existing=True,
+            report_language=(
+                _string_or_none(manifest.get("report_language")) or DEFAULT_REPORT_LANGUAGE
+            ),
+            writer_mode=_string_or_none(writer.get("mode")) or "unknown",
+            llm_writer_status=_string_or_none(writer.get("status")),
             supported_claims=0,
             mixed_claims=0,
             unsupported_claims=0,
@@ -241,6 +288,7 @@ class ReportSynthesisService:
         )
 
     def _prepare_report(self, task: ResearchTask) -> PreparedReport:
+        report_language = resolve_report_language(task.constraints_json)
         claims = self.claim_repository.list_for_task(task.id)
         claim_evidence = self.claim_evidence_repository.list_for_task(task.id)
         evidence_by_claim_id: dict[UUID, list[ClaimEvidence]] = {claim.id: [] for claim in claims}
@@ -286,15 +334,7 @@ class ReportSynthesisService:
                     relation_detail=_string_or_none(relation_metadata.get("relation_detail")),
                     support_level=_string_or_none(relation_metadata.get("support_level")),
                     verifier_method=_string_or_none(relation_metadata.get("verifier_method")),
-                    reasons=(
-                        tuple(
-                            item
-                            for item in relation_metadata.get("reasons", [])
-                            if isinstance(item, str)
-                        )
-                        if isinstance(relation_metadata.get("reasons"), list)
-                        else ()
-                    ),
+                    reasons=_relation_reasons(relation_metadata),
                 )
                 if evidence.relation_type == "support":
                     support_evidence.append(report_evidence)
@@ -341,18 +381,76 @@ class ReportSynthesisService:
             )
 
         sources = list(source_items.values())
-        return PreparedReport(
-            rendered=render_markdown_report(
-                task_id=task.id,
-                research_question=task.query,
-                revision_no=task.revision_no,
-                claims=report_claims,
-                sources=sources,
-                answer_relevant_claim_count=len(report_claims),
-                excluded_low_quality_claim_count=excluded_low_quality_claim_count,
-            ),
+        deterministic_rendered = render_markdown_report(
+            task_id=task.id,
+            research_question=task.query,
+            revision_no=task.revision_no,
             claims=report_claims,
             sources=sources,
+            report_language=report_language,
+            answer_relevant_claim_count=len(report_claims),
+            excluded_low_quality_claim_count=excluded_low_quality_claim_count,
+        )
+        rendered = deterministic_rendered
+        report_writer: dict[str, object] = {
+            "mode": "deterministic",
+            "status": "used",
+            "language": report_language,
+        }
+        if self.llm_report_writer_enabled and self.llm_provider is not None:
+            try:
+                llm_report = render_grounded_llm_report(
+                    task_id=task.id,
+                    research_question=task.query,
+                    revision_no=task.revision_no,
+                    claims=report_claims,
+                    sources=sources,
+                    report_language=report_language,
+                    answer_relevant_claim_count=len(report_claims),
+                    excluded_low_quality_claim_count=excluded_low_quality_claim_count,
+                    llm_provider=self.llm_provider,
+                    llm_model=self.llm_model,
+                    max_output_tokens=self.llm_report_max_output_tokens,
+                )
+            except LLMError as error:
+                report_writer = {
+                    "mode": "deterministic",
+                    "status": "fallback_after_llm_error",
+                    "language": report_language,
+                    "llm_error": error.to_payload(),
+                }
+                logger.warning(
+                    "report.llm_writer_failed",
+                    extra={
+                        "task_id": str(task.id),
+                        "error_code": error.error_code,
+                        "provider": error.provider,
+                    },
+                )
+            except GroundedLLMReportValidationError as error:
+                report_writer = {
+                    "mode": "deterministic",
+                    "status": "fallback_after_llm_validation_error",
+                    "language": report_language,
+                    "validation_error": str(error),
+                }
+                logger.warning(
+                    "report.llm_writer_invalid_output",
+                    extra={
+                        "task_id": str(task.id),
+                        "validation_error": str(error),
+                    },
+                )
+            else:
+                rendered = llm_report.rendered
+                report_writer = dict(llm_report.metadata)
+                report_writer["language"] = report_language
+        return PreparedReport(
+            rendered=rendered,
+            claims=report_claims,
+            sources=sources,
+            report_language=report_language,
+            report_writer=report_writer,
         )
 
     def _artifact_matches(
@@ -379,6 +477,8 @@ class ReportSynthesisService:
         task: ResearchTask,
         artifact: ReportArtifact,
         rendered: RenderedMarkdownReport,
+        report_language: str,
+        report_writer: dict[str, object],
         reused_existing: bool,
     ) -> ReportSynthesisResult:
         return ReportSynthesisResult(
@@ -387,6 +487,9 @@ class ReportSynthesisService:
             title=rendered.title,
             markdown=rendered.markdown,
             reused_existing=reused_existing,
+            report_language=report_language,
+            writer_mode=_string_or_none(report_writer.get("mode")) or "unknown",
+            llm_writer_status=_string_or_none(report_writer.get("status")),
             supported_claims=rendered.supported_count,
             mixed_claims=rendered.mixed_count,
             unsupported_claims=rendered.unsupported_count,
@@ -424,6 +527,10 @@ def create_report_synthesis_service(
     *,
     object_store: SnapshotObjectStore,
     report_storage_bucket: str,
+    llm_provider: LLMProvider | None = None,
+    llm_model: str = "",
+    llm_report_writer_enabled: bool = False,
+    llm_report_max_output_tokens: int = 2400,
 ) -> ReportSynthesisService:
     return ReportSynthesisService(
         session,
@@ -433,6 +540,10 @@ def create_report_synthesis_service(
         report_artifact_repository=ReportArtifactRepository(session),
         object_store=object_store,
         report_storage_bucket=report_storage_bucket,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_report_writer_enabled=llm_report_writer_enabled,
+        llm_report_max_output_tokens=llm_report_max_output_tokens,
     )
 
 
@@ -520,6 +631,13 @@ def _relation_metadata_by_citation_span(claim: Claim) -> dict[str, dict[str, obj
     return result
 
 
+def _relation_reasons(relation_metadata: dict[str, object]) -> tuple[str, ...]:
+    reasons = relation_metadata.get("reasons")
+    if not isinstance(reasons, list):
+        return ()
+    return tuple(item for item in reasons if isinstance(item, str))
+
+
 def _claim_verifier_method(claim: Claim) -> str | None:
     notes = claim.notes_json or {}
     verification = notes.get("verification") if isinstance(notes, dict) else {}
@@ -567,11 +685,11 @@ def _build_report_diagnostics(
         }
         for claim in claims
     ]
-    accepted_candidate_ids = {
-        item["evidence_candidate_id"]
-        for item in evidence_candidate_rows
-        if isinstance(item.get("evidence_candidate_id"), str)
-    }
+    accepted_candidate_ids: set[str] = set()
+    for item in evidence_candidate_rows:
+        evidence_candidate_id = item.get("evidence_candidate_id")
+        if isinstance(evidence_candidate_id, str):
+            accepted_candidate_ids.add(evidence_candidate_id)
     source_yield_summary = _report_source_yield_summary(
         sources=sources,
         claims=claims,

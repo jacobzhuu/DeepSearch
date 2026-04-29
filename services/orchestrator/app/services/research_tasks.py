@@ -21,20 +21,39 @@ TASK_PAUSED_EVENT = "task.paused"
 TASK_RESUMED_EVENT = "task.resumed"
 TASK_CANCELLED_EVENT = "task.cancelled"
 TASK_REVISED_EVENT = "task.revised"
+RESEARCH_PLAN_CREATED_EVENT = "research_plan.created"
+PIPELINE_QUEUED_EVENT = "pipeline.queued"
 
 PHASE2_EXECUTABLE_CANDIDATE_STATUS = "PLANNED"
 PHASE2_ACTIVE_STATUS = PHASE2_EXECUTABLE_CANDIDATE_STATUS
 PHASE2_PAUSED_STATUS = "PAUSED"
 PHASE2_CANCELLED_STATUS = "CANCELLED"
+RUNTIME_QUEUED_STATUS = "QUEUED"
+RUNTIME_ACTIVE_STATUS_VALUES = (
+    RUNTIME_QUEUED_STATUS,
+    "RUNNING",
+    "SEARCHING",
+    "ACQUIRING",
+    "PARSING",
+    "INDEXING",
+    "DRAFTING_CLAIMS",
+    "VERIFYING",
+    "RESEARCHING_MORE",
+    "REPORTING",
+)
 PHASE2_STABLE_STATUS_VALUES = CURRENT_TASK_STATUS_VALUES
 FUTURE_RUNTIME_STATUS_VALUES = MODEL_FUTURE_RUNTIME_STATUS_VALUES
 
 ACTION_TRANSITIONS = {
-    "pause": {PHASE2_ACTIVE_STATUS: PHASE2_PAUSED_STATUS},
-    "resume": {PHASE2_PAUSED_STATUS: PHASE2_ACTIVE_STATUS},
+    "pause": {
+        PHASE2_ACTIVE_STATUS: PHASE2_PAUSED_STATUS,
+        **{status: PHASE2_PAUSED_STATUS for status in RUNTIME_ACTIVE_STATUS_VALUES},
+    },
+    "resume": {PHASE2_PAUSED_STATUS: RUNTIME_QUEUED_STATUS},
     "cancel": {
         PHASE2_ACTIVE_STATUS: PHASE2_CANCELLED_STATUS,
         PHASE2_PAUSED_STATUS: PHASE2_CANCELLED_STATUS,
+        **{status: PHASE2_CANCELLED_STATUS for status in RUNTIME_ACTIVE_STATUS_VALUES},
     },
     "revise": {
         PHASE2_ACTIVE_STATUS: PHASE2_ACTIVE_STATUS,
@@ -145,6 +164,54 @@ class ResearchTaskService:
             limit=limit,
         )
 
+    def enqueue_task(
+        self,
+        task_id: UUID,
+        *,
+        dependencies: dict[str, Any] | None = None,
+        running_mode: str | None = None,
+    ) -> ResearchTask:
+        task = self._get_task(task_id)
+        current_status = task.status
+        if current_status != PHASE2_EXECUTABLE_CANDIDATE_STATUS:
+            raise TaskStateConflictError(task.id, "run", current_status)
+
+        self.task_repository.set_status(task, RUNTIME_QUEUED_STATUS, ended_at=None)
+        payload = build_task_event_payload(
+            from_status=current_status,
+            to_status=RUNTIME_QUEUED_STATUS,
+            changes={"revision_no": task.revision_no},
+        )
+        payload.update(
+            {
+                "source": "pipeline.queue",
+                "stage": RUNTIME_QUEUED_STATUS,
+                "status_note": "research task queued for host-local worker",
+            }
+        )
+        if dependencies is not None:
+            payload["dependencies"] = dependencies
+        if running_mode is not None:
+            payload["running_mode"] = running_mode
+        self.event_repository.record(
+            task_id=task.id,
+            event_type=PIPELINE_QUEUED_EVENT,
+            payload_json=payload,
+        )
+        self.session.commit()
+        self.session.refresh(task)
+        record_task_command(action="run", status=task.status)
+        logger.info(
+            "task.command.completed",
+            extra={
+                "task_id": str(task.id),
+                "action": "run",
+                "status": task.status,
+                "revision_no": task.revision_no,
+            },
+        )
+        return task
+
     def pause_task(self, task_id: UUID) -> ResearchTask:
         return self._transition_task(
             task_id=task_id,
@@ -212,6 +279,57 @@ class ResearchTaskService:
                 "revision_no": task.revision_no,
             },
         )
+        return task
+
+    def record_research_plan_created(
+        self,
+        task_id: UUID,
+        *,
+        research_plan: dict[str, Any],
+        planner_mode: str,
+        plan_source: str,
+        summary: dict[str, Any],
+        warnings: list[str],
+        dependencies: dict[str, Any] | None = None,
+        running_mode: str | None = None,
+    ) -> ResearchTask:
+        task = self._get_task(task_id)
+        if task.status != PHASE2_EXECUTABLE_CANDIDATE_STATUS:
+            raise TaskStateConflictError(task.id, "plan", task.status)
+
+        payload = build_task_event_payload(
+            from_status=task.status,
+            to_status=task.status,
+            changes={
+                "revision_no": task.revision_no,
+                "research_plan_source": plan_source,
+            },
+        )
+        payload.update(
+            {
+                "stage": "PLANNING",
+                "planner_enabled": True,
+                "planner_status": "created",
+                "planner_mode": planner_mode,
+                "plan_source": plan_source,
+                "result": {
+                    "research_plan": research_plan,
+                    **summary,
+                },
+                "warnings": warnings,
+            }
+        )
+        if dependencies is not None:
+            payload["dependencies"] = dependencies
+        if running_mode is not None:
+            payload["running_mode"] = running_mode
+        self.event_repository.record(
+            task_id=task.id,
+            event_type=RESEARCH_PLAN_CREATED_EVENT,
+            payload_json=payload,
+        )
+        self.session.commit()
+        self.session.refresh(task)
         return task
 
     def _transition_task(self, *, task_id: UUID, action: str, event_type: str) -> ResearchTask:

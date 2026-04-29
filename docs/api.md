@@ -2,7 +2,7 @@
 
 ## Phase 11 endpoints
 
-Phase 11 keeps the existing system endpoints, the Phase 2 thin research task API, the Phase 3 search-discovery endpoints, the Phase 4 acquisition endpoints, the Phase 5 parsing endpoints, the Phase 6 indexing endpoints, the Phase 7 claim-drafting endpoints, the Phase 8 verification endpoints, and the Phase 9 report-synthesis endpoints. No new product API semantics are introduced in this phase. The current operator route is host-local / self-hosted Linux first; optional Docker or compose packaging does not change any API contract.
+Phase 11 keeps the existing system endpoints, the Phase 2 thin research task API, the Phase 3 search-discovery endpoints, the Phase 4 acquisition endpoints, the Phase 5 parsing endpoints, the Phase 6 indexing endpoints, the Phase 7 claim-drafting endpoints, the Phase 8 verification endpoints, and the Phase 9 report-synthesis endpoints. It now also exposes a narrow pre-run planner endpoint so the web workspace can show and confirm a bounded research plan before `SEARCHING`. The current operator route is host-local / self-hosted Linux first; optional Docker or compose packaging does not change any API contract.
 
 ### `GET /healthz`
 
@@ -86,12 +86,18 @@ Request:
 ```json
 {
   "query": "近30天 NVIDIA 在开源模型生态上的关键发布与影响",
+  "report_language": "zh-CN",
   "constraints": {
     "domains_allow": ["nvidia.com", "github.com"],
-    "language": "zh-CN"
+    "language": "zh-CN",
+    "report_language": "zh-CN"
   }
 }
 ```
+
+`report_language` may be sent either as a top-level create/revise field or inside
+`constraints.report_language`. The report renderer falls back to `constraints.language`,
+then to `en-US` for older tasks. The web workspace sends `zh-CN` by default.
 
 Response `201 Created`:
 
@@ -103,6 +109,56 @@ Response `201 Created`:
   "updated_at": "2026-04-22T12:00:00Z"
 }
 ```
+
+### `POST /api/v1/research/tasks/{task_id}/plan`
+
+Purpose: create a visible pre-run research plan for a `PLANNED` task and emit
+`research_plan.created` as an auditable task event before `SEARCHING`.
+
+Request body is optional. Without a body, the service uses the configured planner when
+`LLM_ENABLED=true` and `RESEARCH_PLANNER_ENABLED=true`; otherwise it creates a deterministic
+fallback plan. To confirm an edited plan, send the edited plan payload:
+
+```json
+{
+  "research_plan": {
+    "intent": "definition_how_it_works",
+    "subquestions": ["What is SearXNG?", "How does SearXNG work?"],
+    "search_queries": [
+      {
+        "query_text": "SearXNG official documentation",
+        "rationale": "Prioritize official documentation.",
+        "expected_source_type": "official_docs",
+        "priority": 1
+      }
+    ]
+  }
+}
+```
+
+Response `200 OK`:
+
+```json
+{
+  "task_id": "uuid",
+  "status": "PLANNED",
+  "revision_no": 1,
+  "updated_at": "2026-04-22T12:00:00Z",
+  "planner_status": "created",
+  "planner_mode": "deterministic",
+  "plan_source": "deterministic_fallback",
+  "research_plan": {},
+  "running_mode": "smoke-search+deterministic-local+no-LLM",
+  "dependencies": {},
+  "warnings": [
+    "Development smoke mode is active; sources are synthetic fixtures, not real web evidence."
+  ]
+}
+```
+
+The endpoint does not change `research_task.status`; the task remains runnable from
+`PLANNED`. If the task is not `PLANNED`, it returns `409`. If an explicitly configured LLM
+planner fails, it returns `502` with sanitized planner details.
 
 ### `GET /api/v1/research/tasks/{task_id}`
 
@@ -117,7 +173,8 @@ Response `200 OK`:
   "status": "PLANNED",
   "constraints": {
     "domains_allow": ["nvidia.com", "github.com"],
-    "language": "zh-CN"
+    "language": "zh-CN",
+    "report_language": "zh-CN"
   },
   "revision_no": 1,
   "created_at": "2026-04-22T12:00:00Z",
@@ -133,8 +190,9 @@ Response `200 OK`:
 }
 ```
 
-When a task has run through the synchronous pipeline, `progress.observability` is derived from task events and may include:
+When a task has generated a pre-run plan, has been queued, or has run through the worker/debug pipeline, `progress.observability` is derived from task events and may include:
 
+- `running_mode` and `dependencies`, when a pre-run plan or pipeline start event recorded the active search/index/LLM modes
 - planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`
 - `search_result_count`
 - `selected_sources`, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` metadata when applicable
@@ -150,6 +208,7 @@ When a task has run through the synchronous pipeline, `progress.observability` i
 - `dropped_sources`, using the stable reason taxonomy `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`
 - `evidence_yield_summary`, with total/accepted/rejected candidate counts plus by-slot, by-source, and top rejection-reason summaries
 - `verification_summary`, including deterministic verifier method names, strong support counts, weak support counts, contradiction counts, and explicit limitations
+- `gap_analysis` and `gap_rounds`, when required answer slots were missing or weak after verification and the runner generated supplemental search queries before reporting
 - `supplemental_acquisition` with trigger status, reason, attempted sources, and skipped sources
 - `failure_diagnostics` with top rejected candidates, why required source intents were not attempted, backward-compatible about/Wikipedia details, unattempted high-quality sources, and next action when a stage fails with structured details
 - non-blocking `warnings`, such as fewer than two successful fetched sources
@@ -213,9 +272,9 @@ Purpose: perform the minimal Phase 2 transition `PLANNED -> PAUSED` and emit `ta
 
 ### `POST /api/v1/research/tasks/{task_id}/resume`
 
-Purpose: perform the minimal Phase 2 transition `PAUSED -> PLANNED` and emit `task.resumed`.
+Purpose: perform the runtime transition `PAUSED -> QUEUED` and emit `task.resumed`.
 
-Semantics: `resume` currently means “return to the executable-candidate status” only. It does not enqueue work, start a worker, or imply `QUEUED` or `RUNNING`.
+Semantics: `resume` requeues paused work for the host-local worker. It does not directly run the task in the API request.
 
 ### `POST /api/v1/research/tasks/{task_id}/cancel`
 
@@ -229,6 +288,7 @@ Revision semantics:
 
 - `query`, if present, replaces the stored query
 - `constraints`, if present, is a shallow top-level merge into the stored `constraints`
+- top-level `report_language`, if present, is normalized into `constraints.report_language`
 - constraint deletion and deep merge are not supported in the current phase
 
 Request:
@@ -236,6 +296,7 @@ Request:
 ```json
 {
   "query": "聚焦 NVIDIA 与开源推理栈",
+  "report_language": "zh-CN",
   "constraints": {
     "max_rounds": 2
   }
@@ -1176,6 +1237,8 @@ Request semantics:
 - no request body is required in the current phase
 - report generation does not run new retrieval, verification, or claim-drafting logic
 - report generation may be invoked for any existing task because it synthesizes from persisted ledger state only
+- report language resolves from `constraints.report_language`, then `constraints.language`, then `en-US`
+- when `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`, report generation attempts the grounded LLM writer; invalid or failed LLM output falls back to deterministic Markdown
 
 Response `200 OK`:
 
@@ -1186,6 +1249,9 @@ Response `200 OK`:
   "version": 1,
   "format": "markdown",
   "title": "Research Report: What is the current verified position?",
+  "report_language": "en-US",
+  "writer_mode": "deterministic",
+  "llm_writer_status": "used",
   "storage_bucket": "reports",
   "storage_key": "uuid/v1/report.md",
   "created_at": "2026-04-24T10:30:00Z",
@@ -1208,6 +1274,7 @@ Command contract:
   - `verification_status`
 - `supported` claims may appear as settled conclusions
 - `mixed`, `unsupported`, and `draft` claims must remain explicitly labeled in the report body
+- LLM-written report prose is allowed only from a structured claim/evidence/citation-span bundle; every rendered LLM item must carry valid claim/evidence/citation ids
 - repeated calls reuse the latest artifact when the newly rendered Markdown bytes are identical
 - repeated calls create a new Markdown artifact version only when the rendered content changes
 - does not emit new `task_event` rows and does not change `research_task.status`
@@ -1234,6 +1301,9 @@ Response `200 OK`:
   "version": 1,
   "format": "markdown",
   "title": "Research Report: What is the current verified position?",
+  "report_language": "en-US",
+  "writer_mode": "deterministic",
+  "llm_writer_status": "used",
   "storage_bucket": "reports",
   "storage_key": "uuid/v1/report.md",
   "created_at": "2026-04-24T10:30:00Z",
@@ -1244,10 +1314,11 @@ Response `200 OK`:
 ## Phase 9 plus Phase 10 report synthesis rules
 
 - current report output format is `markdown` only
-- current report generation is deterministic and explainable:
+- current report generation is evidence-first and explainable:
   - read persisted claims and evidence
   - read persisted verification status and rationale
-  - render a Markdown report with fixed section structure
+  - render a Markdown report with fixed section structure through the deterministic renderer by default
+  - optionally render report prose through the grounded LLM writer when explicitly enabled
   - store the artifact through the existing object-store abstraction
   - persist a `report_artifact(task_id, version, format="markdown")` ledger row
 - the current Markdown report includes:
@@ -1262,6 +1333,16 @@ Response `200 OK`:
 - current report synthesis never invents unsupported conclusions:
   - only `supported` claims appear as settled conclusions
   - `mixed` and `unsupported` claims are rendered only inside uncertainty-aware sections with explicit status labels
+- grounded LLM report synthesis is constrained by ids:
+  - the LLM prompt receives only verified claim rows and their claim-evidence / citation-span excerpts
+  - the LLM must return structured JSON, not free-form Markdown
+  - rendered LLM items are dropped unless their `claim_ids`, `claim_evidence_ids`, and `citation_span_ids` validate against the prepared report bundle
+  - invalid LLM JSON, ungrounded ids, provider errors, or missing verified evidence fall back to the deterministic renderer
+- report language support:
+  - `constraints.report_language` has priority
+  - `constraints.language` is the fallback
+  - older tasks without either field render as `en-US`
+  - the web workspace sends `zh-CN` by default
 - report synthesis filters historical weak ledger material before rendering:
   - non-claimable title/question/fragment statements are skipped
   - citation excerpts below the minimum claimable threshold are not rendered as support evidence
@@ -1274,6 +1355,8 @@ Response `200 OK`:
 - Phase 10 now persists additional internal report-artifact provenance:
   - `content_hash`
   - `manifest_json`
+  - `manifest_json.report_language`
+  - `manifest_json.report_writer`
 - `GET /report` now verifies stored Markdown bytes against `content_hash` when that hash is present
   - hash mismatch is treated as `500 Internal Server Error`
 - report endpoint response bodies are unchanged in Phase 10; the new provenance fields are internal ledger hardening, not a new product response contract
@@ -1283,15 +1366,16 @@ Response `200 OK`:
 
 ### `POST /api/v1/research/tasks/{task_id}/run`
 
-Purpose: run one existing `research_task` through the current synchronous DeepSearch loop from the frontend or host-local API tooling.
+Purpose: enqueue one existing `research_task` for the host-local DeepSearch worker.
 
 Execution contract:
 
 - starts only from `research_task.status = "PLANNED"`
-- does not use a worker, queue, Celery, or LangGraph runner
-- may run optional Research Planner v1 before search only when `LLM_ENABLED=true` and `RESEARCH_PLANNER_ENABLED=true`
-- never uses an LLM to draft claims, verify evidence, or write the final report
-- reuses the existing service-layer seams:
+- transitions the task to `QUEUED`, emits `pipeline.queued`, and returns immediately
+- uses the existing database state as the minimal host-local queue; no Celery, Redis, or LangGraph runner is required
+- the worker may reuse a pre-run `research_plan.created` event; if no pre-run plan exists, it may run optional Research Planner v1 before search only when `LLM_ENABLED=true` and `RESEARCH_PLANNER_ENABLED=true`
+- never uses an LLM to draft claims or verify evidence; final report writing may use the optional grounded LLM writer only when explicitly enabled and only from verified claim/evidence/citation-span bundles
+- the worker reuses the existing service-layer seams:
   - optional research planning
   - search discovery
   - HTTP acquisition
@@ -1300,7 +1384,7 @@ Execution contract:
   - claim drafting
   - claim verification
   - Markdown report generation
-- transitions `research_task.status` through:
+- worker execution transitions `research_task.status` through:
   - `RUNNING`
   - `SEARCHING`
   - `ACQUIRING`
@@ -1308,11 +1392,12 @@ Execution contract:
   - `INDEXING`
   - `DRAFTING_CLAIMS`
   - `VERIFYING`
+  - `RESEARCHING_MORE` when required answer slots need supplemental search
   - `REPORTING`
   - `COMPLETED`
-- on stage failure, transitions the task to `FAILED`, emits `pipeline.failed`, and returns a structured failure object instead of an unstructured 500
-- emits `pipeline.started`, `pipeline.stage_started`, `pipeline.stage_completed`, `pipeline.failed`, and `pipeline.completed` task events
-- when planner is enabled, emits `research_plan.created`; when planner fails, emits `research_plan.failed` and continues with the original query
+- on stage failure, transitions the task to `FAILED` and emits `pipeline.failed`
+- emits `pipeline.queued`, `pipeline.started`, `pipeline.stage_started`, `pipeline.stage_completed`, `pipeline.gap_analysis`, `pipeline.failed`, and `pipeline.completed` task events
+- when planner is enabled inside the pipeline, emits `research_plan.created`; when planner fails, emits `research_plan.failed` and continues with the original query
 - `pipeline.stage_completed` and `pipeline.failed` payloads include operator observability details for search, acquisition, parsing, claim drafting, and supplemental acquisition:
   - planner intent, subquestion count, search-query count, raw/final planner query lists, downweighted planner queries, preferred/avoided domains, intent classification, extracted entity, and planner guardrail warnings when a plan exists
   - search result count and selected candidate source summaries, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` when source-selection guardrails classify official about/home/reference, Wikipedia, GitHub, admin architecture, installation, API/developer, forum/social/video, generic, or low-quality pages
@@ -1323,41 +1408,34 @@ Execution contract:
   - evidence-yield summaries and slot-coverage summaries that link answer slots to candidate evidence, accepted evidence, strong/weak support, unsupported claims, and contributing source counts
   - verification summaries that identify the deterministic lexical verifier method and distinguish strong support from weak lexical support
   - supplemental acquisition trigger reason, attempted sources, skipped sources, and bounded retry status
+  - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates, max-round terminal reasons, and per-round `RESEARCHING_MORE` results
   - claim-drafting failure diagnostics when a no-claims failure remains after supplemental acquisition, including why supplemental acquisition triggered, top rejected candidates, unattempted high-quality sources, why about/Wikipedia was not attempted, per-source answer yield, and an operator `next_action`
   - warnings when fewer than two sources fetch successfully; this does not block completion when at least one source succeeds
 
-Response `200 OK` on completion:
+Response `200 OK` after queueing:
 
 ```json
 {
   "task_id": "uuid",
-  "status": "COMPLETED",
-  "completed": true,
+  "status": "QUEUED",
+  "completed": false,
   "running_mode": "real-search+opensearch+no-LLM",
-  "stages_completed": [
-    "SEARCHING",
-    "ACQUIRING",
-    "PARSING",
-    "INDEXING",
-    "DRAFTING_CLAIMS",
-    "VERIFYING",
-    "REPORTING"
-  ],
+  "stages_completed": [],
   "counts": {
-    "search_queries": 1,
-    "candidate_urls": 3,
-    "fetch_attempts": 3,
-    "content_snapshots": 2,
-    "source_documents": 2,
-    "source_chunks": 4,
-    "indexed_chunks": 4,
-    "claims": 4,
-    "claim_evidence": 4,
-    "report_artifacts": 1
+    "search_queries": 0,
+    "candidate_urls": 0,
+    "fetch_attempts": 0,
+    "content_snapshots": 0,
+    "source_documents": 0,
+    "source_chunks": 0,
+    "indexed_chunks": 0,
+    "claims": 0,
+    "claim_evidence": 0,
+    "report_artifacts": 0
   },
-  "report_artifact_id": "uuid",
-  "report_version": 1,
-  "report_markdown_preview": "# Research Report: ...",
+  "report_artifact_id": null,
+  "report_version": null,
+  "report_markdown_preview": null,
   "failure": null,
   "dependencies": {
     "search_provider": "searxng",
@@ -1366,14 +1444,18 @@ Response `200 OK` on completion:
     "index_mode": "opensearch",
     "llm_mode": "no-LLM",
     "research_planner_enabled": false,
+    "llm_report_writer_enabled": false,
+    "report_writer_mode": "deterministic",
     "llm_provider": "noop",
     "llm_base_url_configured": false,
-    "uses_worker_or_queue": false
+    "uses_worker_or_queue": true
   }
 }
 ```
 
-Response `200 OK` on a handled stage failure:
+Handled stage failures are reported later through task detail/events after the worker updates the task to `FAILED`; the enqueue response itself does not include the future failure object.
+
+Historical debug response shape for synchronous development runs:
 
 ```json
 {
@@ -1472,7 +1554,7 @@ External dependencies:
 - `OPENSEARCH_INDEX_NAME`
 - optional planner-only OpenAI-compatible provider through `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`
 
-No LLM API is used by the deterministic claim drafting, verification, or report-writing slices. Planner output is stored only in task-event payload JSON and task-detail observability summaries; there is no research-plan schema migration.
+No LLM API is used by claim drafting or verification. Report writing remains deterministic unless `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`; in that mode the grounded report writer receives only verified claims and their evidence/citation-span excerpts, and invalid LLM output falls back to deterministic Markdown. Planner output is stored only in task-event payload JSON and task-detail observability summaries; there is no research-plan schema migration.
 
 ## Phase 10 infrastructure-hardening rules
 
@@ -1490,7 +1572,7 @@ No LLM API is used by the deterministic claim drafting, verification, or report-
 
 ## Phase 11 deployment and smoke rules
 
-- Phase 11 adds no new endpoint or response contract; it packages the existing API chain into host-local operational and smoke helpers
+- Phase 11 now adds only the narrow `POST /api/v1/research/tasks/{task_id}/plan` pre-run planning contract; the rest of the work packages the existing API chain into host-local operational and smoke helpers
 - the currently completed functional loop is:
   - `task -> search -> fetch -> parse -> index -> draft -> verify -> report`
 - the recommended operational validation path is host-local Linux with real PostgreSQL, MinIO or filesystem storage, OpenSearch, and a running orchestrator process
@@ -1512,11 +1594,11 @@ No LLM API is used by the deterministic claim drafting, verification, or report-
 
 ## Out of scope in Phase 11
 
-- no worker-triggered execution starts after `resume` or `revise`
+- no distributed worker lease or external queue exists yet
 - no browser or Playwright fetching exists yet
 - no Tika or attachment parsing exists yet
 - no OpenClaw integration
 - no HTML export or PDF export exists yet
-- no multi-round planner or gap-analyzer logic exists yet
+- no LLM-authored gap-analysis logic exists yet; gap queries are deterministic
 - no new verifier semantics beyond the current minimal support / contradict flow
 - no complex retrieval or reranking optimization

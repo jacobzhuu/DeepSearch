@@ -11,6 +11,7 @@ from services.orchestrator.app.api.schemas.reporting import (
     ReportResponse,
 )
 from services.orchestrator.app.db import get_db_session
+from services.orchestrator.app.llm import create_llm_provider
 from services.orchestrator.app.services.reporting import (
     ReportArtifactContentMismatchError,
     ReportArtifactNotFoundError,
@@ -45,10 +46,17 @@ def get_report_synthesis_service(
     object_store: Annotated[SnapshotObjectStore, Depends(get_report_object_store)],
 ) -> ReportSynthesisService:
     settings = get_settings()
+    llm_provider = (
+        create_llm_provider(settings) if _llm_report_writer_configured(settings) else None
+    )
     return create_report_synthesis_service(
         session,
         object_store=object_store,
         report_storage_bucket=settings.report_storage_bucket,
+        llm_provider=llm_provider,
+        llm_model=settings.llm_model,
+        llm_report_writer_enabled=llm_provider is not None,
+        llm_report_max_output_tokens=settings.llm_report_max_output_tokens,
     )
 
 
@@ -78,6 +86,9 @@ def generate_task_report(
         storage_bucket=result.artifact.storage_bucket,
         storage_key=result.artifact.storage_key,
         created_at=result.artifact.created_at,
+        report_language=result.report_language,
+        writer_mode=result.writer_mode,
+        llm_writer_status=result.llm_writer_status,
         supported_claims=result.supported_claims,
         mixed_claims=result.mixed_claims,
         unsupported_claims=result.unsupported_claims,
@@ -117,4 +128,16 @@ def get_task_report(
         storage_key=result.artifact.storage_key,
         created_at=result.artifact.created_at,
         markdown=result.markdown,
+        report_language=result.report_language,
+        writer_mode=result.writer_mode,
+        llm_writer_status=result.llm_writer_status,
+    )
+
+
+def _llm_report_writer_configured(settings: object) -> bool:
+    provider = str(getattr(settings, "llm_provider", "") or "").strip().lower()
+    return bool(
+        getattr(settings, "llm_enabled", False)
+        and getattr(settings, "llm_report_writer_enabled", False)
+        and provider not in {"", "noop"}
     )

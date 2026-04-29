@@ -11,15 +11,19 @@ class PlannedSearchQuery:
     expected_source_type: str
     priority: int
     query_source: str = "planner_query"
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "query_text": self.query_text,
             "rationale": self.rationale,
             "expected_source_type": self.expected_source_type,
             "priority": self.priority,
             "query_source": self.query_source,
         }
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
 
 
 @dataclass(frozen=True)

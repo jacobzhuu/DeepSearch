@@ -7,7 +7,7 @@
 - the current completed functional loop is:
   - `task -> search -> fetch -> parse -> index -> draft -> verify -> report`
 - Docker and compose may stay in the repository as optional tooling, but they are not the primary route or acceptance standard
-- no new product features are being added in this closeout beyond conflict fixes required to keep the current path stable
+- product changes in this closeout are limited to conflict fixes and the narrow pre-run planner workflow needed to keep web testing honest about smoke versus real research mode
 
 ## Recommended runtime path
 
@@ -34,15 +34,19 @@ They are convenience packaging only. They are not the current primary operator p
 The current v1 path supports:
 
 - task creation, mutation, event stream, and revision tracking
-- synchronous search discovery with canonicalized candidate URLs
-- synchronous HTTP acquisition with fetch jobs, attempts, and stored snapshots
-- synchronous parsing for `text/html` and `text/plain`
+- worker-executed search discovery with canonicalized candidate URLs
+- worker-executed HTTP acquisition with fetch jobs, attempts, and stored snapshots
+- worker-executed parsing for `text/html` and `text/plain`
 - task-scoped chunk indexing and retrieval through OpenSearch
 - support-only claim drafting with citation span binding, query-aware deterministic claim scoring, and answer-focused top-K selection
 - minimal claim verification with `support` and `contradict` evidence
 - Markdown report synthesis backed by persisted report artifacts, with low-quality/off-query claim filtering and low answer-coverage warnings
-- shared deterministic source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, and slot-coverage contracts for source selection, diagnostics, verification, and report coverage
-- task-event and task-detail observability for planner guardrails, final search queries, source selection, answer slots, source yield, evidence yield, slot coverage, answer yield, answer coverage, verifier strong/weak support counts, supplemental acquisition, fetch success/failure counts, failed fetch reasons, parse decisions, and actionable failure diagnostics
+- report language selection from task constraints; the web workspace sends `zh-CN` by default
+- optional grounded LLM report writing that receives only verified claim/evidence/citation-span bundles and falls back to deterministic Markdown on invalid output or provider failure
+- shared deterministic source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, slot-coverage, and gap-analysis contracts for source selection, diagnostics, verification, and report coverage
+- task-event and task-detail observability for planner guardrails, final search queries, source selection, answer slots, source yield, evidence yield, slot coverage, gap rounds, answer yield, answer coverage, verifier strong/weak support counts, supplemental acquisition, fetch success/failure counts, failed fetch reasons, parse decisions, and actionable failure diagnostics
+- pre-run research planning from the web workspace: create a `research_task`, generate a bounded plan, optionally edit its JSON, then confirm and queue the worker pipeline
+- visible runtime-mode warnings when `SEARCH_PROVIDER=smoke`, `INDEX_BACKEND=local`, or no LLM planner is active
 - report page HTML rendering plus Raw Markdown, Copy Markdown, and Download `.md` controls
 - JSON logs and basic metrics
 
@@ -51,10 +55,10 @@ The current v1 path supports:
 - OpenClaw
 - HTML export
 - PDF export
-- multi-round planner / gap analyzer
+- LLM-authored planner / gap analyzer
 - complex verifier logic
 - complex retrieval optimization
-- new worker or background execution semantics
+- distributed worker leases or external queue infrastructure
 
 ## Environment variables
 
@@ -92,6 +96,10 @@ The current v1 path supports:
 | `ACQUISITION_TARGET_SUCCESSFUL_SNAPSHOTS` | Target successful snapshots before ordinary acquisition may stop | `2` |
 | `ACQUISITION_MIN_ANSWER_SOURCES` | Minimum answer-source target for planner-enabled overview runs | `3` |
 | `ACQUISITION_MAX_SUPPLEMENTAL_SOURCES` | Max unattempted high-value sources in one supplemental pass | `3` |
+| `RESEARCH_GAP_MAX_ROUNDS` | Max supplemental gap-analysis rounds after verification | `2` |
+| `RESEARCH_GAP_MAX_QUERIES_PER_ROUND` | Max deterministic supplemental queries per gap round | `4` |
+| `RESEARCH_WORKER_POLL_INTERVAL_SECONDS` | Host-local worker idle poll interval | `2` |
+| `RESEARCH_WORKER_BATCH_SIZE` | Queued tasks processed per worker poll | `1` |
 | `ACQUISITION_USER_AGENT` | Acquisition user agent | `deepresearch-orchestrator/0.1` |
 
 ### Object storage
@@ -129,6 +137,7 @@ Development-only note:
 - `SEARCH_PROVIDER=smoke` returns clearly marked synthetic `deepsearch-smoke.local` fixture sources and uses a network-free smoke acquisition client; it is not real search
 - `INDEX_BACKEND=local` uses an in-process deterministic index; it is not durable and is not a replacement for OpenSearch
 - together these report `running_mode=smoke-search+deterministic-local+no-LLM`
+- the web UI now surfaces this as a connectivity-test mode before research starts; do not evaluate product-quality report output from smoke fixtures
 
 ### Claims and report
 
@@ -153,7 +162,7 @@ The pipeline also computes answer-yield metrics per `source_document`, separatin
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `LLM_ENABLED` | Master switch for planner LLM provider construction | `false` |
+| `LLM_ENABLED` | Master switch for LLM provider construction | `false` |
 | `LLM_PROVIDER` | `noop` or OpenAI-compatible aliases: `openai-compatible`, `openai_compatible`, `openai` | `noop` |
 | `LLM_MODEL` | Provider model name | empty |
 | `LLM_API_KEY` | Provider API key from env or `.env`; never log or expose this value | empty |
@@ -161,11 +170,13 @@ The pipeline also computes answer-yield metrics per `source_document`, separatin
 | `LLM_TIMEOUT_SECONDS` | LLM HTTP timeout | `30` |
 | `LLM_MAX_RETRIES` | Retry count for retryable LLM provider errors | `1` |
 | `LLM_MAX_OUTPUT_TOKENS` | Planner response token cap | `1200` |
+| `LLM_REPORT_WRITER_ENABLED` | Enable grounded LLM report writer for final Markdown synthesis | `false` |
+| `LLM_REPORT_MAX_OUTPUT_TOKENS` | Grounded report-writer response token cap | `2400` |
 | `RESEARCH_PLANNER_ENABLED` | Run planner before search when `LLM_ENABLED=true` | `false` |
 | `RESEARCH_PLANNER_MAX_SUBQUESTIONS` | Planner subquestion cap | `5` |
 | `RESEARCH_PLANNER_MAX_SEARCH_QUERIES` | Planner search-query cap | `8` |
 
-The planner is disabled by default. When enabled, it emits `research_plan.created` before `SEARCHING` and lets search discovery use capped, deduped planner queries plus the original query. If planner generation fails, it emits `research_plan.failed`, falls back to the original query, and continues the deterministic pipeline.
+The planner is disabled by default. The web workspace can still create a deterministic fallback plan through `POST /api/v1/research/tasks/{task_id}/plan`; this is useful for reviewing search intent but is not an LLM-generated plan. When LLM planning is enabled, the same endpoint uses the configured provider. Both generated and operator-edited plans emit `research_plan.created` before `SEARCHING`, and the pipeline reuses the latest current-revision plan instead of generating a hidden duplicate. If planner generation fails inside the pipeline, it emits `research_plan.failed`, falls back to the original query, and continues the deterministic pipeline.
 
 For definition and overview queries such as `What is SearXNG and how does it work?`,
 planner output is post-processed as a bounded suggestion. Wikipedia cannot be treated as a
@@ -177,7 +188,7 @@ deterministic known-path candidates for `https://docs.searxng.org/user/about.htm
 Source selection prioritizes official about/reference pages over admin architecture,
 installation, API, or developer pages unless the user explicitly asks about those topics.
 
-The planner never writes claims or final reports. Claim drafting, evidence binding, verification, and Markdown report synthesis remain deterministic and source-backed.
+The planner never writes claims. Claim drafting, evidence binding, and verification remain deterministic and source-backed. Markdown report synthesis is deterministic by default; when `LLM_REPORT_WRITER_ENABLED=true`, the grounded report writer may write report prose but receives only verified claims, claim-evidence ids, and citation-span excerpts. Rendered LLM items are dropped unless their claim/evidence/citation ids validate against the prepared report bundle, and failures fall back to deterministic Markdown.
 
 Noop planner validation:
 
@@ -201,6 +212,31 @@ LLM_API_KEY=sk-...
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-chat
 RESEARCH_PLANNER_ENABLED=true
+```
+
+Grounded report-writer configuration uses the same provider, but is controlled independently:
+
+```bash
+LLM_ENABLED=true
+LLM_PROVIDER=openai_compatible
+LLM_API_KEY=sk-...
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+LLM_REPORT_WRITER_ENABLED=true
+LLM_REPORT_MAX_OUTPUT_TOKENS=2400
+```
+
+To generate Chinese reports from API tooling, send either top-level `report_language` or a
+task constraint:
+
+```json
+{
+  "query": "How to deploy SearXNG with Docker?",
+  "report_language": "zh-CN",
+  "constraints": {
+    "language": "zh-CN"
+  }
+}
 ```
 
 DeepSeek planner smoke test:
@@ -250,7 +286,14 @@ PYTHONPATH=. uvicorn services.orchestrator.app.main:app --host 0.0.0.0 --port 80
 ' > /share/zhuzy/projects/DeepSearch/orchestrator.log 2>&1 &
 ```
 
-3. Create a task and run it:
+3. Start the host-local worker in a second shell:
+
+```bash
+cd /share/zhuzy/projects/DeepSearch
+PYTHONPATH=. python scripts/research_worker.py
+```
+
+4. Create a task and queue it:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/api/v1/research/tasks \
@@ -264,7 +307,9 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/research/tasks/$TASK_ID/run \
   | python3 -m json.tool
 ```
 
-4. Check planner events:
+The run response returns `status = "QUEUED"`. The worker advances the task through runtime stages.
+
+5. Poll events:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/research/tasks/$TASK_ID/events \
@@ -272,7 +317,7 @@ curl -s http://127.0.0.1:8000/api/v1/research/tasks/$TASK_ID/events \
   | grep -E "research_plan|planner|subquestions|search_queries" -n
 ```
 
-5. Check the deterministic report:
+6. Check the report after the task reaches `COMPLETED`:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/research/tasks/$TASK_ID/report \
@@ -289,12 +334,13 @@ python scripts/smoke_planner_pipeline.py \
   --base-url http://127.0.0.1:8000
 ```
 
-The helper reads `.env`, creates a task, runs `POST /api/v1/research/tasks/<task_id>/run`,
-and prints task id, status, running mode, planner status, final search queries, attempted
-sources, source documents, chunk count, claims by category, report preview, and failure
-details. It never prints API keys. Exit code `0` means the pipeline completed with at least
-three claims and a report; `1` means the pipeline failed or produced an insufficient report;
-`2` means the service or configuration is unavailable.
+The helper reads `.env`, creates a task, queues `POST /api/v1/research/tasks/<task_id>/run`,
+and polls task status/events until the worker completes or fails. It prints task id, status,
+running mode, planner status, final search queries, attempted sources, source documents,
+chunk count, claims by category, report preview, and failure details. It never prints API
+keys. Exit code `0` means the pipeline completed with at least three claims and a report;
+`1` means the pipeline failed or produced an insufficient report; `2` means the service,
+worker, or configuration is unavailable.
 
 Generalization benchmark query list:
 
@@ -314,16 +360,18 @@ python scripts/benchmark_queries.py \
 The benchmark uses ten representative queries covering SearXNG, OpenSearch, LangGraph, MCP,
 Dify, privacy limitations, Docker deployment, vendor comparison, RAG limitations, and current
 Deep Research product comparison. It is a regression harness for source-intent, answer-slot,
-source-yield, evidence-yield, verifier, and report-structure generalization, not a golden-output
-text comparison. With `--run --json`, each row includes slot coverage, source yield, evidence
-yield, verification summary, and a non-SearXNG contamination check.
+source-yield, evidence-yield, verifier, gap-round recovery, and report-structure generalization,
+not a golden-output text comparison. With `--run --json`, each task is queued through `/run`,
+then polled until it leaves `QUEUED`/runtime statuses or `--wait-seconds` expires. Each row
+includes slot coverage, source yield, evidence yield, verification summary, and a non-SearXNG
+contamination check.
 
 Useful benchmark narrowing options:
 
 ```bash
 python scripts/benchmark_queries.py --json --limit 2
 python scripts/benchmark_queries.py --json --query-id 3
-python scripts/benchmark_queries.py --run --limit 2 --output /tmp/deepsearch-benchmark.json
+python scripts/benchmark_queries.py --run --limit 2 --wait-seconds 420 --output /tmp/deepsearch-benchmark.json
 ```
 
 Before trusting the default `http://127.0.0.1:8000` service, check that it is the current
@@ -532,7 +580,7 @@ curl -fsS -X POST \
   http://127.0.0.1:8000/api/v1/research/tasks/<task_id>/debug/run-real-pipeline
 ```
 
-This endpoint is available only when `APP_ENV=development`. It reuses the real search, fetch, parse, index, claim, verification, and Markdown report services. It does not mock external search, does not call an LLM, and does not generate a fake report.
+This endpoint is available only when `APP_ENV=development`. It reuses the real search, fetch, parse, index, claim, verification, and Markdown report services. It does not mock external search or generate a fake report. It calls an LLM only when planner or grounded report-writer flags are explicitly enabled.
 
 Required live dependencies:
 
@@ -541,11 +589,11 @@ Required live dependencies:
 - snapshot/report storage must be configured
 - `OPENSEARCH_BASE_URL` and `OPENSEARCH_INDEX_NAME` must point at a reachable OpenSearch backend
 
-On failure the response includes `stage`, `reason`, `exception`, `message`, `next_action`, and counts of any intermediate ledger rows already produced. The product `/run` endpoint also moves the task to `FAILED` for inspection.
+On failure the response includes `stage`, `reason`, `exception`, `message`, `next_action`, and counts of any intermediate ledger rows already produced. The product `/run` endpoint only queues work; worker failures are visible later on the task detail/events APIs.
 
-### 12. Frontend-triggered full run
+### 12. Worker-triggered full run
 
-The frontend now calls the product run endpoint:
+The frontend now calls the product run endpoint to enqueue work:
 
 ```bash
 POST /api/v1/research/tasks/<task_id>/run
@@ -556,8 +604,9 @@ From the web UI:
 1. open `/tasks/new`
 2. enter a research query
 3. click `Create And Run DeepSearch`
-4. on success the UI navigates to the report page
-5. on failure the task detail page shows `failed_stage`, `reason`, `message`, `next_action`, stage events, and intermediate counts
+4. the UI navigates to task detail and polls progress/events while the worker runs
+5. on completion the report page is available
+6. on failure the task detail page shows `stage`, `reason`, `message`, `next_action`, stage events, and intermediate counts
 
 Real-search mode requires:
 
@@ -568,6 +617,7 @@ INDEX_BACKEND=opensearch
 OPENSEARCH_BASE_URL=http://127.0.0.1:9200
 python3 scripts/init_index.py
 python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 8000
+PYTHONPATH=. python scripts/research_worker.py
 ```
 
 If `SEARXNG_BASE_URL=http://127.0.0.1:8080` returns frontend HTML, it is misconfigured. Point it at a SearXNG-compatible `/search?format=json` endpoint, or use explicit smoke mode for development validation.
@@ -600,7 +650,7 @@ INDEX_BACKEND=local \
 python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-This mode still performs real HTTP acquisition of `https://example.com/`, real parsing, real ledger persistence, deterministic local indexing, deterministic claim/evidence generation, and Markdown report generation. It does not perform real web search, does not use OpenSearch, and does not call an LLM.
+This mode still performs real HTTP acquisition of `https://example.com/`, real parsing, real ledger persistence, deterministic local indexing, deterministic claim/evidence generation, and Markdown report generation. It does not perform real web search, does not use OpenSearch, and does not call an LLM unless planner or grounded report-writer flags are explicitly enabled.
 
 ## Host-local validation commands
 

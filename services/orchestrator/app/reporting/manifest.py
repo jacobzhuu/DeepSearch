@@ -25,6 +25,8 @@ def build_report_manifest(
     revision_no: int,
     query: str,
     report_title: str,
+    report_language: str,
+    report_writer: dict[str, Any],
     claims: list[ReportClaimItem],
     sources: list[ReportSourceItem],
     slot_coverage_summary: list[dict[str, Any]] | None = None,
@@ -42,6 +44,8 @@ def build_report_manifest(
         "revision_no": revision_no,
         "query": query,
         "report_title": report_title,
+        "report_language": report_language,
+        "report_writer": report_writer,
         "answer_slot_coverage": answer_slot_coverage(
             query,
             {

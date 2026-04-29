@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -13,6 +14,18 @@ from typing import Any
 DEFAULT_QUERY = "What is SearXNG and how does it work?"
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 REQUEST_TIMEOUT_SECONDS = 20
+ACTIVE_STATUSES = {
+    "QUEUED",
+    "RUNNING",
+    "SEARCHING",
+    "ACQUIRING",
+    "PARSING",
+    "INDEXING",
+    "DRAFTING_CLAIMS",
+    "VERIFYING",
+    "RESEARCHING_MORE",
+    "REPORTING",
+}
 
 
 class ServiceUnavailable(RuntimeError):
@@ -70,7 +83,7 @@ def main() -> int:
                 payload=run_payload,
             )
 
-        detail = get_optional(base_url, f"/api/v1/research/tasks/{task_id}")
+        detail = wait_for_task(base_url, task_id, timeout_seconds=args.wait_seconds)
         events = get_optional(base_url, f"/api/v1/research/tasks/{task_id}/events")
         search_queries = get_optional(base_url, f"/api/v1/research/tasks/{task_id}/search-queries")
         candidate_urls = get_optional(base_url, f"/api/v1/research/tasks/{task_id}/candidate-urls")
@@ -97,7 +110,7 @@ def main() -> int:
 
         claim_count = len(as_list(claims.get("claims") if isinstance(claims, dict) else []))
         report_markdown = report.get("markdown") if isinstance(report, dict) else None
-        if run_payload.get("completed") is True and claim_count >= 3 and report_markdown:
+        if detail.get("status") == "COMPLETED" and claim_count >= 3 and report_markdown:
             return 0
         return 1
     except ServiceUnavailable as error:
@@ -125,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("DEEPSEARCH_BASE_URL")
         or os.environ.get("API_BASE_URL")
         or DEFAULT_BASE_URL,
+    )
+    parser.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=float(os.environ.get("DEEPSEARCH_SMOKE_WAIT_SECONDS", "180")),
+        help="How long to poll the queued worker task before collecting ledger details.",
     )
     return parser.parse_args()
 
@@ -173,6 +192,15 @@ def get_optional(base_url: str, path: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def wait_for_task(base_url: str, task_id: str, *, timeout_seconds: float) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    detail = get_optional(base_url, f"/api/v1/research/tasks/{task_id}")
+    while detail.get("status") in ACTIVE_STATUSES and time.monotonic() < deadline:
+        time.sleep(2.0)
+        detail = get_optional(base_url, f"/api/v1/research/tasks/{task_id}")
+    return detail
+
+
 def decode_json(data: bytes) -> Any:
     if not data:
         return {}
@@ -199,7 +227,8 @@ def print_summary(
         detail.get("progress", {}).get("observability", {}) if isinstance(detail, dict) else {}
     )
     print(f"task_id: {task_id}")
-    print(f"status: {run_payload.get('status')}")
+    display_status = detail.get("status") or run_payload.get("status")
+    print(f"status: {display_status}")
     print(f"running_mode: {run_payload.get('running_mode')}")
     print(f"planner_status: {observability.get('planner_status') or 'n/a'}")
     print(f"planner_mode: {observability.get('planner_mode') or 'n/a'}")
@@ -243,15 +272,26 @@ def print_summary(
     else:
         print("report_preview: n/a")
 
-    failure = run_payload.get("failure")
+    failure = run_payload.get("failure") or latest_failure_from_events(events)
     if failure:
         print("failure_details:")
         print_json(failure)
-    elif run_payload.get("completed") is not True:
+    elif display_status != "COMPLETED":
         print("failure_details: pipeline did not complete")
 
     event_types = [item.get("event_type") for item in as_list(events.get("events"))]
     print_list("events", event_types, limit=12)
+
+
+def latest_failure_from_events(events: dict[str, Any]) -> dict[str, Any] | None:
+    for event in reversed(as_list(events.get("events"))):
+        if not isinstance(event, dict):
+            continue
+        if event.get("event_type") not in {"pipeline.failed", "debug.pipeline.failed"}:
+            continue
+        payload = event.get("payload")
+        return payload if isinstance(payload, dict) else None
+    return None
 
 
 def print_claims_by_category(claims_payload: dict[str, Any]) -> None:

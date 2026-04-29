@@ -3,11 +3,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+ACTIVE_STATUSES = {
+    "QUEUED",
+    "RUNNING",
+    "SEARCHING",
+    "ACQUIRING",
+    "PARSING",
+    "INDEXING",
+    "DRAFTING_CLAIMS",
+    "VERIFYING",
+    "RESEARCHING_MORE",
+    "REPORTING",
+}
 
 
 @dataclass(frozen=True)
@@ -119,6 +133,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--only", type=int, dest="query_id")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=300.0,
+        help="How long to poll each queued worker task before collecting diagnostics.",
+    )
     return parser.parse_args()
 
 
@@ -140,6 +160,7 @@ def main() -> int:
         base_url=args.base_url,
         queries=selected,
         timeout_seconds=args.timeout_seconds,
+        wait_seconds=args.wait_seconds,
     )
     payload = {
         "mode": "run",
@@ -167,6 +188,7 @@ def _run_benchmark(
     base_url: str,
     queries: tuple[BenchmarkQuery, ...],
     timeout_seconds: float,
+    wait_seconds: float,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with httpx.Client(
@@ -183,15 +205,15 @@ def _run_benchmark(
             )
             task_id = _required_str(task, "task_id")
             run = _request_json(client, "POST", f"/api/v1/research/tasks/{task_id}/run")
-            detail = _request_json(client, "GET", f"/api/v1/research/tasks/{task_id}")
-            completed = bool(run.get("completed"))
+            detail = _wait_for_task(client, task_id, wait_seconds=wait_seconds)
+            completed = detail.get("status") == "COMPLETED"
             observability = _observability_from_detail(detail)
             rows.append(
                 {
                     **benchmark.to_payload(),
                     "task_id": task_id,
                     "completed": completed,
-                    "status": run.get("status"),
+                    "status": detail.get("status") or run.get("status"),
                     "running_mode": run.get("running_mode"),
                     "counts": run.get("counts"),
                     "failure": run.get("failure"),
@@ -214,6 +236,20 @@ def _run_benchmark(
                 }
             )
     return rows
+
+
+def _wait_for_task(
+    client: httpx.Client,
+    task_id: str,
+    *,
+    wait_seconds: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    detail = _request_json(client, "GET", f"/api/v1/research/tasks/{task_id}")
+    while detail.get("status") in ACTIVE_STATUSES and time.monotonic() < deadline:
+        time.sleep(2.0)
+        detail = _request_json(client, "GET", f"/api/v1/research/tasks/{task_id}")
+    return detail
 
 
 def _request_json(

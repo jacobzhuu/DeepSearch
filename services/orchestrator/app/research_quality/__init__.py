@@ -22,6 +22,11 @@ from services.orchestrator.app.research_quality.evidence import (
     slot_ids_for_candidate_category,
     summarize_evidence_yield,
 )
+from services.orchestrator.app.research_quality.gap_analyzer import (
+    GapAnalysisResult,
+    SupplementalSearchQuery,
+    analyze_required_slot_gaps,
+)
 from services.orchestrator.app.research_quality.source_intent import (
     SourceIntentClassification,
     classify_source_intent,
@@ -36,10 +41,13 @@ __all__ = [
     "EVIDENCE_LINEAGE_FIELDS",
     "EvidenceCandidate",
     "EvidenceYieldSummary",
+    "GapAnalysisResult",
     "QUALITY_DIAGNOSTIC_FIELDS",
     "SlotCoverageSummary",
     "SourceIntentClassification",
     "SourceYieldSummary",
+    "SupplementalSearchQuery",
+    "analyze_required_slot_gaps",
     "answer_slot_coverage",
     "answer_slots_for_query",
     "build_slot_coverage_summary",

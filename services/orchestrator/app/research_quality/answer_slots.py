@@ -53,7 +53,11 @@ def answer_slots_for_query(query: str | None) -> list[AnswerSlot]:
                 "Deployment steps",
                 ("deployment/self_hosting", "feature"),
             ),
-            AnswerSlot("deployment_configuration", "Configuration", ("feature", "mechanism")),
+            AnswerSlot(
+                "deployment_configuration",
+                "Configuration",
+                ("deployment/self_hosting", "feature", "mechanism"),
+            ),
             AnswerSlot(
                 "deployment_limitations",
                 "Operational limitations",

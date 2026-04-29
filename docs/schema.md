@@ -22,13 +22,16 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 
 - Phase 11 adds no new relational fields, tables, or indexes
 - Research Planner v1 stores its output in existing `task_event.payload_json` rows with event types `research_plan.created` and `research_plan.failed`; no `research_plan` table or migration exists
-- planner guardrail, source-selection, answer-slot coverage, source-yield, evidence-yield, dropped-source, verifier-detail, supplemental-acquisition, and failure-diagnostic fields are stored in existing `task_event.payload_json`, `claim.notes_json`, `report_artifact.manifest_json`, and API observability payloads; no new planner, source-quality, answer-slot, evidence-candidate, or acquisition-retry table exists
+- pre-run planner confirmation also uses `research_plan.created` with `stage = "PLANNING"` while leaving `research_task.status = PLANNED`; the latest matching plan event for the current `revision_no` is reused by the worker pipeline instead of creating a hidden duplicate plan
+- product run queueing uses existing `research_task.status = QUEUED`; the host-local worker writes runtime progress to existing `task_event` rows and `research_run.checkpoint_json`
+- planner guardrail, source-selection, answer-slot coverage, source-yield, evidence-yield, dropped-source, verifier-detail, supplemental-acquisition, gap-analysis, and failure-diagnostic fields are stored in existing `task_event.payload_json`, `search_query.raw_response_json`, `candidate_url.metadata_json`, `claim.notes_json`, `research_run.checkpoint_json`, `report_artifact.manifest_json`, and API observability payloads; gap supplemental query metadata such as `query_source = "gap_analyzer"`, `gap_round_no`, and `slot_ids` stays in existing search metadata; no new planner, source-quality, answer-slot, evidence-candidate, gap-analyzer, worker-queue, or acquisition-retry table exists
 - query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `answer_role`, `answer_relevant`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`
 - claim drafting now also stores code-contract lineage fields in `claim.notes_json`, including `slot_ids`, `source_document_id`, `source_chunk_id`, `citation_span_id`, `claim_evidence_id`, `source_intent`, `evidence_candidate_id`, `evidence_quality_score`, `evidence_salience_score`, `evidence_rejection_reasons`, and a serialized `evidence_candidate` payload
 - verification stores deterministic lexical verifier metadata in `claim.notes_json["verification"]`, including `verifier_method`, strong and weak support counts, contradiction counts, insufficient-evidence count, relation details, shallow-overlap flags, numeric/date mismatch flags, and scope-mismatch flags
+- report language and optional grounded LLM writer provenance are stored in existing `report_artifact.manifest_json` keys: `report_language`, `report_writer.mode`, `report_writer.status`, and sanitized provider/model/usage/error metadata when the LLM writer is attempted
 - host-local operational closeout, optional compose wiring, init scripts, and smoke validation all reuse the existing Phase 10 schema as-is
-- `services/orchestrator/app/research_quality/` provides the current code-level source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, and slot-coverage contracts; these are not relational schema entities yet
-- the stable code-level diagnostics field names are `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, `evidence_yield_summary`, `slot_coverage_summary`, and `verification_summary`; older rows that lack these fields are interpreted as empty summaries rather than requiring a data migration
+- `services/orchestrator/app/research_quality/` provides the current code-level source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, slot-coverage, and gap-analysis contracts; these are not relational schema entities yet
+- the stable code-level diagnostics field names are `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, `evidence_yield_summary`, `slot_coverage_summary`, `gap_analysis`, `gap_rounds`, and `verification_summary`; older rows that lack these fields are interpreted as empty summaries rather than requiring a data migration
 - the latest relational schema change remains `20260424_0005_report_artifact_manifest_and_hash`
 - the current functional ledger loop is complete through:
   - `research_task -> search_query -> candidate_url -> fetch_job/fetch_attempt -> content_snapshot -> source_document/source_chunk -> claim/citation_span/claim_evidence -> report_artifact`
@@ -81,10 +84,18 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 
 ## Phase 2 task-event usage
 
-- Phase 2 still uses the writable `research_task` status subset `PLANNED`, `PAUSED`, and `CANCELLED`
-- the schema and code now reserve these later runtime-facing statuses for future phases:
+- Phase 2 still creates tasks in `PLANNED`; pause/cancel remain stable lifecycle commands
+- the product runner now uses these runtime-facing statuses:
   - `QUEUED`
   - `RUNNING`
+  - `SEARCHING`
+  - `ACQUIRING`
+  - `PARSING`
+  - `INDEXING`
+  - `DRAFTING_CLAIMS`
+  - `VERIFYING`
+  - `RESEARCHING_MORE`
+  - `REPORTING`
   - `FAILED`
   - `COMPLETED`
   - `NEEDS_REVISION`
@@ -102,17 +113,8 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `from_status`
   - `to_status`
   - `changes`
-- the product pipeline run endpoint now uses the already-reserved runtime statuses for synchronous execution progress:
-  - `RUNNING`
-  - `SEARCHING`
-  - `ACQUIRING`
-  - `PARSING`
-  - `INDEXING`
-  - `DRAFTING_CLAIMS`
-  - `VERIFYING`
-  - `REPORTING`
-  - `COMPLETED`
-  - `FAILED`
+- `POST /api/v1/research/tasks/{task_id}/run` only transitions `PLANNED -> QUEUED`; the worker owns `QUEUED -> RUNNING -> stage statuses -> COMPLETED/FAILED`
+- `resume` transitions `PAUSED -> QUEUED`, preserving the existing checkpoint and letting the worker continue at a stage boundary
 
 ## Phase 3 search-discovery usage
 
@@ -289,13 +291,19 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 - report generation reuses the existing filesystem-backed object-store abstraction from earlier phases
   - current artifacts are stored under the configured report bucket, which defaults to `reports`
   - current artifact keys use the stable shape `<task_id>/v<version>/report.md`
-- the current report content is evidence-first and deterministic:
+- the current report content is evidence-first and deterministic by default:
+  - the deterministic renderer localizes report headings and template text from `constraints.report_language` or `constraints.language`
   - supported claims appear as settled conclusions
   - mixed and unsupported claims are rendered only with explicit status labels and uncertainty sections
   - no new claims, verification decisions, or retrieval operations are introduced during report generation
   - low-quality or off-query supported claims are filtered using persisted or recomputed claim-quality and query-answer scores before they can appear in the Executive Summary, Answer sections, Evidence Table, or claim evidence mapping
   - definition/mechanism reports also apply an answer-category gate so supported `other`, setup, community, slogan, reference, or navigation claims do not appear as conclusions by status alone
   - the rendered Source Scope and Limitations section reports answer-relevant included claims and excluded low-quality/off-query claims
+- when explicitly enabled, the grounded LLM report writer uses the same prepared report claim/evidence bundle:
+  - it receives only verified claim rows and their evidence/citation-span excerpts
+  - it returns structured JSON with claim/evidence/citation ids
+  - ungrounded or invalid ids are rejected before Markdown rendering
+  - failures fall back to the deterministic renderer
 - repeated report generation is currently guarded by byte-for-byte reuse of the latest stored Markdown artifact
   - if the newly rendered Markdown matches the latest stored artifact bytes, no new `report_artifact` row is created
   - otherwise a new Markdown artifact version is created for the task
@@ -327,6 +335,8 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `revision_no`
   - `query`
   - `report_title`
+  - `report_language`
+  - `report_writer`
   - `claim_counts`
   - `answer_slot_coverage`
   - `claim_snapshot`
@@ -347,7 +357,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 
 - `research_plan`, `attachment`, and `domain_policy`
 - many-to-many provenance between one canonical URL and every query that surfaced it, likely via a `search_query_candidate_url` style association table
-- browser fallback, fetch scheduling, retries, and queue execution
+- browser fallback, distributed queue leases, fetch scheduling, and retries
 - parse-history-aware `source_document` versioning
 - multi-span claim synthesis, richer contradiction reasoning, and richer report-generation behavior
 - Tika parsing, embeddings, and advanced retrieval behavior

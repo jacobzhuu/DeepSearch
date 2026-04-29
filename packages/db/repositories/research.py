@@ -21,6 +21,22 @@ class ResearchTaskRepository(SQLAlchemyRepository[ResearchTask]):
         )
         return list(self.session.scalars(statement))
 
+    def list_by_statuses(
+        self,
+        statuses: tuple[str, ...],
+        *,
+        limit: int | None = None,
+        oldest_first: bool = False,
+    ) -> list[ResearchTask]:
+        statement = select(ResearchTask).where(ResearchTask.status.in_(statuses))
+        if oldest_first:
+            statement = statement.order_by(ResearchTask.created_at.asc())
+        else:
+            statement = statement.order_by(ResearchTask.created_at.desc())
+        if limit is not None:
+            statement = statement.limit(limit)
+        return list(self.session.scalars(statement))
+
     def set_status(
         self,
         task: ResearchTask,

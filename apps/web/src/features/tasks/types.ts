@@ -3,6 +3,7 @@ import { TaskConstraints } from '../../types/api';
 export interface CreateTaskRequest {
   query: string;
   constraints?: TaskConstraints;
+  report_language?: string;
 }
 
 export interface CreateTaskResponse {
@@ -12,10 +13,15 @@ export interface CreateTaskResponse {
   updated_at: string;
 }
 
+export interface PlanTaskRequest {
+  research_plan?: Record<string, any>;
+}
+
 export type {
   PipelineCounts,
   PipelineFailure,
   PipelineRunResponse,
+  ResearchPlanResponse,
   ResearchTask,
   TaskEvent,
   TaskEventListResponse,

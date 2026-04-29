@@ -111,13 +111,22 @@ _FEATURE_TERMS = (
     "engines",
 )
 _DEPLOYMENT_TERMS = (
+    "container",
+    "containers",
+    "docker",
     "self-hosted",
     "self hosted",
     "self host",
     "selfhost",
     "deploy",
+    "deploying",
     "deployed as",
+    "deployment",
     "host your own",
+    "mounting",
+    "persistent storage",
+    "reverse-proxy",
+    "reverse proxy",
 )
 _SETUP_TERMS = (
     "add your instance",
@@ -208,6 +217,9 @@ _SETUP_ALLOWED_QUERY_TERMS = {
     "browser",
     "configure",
     "default",
+    "deploy",
+    "deployment",
+    "docker",
     "install",
     "opensearch",
     "setup",
@@ -335,11 +347,23 @@ def classify_query_intent(query: str | None) -> QueryIntent:
             "deployment",
             "host",
             "hosting",
+            "docker",
+            "container",
             "self",
             "selfhost",
             "selfhosting",
         }
     )
+
+    if subject_terms and deployment_relevant:
+        return QueryIntent(
+            intent_name="deployment",
+            expected_claim_types=("deployment/self_hosting", "feature", "mechanism", "privacy"),
+            avoid_claim_types=("community", "slogan", "reference", "navigation"),
+            subject_terms=subject_terms,
+            setup_allowed=True,
+            contribution_allowed=contribution_allowed,
+        )
 
     if (
         subject_terms
@@ -456,12 +480,12 @@ def classify_claim_category(statement: str, *, intent: QueryIntent | None = None
         return "navigation"
     if _contains_any(lower, _COMMUNITY_TERMS):
         return "community"
-    if _IMPERATIVE_PREFIX_PATTERN.search(normalized) or _contains_any(lower, _SETUP_TERMS):
-        return "setup"
     if any(pattern in padded for pattern in _DEFINITION_PATTERNS):
         return "definition"
-    if any(term in lower for term in _DEPLOYMENT_TERMS):
+    if _is_deployment_statement(lower, intent=intent):
         return "deployment/self_hosting"
+    if _IMPERATIVE_PREFIX_PATTERN.search(normalized) or _contains_any(lower, _SETUP_TERMS):
+        return "setup"
     if any(term in lower for term in _PRIVACY_TERMS):
         return "privacy"
     if ("supports" in lower or "supported" in lower) and any(
@@ -479,6 +503,30 @@ def classify_claim_category(statement: str, *, intent: QueryIntent | None = None
 
 def candidate_category_sort_key(category: str) -> int:
     return _CATEGORY_PRIORITY.get(category, 99)
+
+
+def _is_deployment_statement(lower_statement: str, *, intent: QueryIntent) -> bool:
+    if any(term in lower_statement for term in _DEPLOYMENT_TERMS):
+        return True
+    if intent.intent_name != "deployment":
+        return False
+    return any(
+        term in lower_statement
+        for term in (
+            "base url",
+            "base urls",
+            "configuration",
+            "configure",
+            "health check",
+            "health checks",
+            "mount",
+            "network",
+            "persistent",
+            "secret",
+            "secrets",
+            "storage",
+        )
+    )
 
 
 def is_overview_answer_intent(intent: QueryIntent) -> bool:

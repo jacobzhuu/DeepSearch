@@ -152,6 +152,64 @@ def build_basic_research_plan(
     planner_mode: str,
 ) -> ResearchPlan:
     subject = _subject_from_query(query)
+    if _is_deployment_query(query):
+        subquestions = [
+            f"What is the deployment target for {subject}?",
+            f"What Docker or container steps are needed to deploy {subject}?",
+            f"What configuration, secrets, storage, and network settings does {subject} need?",
+            f"What operational limitations or caveats apply to a {subject} deployment?",
+        ][:max_subquestions]
+        search_queries = [
+            PlannedSearchQuery(
+                query_text=f"{subject} Docker deployment official documentation",
+                rationale="Find official Docker deployment guidance.",
+                expected_source_type="official_installation_admin",
+                priority=1,
+                query_source="planner_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"{subject} docker compose installation configuration settings",
+                rationale="Find required container configuration and setup steps.",
+                expected_source_type="official_docs",
+                priority=2,
+                query_source="planner_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"{subject} deployment environment variables secrets reverse proxy",
+                rationale="Find operational configuration and exposure requirements.",
+                expected_source_type="official_docs",
+                priority=3,
+                query_source="planner_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"{subject} Docker deployment limitations troubleshooting",
+                rationale="Find caveats and common deployment failure modes.",
+                expected_source_type="reference",
+                priority=4,
+                query_source="planner_query",
+            ),
+        ][:max_search_queries]
+        return ResearchPlan(
+            intent="deployment",
+            normalized_question=query,
+            subquestions=subquestions,
+            search_queries=search_queries,
+            source_preferences=_default_source_preferences(),
+            answer_outline=[
+                "Deployment target",
+                "Deployment steps",
+                "Configuration",
+                "Operational limitations",
+            ],
+            risk_notes=[
+                "Prefer official installation and operations documentation.",
+                "Treat secrets, public exposure, storage, and reverse-proxy settings as operational risk areas.",
+            ],
+            planner_mode=planner_mode,
+            warnings=[],
+            answer_slots=[slot.to_payload() for slot in answer_slots_for_query(query)],
+        )
+
     subquestions = [
         f"What is {subject}?",
         f"How does {subject} work?",
@@ -193,18 +251,7 @@ def build_basic_research_plan(
         normalized_question=query,
         subquestions=subquestions,
         search_queries=search_queries,
-        source_preferences={
-            "preferred_domains": [],
-            "avoid_domains": [
-                "reddit.com",
-                "youtube.com",
-                "facebook.com",
-                "x.com",
-                "twitter.com",
-                "tiktok.com",
-            ],
-            "freshness_required": False,
-        },
+        source_preferences=_default_source_preferences(),
         answer_outline=[
             "Definition",
             "How it works",
@@ -215,6 +262,78 @@ def build_basic_research_plan(
         planner_mode=planner_mode,
         warnings=[],
         answer_slots=[slot.to_payload() for slot in answer_slots_for_query(query)],
+    )
+
+
+def build_default_research_plan(
+    query: str,
+    *,
+    max_subquestions: int,
+    max_search_queries: int,
+    planner_mode: str = "deterministic",
+) -> ResearchPlan:
+    plan = build_basic_research_plan(
+        query,
+        max_subquestions=max_subquestions,
+        max_search_queries=max_search_queries,
+        planner_mode=planner_mode,
+    )
+    return _apply_research_plan_guardrails(
+        plan,
+        query=query,
+        max_search_queries=max_search_queries,
+    )
+
+
+def build_research_plan_from_payload(
+    payload: dict[str, Any],
+    *,
+    query: str,
+    planner_mode: str,
+    max_subquestions: int,
+    max_search_queries: int,
+) -> ResearchPlan:
+    return _plan_from_payload(
+        payload,
+        query=query,
+        planner_mode=planner_mode,
+        max_subquestions=max_subquestions,
+        max_search_queries=max_search_queries,
+    )
+
+
+def research_plan_from_serialized_payload(payload: dict[str, Any]) -> ResearchPlan | None:
+    search_queries = _planned_search_queries(payload.get("search_queries"))
+    if not search_queries:
+        return None
+    intent = _string_value(payload.get("intent"), default="general")
+    normalized_question = _string_value(
+        payload.get("normalized_question"),
+        default="Research question",
+    )
+    planner_mode = _string_value(payload.get("planner_mode"), default="event")
+    source_preferences = payload.get("source_preferences")
+    if not isinstance(source_preferences, dict):
+        source_preferences = {}
+    return ResearchPlan(
+        intent=intent,
+        normalized_question=normalized_question,
+        subquestions=_string_list(payload.get("subquestions")),
+        search_queries=search_queries,
+        source_preferences=dict(source_preferences),
+        answer_outline=_string_list(payload.get("answer_outline")),
+        risk_notes=_string_list(payload.get("risk_notes")),
+        planner_mode=planner_mode,
+        warnings=_string_list(payload.get("warnings")),
+        answer_slots=_object_list(payload.get("answer_slots")),
+        raw_planner_queries=_object_list(payload.get("raw_planner_queries")),
+        final_search_queries=_object_list(payload.get("final_search_queries")),
+        dropped_or_downweighted_planner_queries=_object_list(
+            payload.get("dropped_or_downweighted_planner_queries")
+        ),
+        planner_guardrail_warnings=_string_list(payload.get("planner_guardrail_warnings")),
+        intent_classification=_optional_string(payload.get("intent_classification")),
+        extracted_entity=_optional_string(payload.get("extracted_entity")),
     )
 
 
@@ -345,6 +464,7 @@ def _apply_research_plan_guardrails(
 ) -> ResearchPlan:
     intent_classification = _classify_research_intent(query=query, intent=plan.intent)
     overview_query = intent_classification == "overview_definition_intent"
+    deployment_query = intent_classification == "deployment_intent"
     extracted_entity = _extract_entity_from_overview_query(query) if overview_query else None
     searxng_query = _is_searxng_query(query)
     source_preferences = dict(plan.source_preferences)
@@ -388,6 +508,14 @@ def _apply_research_plan_guardrails(
         )
 
     search_queries = plan.search_queries
+    answer_outline = list(plan.answer_outline)
+    risk_notes = list(plan.risk_notes)
+    guarded_intent = "deployment" if deployment_query else plan.intent
+    if deployment_query and plan.intent != "deployment":
+        override_warning = "planner_intent_overridden_for_deployment_query"
+        guardrail_warnings.append(override_warning)
+        warnings.append(override_warning)
+
     if overview_query and extracted_entity:
         guardrail_queries = [
             PlannedSearchQuery(
@@ -436,16 +564,70 @@ def _apply_research_plan_guardrails(
             max_search_queries=max_search_queries,
             demote_architecture_or_setup=not _query_explicitly_asks_admin_or_setup(query),
         )
+    elif deployment_query:
+        subject = _subject_from_query(query)
+        guardrail_queries = [
+            PlannedSearchQuery(
+                query_text=query,
+                rationale="Preserve the user's original deployment question.",
+                expected_source_type="general_web",
+                priority=1,
+                query_source="original_user_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"{subject} Docker deployment official documentation",
+                rationale="Prioritize official Docker deployment guidance.",
+                expected_source_type="official_installation_admin",
+                priority=2,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"{subject} docker compose installation configuration settings",
+                rationale="Prioritize required container configuration and setup steps.",
+                expected_source_type="official_docs",
+                priority=3,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"{subject} deployment environment variables secrets reverse proxy",
+                rationale="Prioritize operational configuration and exposure requirements.",
+                expected_source_type="official_docs",
+                priority=4,
+                query_source="guardrail_query",
+            ),
+        ]
+        search_queries, dropped_or_downweighted = _merge_and_rank_planned_queries(
+            guardrail_queries,
+            plan.search_queries,
+            max_search_queries=max_search_queries,
+            demote_architecture_or_setup=False,
+        )
+        answer_outline = _prepend_unique_strings(
+            [
+                "Deployment target",
+                "Deployment steps",
+                "Configuration",
+                "Operational limitations",
+            ],
+            answer_outline,
+        )
+        risk_notes = _prepend_unique_strings(
+            [
+                "Prefer official installation and operations documentation.",
+                "Treat secrets, public exposure, storage, and reverse-proxy settings as operational risk areas.",
+            ],
+            risk_notes,
+        )
 
     final_search_queries = [item.to_payload() for item in search_queries]
     return ResearchPlan(
-        intent=plan.intent,
+        intent=guarded_intent,
         normalized_question=plan.normalized_question,
         subquestions=plan.subquestions,
         search_queries=search_queries,
         source_preferences=source_preferences,
-        answer_outline=plan.answer_outline,
-        risk_notes=plan.risk_notes,
+        answer_outline=answer_outline,
+        risk_notes=risk_notes,
         planner_mode=plan.planner_mode,
         warnings=list(dict.fromkeys(warnings)),
         answer_slots=[slot.to_payload() for slot in answer_slots_for_query(query)],
@@ -473,6 +655,21 @@ def _source_preferences_with_defaults(
             if isinstance(freshness_required, bool)
             else bool(defaults.get("freshness_required", False))
         ),
+    }
+
+
+def _default_source_preferences() -> dict[str, Any]:
+    return {
+        "preferred_domains": [],
+        "avoid_domains": [
+            "reddit.com",
+            "youtube.com",
+            "facebook.com",
+            "x.com",
+            "twitter.com",
+            "tiktok.com",
+        ],
+        "freshness_required": False,
     }
 
 
@@ -598,6 +795,8 @@ def _planner_query_downrank_reason(query: PlannedSearchQuery) -> str:
 
 
 def _classify_research_intent(*, query: str, intent: str) -> str:
+    if _is_deployment_query(query):
+        return "deployment_intent"
     if _is_definition_or_overview_query(query=query, intent=intent):
         return "overview_definition_intent"
     return "general_research_intent"
@@ -781,10 +980,22 @@ def _string_list(value: Any) -> list[str]:
     return strings
 
 
+def _object_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
 def _string_value(value: Any, *, default: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return default
+
+
+def _optional_string(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _safe_constraints(constraints: dict[str, Any]) -> dict[str, Any]:
@@ -800,6 +1011,17 @@ def _safe_constraints(constraints: dict[str, Any]) -> dict[str, Any]:
 
 def _subject_from_query(query: str) -> str:
     normalized = query.strip().rstrip("?")
+    for pattern in (
+        r"(?i)^how\s+to\s+(?:deploy|install|self-host|self\s+host)\s+(.+?)(?:\s+(?:with|using|via|on)\b|$)",
+        r"(?i)^deploy(?:ing)?\s+(.+?)(?:\s+(?:with|using|via|on)\b|$)",
+        r"(?i)^(.+?)\s+(?:docker|container|compose)\s+deployment$",
+    ):
+        match = re.match(pattern, normalized)
+        if match is not None:
+            subject = match.group(1).strip()
+            if subject:
+                return subject
+
     lower = normalized.lower()
     if lower.startswith("what is "):
         remainder = normalized[8:].strip()
@@ -809,3 +1031,15 @@ def _subject_from_query(query: str) -> str:
             return remainder[: lower_remainder.index(marker)].strip() or normalized
         return remainder or normalized
     return normalized
+
+
+def _is_deployment_query(query: str) -> bool:
+    lower = query.lower()
+    if re.search(r"\b(deploy|deploying|deployed|deployment|self-host|self\s+host)\b", lower):
+        return True
+    if re.search(r"\bhow\s+to\b", lower) and re.search(
+        r"\b(docker|docker-compose|compose|container|containers|install|installation)\b",
+        lower,
+    ):
+        return True
+    return False

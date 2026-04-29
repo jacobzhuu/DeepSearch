@@ -84,6 +84,9 @@ export const TaskReportPage: React.FC = () => {
         <section style={{ backgroundColor: '#f0f7ff', padding: '1rem', borderRadius: '4px' }}>
           <strong>标题:</strong> {report.title} <br />
           <strong>格式:</strong> {report.format} <br />
+          <strong>语言:</strong> {report.report_language} <br />
+          <strong>写作模式:</strong> {report.writer_mode}
+          {report.llm_writer_status ? ` / ${report.llm_writer_status}` : ''} <br />
           <strong>创建时间:</strong> {new Date(report.created_at).toLocaleString()}
         </section>
 

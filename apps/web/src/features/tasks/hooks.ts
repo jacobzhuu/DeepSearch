@@ -4,7 +4,9 @@ import { ResearchTask } from '../../types/api';
 import {
   CreateTaskRequest,
   CreateTaskResponse,
+  PlanTaskRequest,
   PipelineRunResponse,
+  ResearchPlanResponse,
   TaskEventListResponse,
 } from './types';
 
@@ -13,10 +15,10 @@ export function useTask(taskId: string | undefined) {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<Error | null>(null);
 
-  const fetchTask = useCallback(async () => {
+  const fetchTask = useCallback(async (background = false) => {
     if (!taskId) return;
     
-    setIsLoading(true);
+    if (!background) setIsLoading(true);
     setError(null);
     try {
       const data = await taskApi.getTask(taskId);
@@ -24,7 +26,7 @@ export function useTask(taskId: string | undefined) {
     } catch (err) {
       setError(err instanceof Error ? err : new Error('Failed to fetch task'));
     } finally {
-      setIsLoading(false);
+      if (!background) setIsLoading(false);
     }
   }, [taskId]);
 
@@ -40,10 +42,10 @@ export function useTaskEvents(taskId: string | undefined) {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<Error | null>(null);
 
-  const fetchEvents = useCallback(async () => {
+  const fetchEvents = useCallback(async (background = false) => {
     if (!taskId) return;
 
-    setIsLoading(true);
+    if (!background) setIsLoading(true);
     setError(null);
     try {
       const data = await taskApi.getTaskEvents(taskId);
@@ -51,7 +53,7 @@ export function useTaskEvents(taskId: string | undefined) {
     } catch (err) {
       setError(err instanceof Error ? err : new Error('Failed to fetch task events'));
     } finally {
-      setIsLoading(false);
+      if (!background) setIsLoading(false);
     }
   }, [taskId]);
 
@@ -84,6 +86,32 @@ export function useRunTask() {
   };
 
   return { runTask, isRunning, result, error };
+}
+
+export function usePlanTask() {
+  const [isPlanning, setIsPlanning] = useState<boolean>(false);
+  const [result, setResult] = useState<ResearchPlanResponse | null>(null);
+  const [error, setError] = useState<Error | null>(null);
+
+  const planTask = async (
+    taskId: string,
+    data: PlanTaskRequest = {},
+  ): Promise<ResearchPlanResponse | null> => {
+    setIsPlanning(true);
+    setError(null);
+    try {
+      const result = await taskApi.planTask(taskId, data);
+      setResult(result);
+      return result;
+    } catch (err) {
+      setError(err instanceof Error ? err : new Error('Failed to generate research plan'));
+      return null;
+    } finally {
+      setIsPlanning(false);
+    }
+  };
+
+  return { planTask, isPlanning, result, error };
 }
 
 export function useCreateTask() {

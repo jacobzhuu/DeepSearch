@@ -8,7 +8,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from packages.db.models import CandidateUrl, ResearchTask, SourceChunk, SourceDocument
+from packages.db.models import CandidateUrl, ResearchRun, ResearchTask, SourceChunk, SourceDocument
 from packages.db.repositories import (
     CandidateUrlRepository,
     ClaimEvidenceRepository,
@@ -17,6 +17,7 @@ from packages.db.repositories import (
     FetchAttemptRepository,
     FetchJobRepository,
     ReportArtifactRepository,
+    ResearchRunRepository,
     ResearchTaskRepository,
     SearchQueryRepository,
     SourceChunkRepository,
@@ -31,12 +32,15 @@ from services.orchestrator.app.claims import (
 )
 from services.orchestrator.app.indexing import IndexedChunkPage
 from services.orchestrator.app.planning import (
+    PlannedSearchQuery,
     ResearchPlan,
     ResearchPlannerError,
     ResearchPlannerService,
+    research_plan_from_serialized_payload,
 )
 from services.orchestrator.app.research_quality import (
     SourceYieldSummary,
+    analyze_required_slot_gaps,
     answer_slot_coverage,
     build_slot_coverage_summary,
     classify_source_intent,
@@ -66,8 +70,11 @@ PIPELINE_EVENT_PREFIX = "pipeline"
 DEBUG_EVENT_PREFIX = "debug.pipeline"
 
 STATUS_RUNNING = "RUNNING"
+STATUS_QUEUED = "QUEUED"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_FAILED = "FAILED"
+STATUS_PAUSED = "PAUSED"
+STATUS_CANCELLED = "CANCELLED"
 
 STAGE_SEARCHING = "SEARCHING"
 STAGE_ACQUIRING = "ACQUIRING"
@@ -75,15 +82,34 @@ STAGE_PARSING = "PARSING"
 STAGE_INDEXING = "INDEXING"
 STAGE_DRAFTING_CLAIMS = "DRAFTING_CLAIMS"
 STAGE_VERIFYING = "VERIFYING"
+STAGE_RESEARCHING_MORE = "RESEARCHING_MORE"
 STAGE_REPORTING = "REPORTING"
 
-PIPELINE_RUNNABLE_STATUSES = ("PLANNED",)
-SEARCH_ALLOWED_STATUSES = ("PLANNED", STAGE_SEARCHING)
-ACQUISITION_ALLOWED_STATUSES = ("PLANNED", STAGE_ACQUIRING, STAGE_DRAFTING_CLAIMS)
-PARSING_ALLOWED_STATUSES = ("PLANNED", STAGE_PARSING, STAGE_DRAFTING_CLAIMS)
-INDEXING_ALLOWED_STATUSES = ("PLANNED", STAGE_INDEXING, STAGE_DRAFTING_CLAIMS)
-DRAFT_ALLOWED_STATUSES = ("PLANNED", STAGE_DRAFTING_CLAIMS)
-VERIFY_ALLOWED_STATUSES = ("PLANNED", STAGE_VERIFYING)
+PIPELINE_RUNNABLE_STATUSES = ("PLANNED", STATUS_QUEUED)
+SEARCH_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_SEARCHING, STAGE_RESEARCHING_MORE)
+ACQUISITION_ALLOWED_STATUSES = (
+    "PLANNED",
+    STATUS_QUEUED,
+    STAGE_ACQUIRING,
+    STAGE_DRAFTING_CLAIMS,
+    STAGE_RESEARCHING_MORE,
+)
+PARSING_ALLOWED_STATUSES = (
+    "PLANNED",
+    STATUS_QUEUED,
+    STAGE_PARSING,
+    STAGE_DRAFTING_CLAIMS,
+    STAGE_RESEARCHING_MORE,
+)
+INDEXING_ALLOWED_STATUSES = (
+    "PLANNED",
+    STATUS_QUEUED,
+    STAGE_INDEXING,
+    STAGE_DRAFTING_CLAIMS,
+    STAGE_RESEARCHING_MORE,
+)
+DRAFT_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_DRAFTING_CLAIMS, STAGE_RESEARCHING_MORE)
+VERIFY_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_VERIFYING, STAGE_RESEARCHING_MORE)
 MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD = 2
 
 
@@ -143,6 +169,13 @@ class DebugPipelinePreconditionError(Exception):
         self.details = details
 
 
+class DebugPipelineInterrupted(Exception):
+    def __init__(self, task_id: UUID, status: str) -> None:
+        super().__init__(f"pipeline interrupted for task {task_id}; current status is {status}")
+        self.task_id = task_id
+        self.status = status
+
+
 class DebugRealPipelineRunner:
     def __init__(
         self,
@@ -165,6 +198,8 @@ class DebugRealPipelineRunner:
         target_successful_snapshots: int = MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD,
         min_answer_sources: int = 3,
         max_supplemental_sources: int = 3,
+        max_gap_rounds: int = 2,
+        gap_max_queries_per_round: int = 4,
     ) -> None:
         self.session = session
         self.search_service = search_service
@@ -185,15 +220,19 @@ class DebugRealPipelineRunner:
         self.target_successful_snapshots = target_successful_snapshots
         self.min_answer_sources = max(1, min_answer_sources)
         self.max_supplemental_sources = max(0, max_supplemental_sources)
+        self.max_gap_rounds = max(0, max_gap_rounds)
+        self.gap_max_queries_per_round = max(1, gap_max_queries_per_round)
         self.supplemental_acquisition_ran = False
         self.task_repository = ResearchTaskRepository(session)
+        self.run_repository = ResearchRunRepository(session)
         self.event_repository = TaskEventRepository(session)
 
     def run(self, task_id: UUID) -> DebugPipelineResult:
         task = self._get_task(task_id)
         if task.status not in PIPELINE_RUNNABLE_STATUSES:
             raise DebugPipelinePreconditionError(
-                f"DeepSearch pipeline can only run from PLANNED; current status is {task.status}"
+                "DeepSearch pipeline can only run from PLANNED or QUEUED; "
+                f"current status is {task.status}"
             )
 
         stages_completed: list[str] = []
@@ -201,53 +240,59 @@ class DebugRealPipelineRunner:
         report_version: int | None = None
         report_markdown_preview: str | None = None
 
-        self._mark_started(task)
-        self._run_planner_if_configured(task.id)
+        checkpoint_stages = self._checkpoint_completed_stages(task)
+        try:
+            self._mark_started(task)
+            self._run_planner_if_configured(task.id)
 
-        for stage, action in (
-            (STAGE_SEARCHING, self._run_search),
-            (STAGE_ACQUIRING, self._run_fetch),
-            (STAGE_PARSING, self._run_parse),
-            (STAGE_INDEXING, self._run_index),
-            (STAGE_DRAFTING_CLAIMS, self._run_draft_claims),
-            (STAGE_VERIFYING, self._run_verify_claims),
-            (STAGE_REPORTING, self._run_report),
-        ):
-            self._record_stage_started(task.id, stage)
-            try:
-                stage_result = action(task.id)
-            except Exception as error:  # noqa: BLE001 - debug endpoint must report exact blocker.
-                self.session.rollback()
-                counts = self._safe_counts(task.id)
-                failure = DebugPipelineFailure(
-                    stage=stage,
-                    reason=_classify_failure(error),
-                    exception=type(error).__name__,
-                    message=str(error),
-                    next_action=_next_action_for_failure(stage=stage, error=error),
-                    counts=counts,
-                    details=getattr(error, "details", None),
-                )
-                self._record_failure(task.id, failure)
-                refreshed_task = self._get_task(task.id)
-                return DebugPipelineResult(
-                    task=refreshed_task,
-                    completed=False,
-                    stages_completed=stages_completed,
-                    counts=counts,
-                    report_artifact_id=None,
-                    report_version=None,
-                    report_markdown_preview=None,
-                    failure=failure,
-                    dependencies=self.dependencies,
-                )
+            for stage, action in (
+                (STAGE_SEARCHING, self._run_search),
+                (STAGE_ACQUIRING, self._run_fetch),
+                (STAGE_PARSING, self._run_parse),
+                (STAGE_INDEXING, self._run_index),
+                (STAGE_DRAFTING_CLAIMS, self._run_draft_claims),
+                (STAGE_VERIFYING, self._run_verify_claims),
+            ):
+                if stage in checkpoint_stages:
+                    stages_completed.append(stage)
+                    continue
+                failure = self._execute_stage(task.id, stage, action, stages_completed)
+                if failure is not None:
+                    return failure
 
-            stages_completed.append(stage)
-            self._record_stage_completed(task.id, stage, stage_result)
-            if stage == STAGE_REPORTING:
-                report_artifact_id = stage_result.get("report_artifact_id")
-                report_version = stage_result.get("report_version")
-                report_markdown_preview = stage_result.get("report_markdown_preview")
+            gap_failure = self._run_gap_rounds(task.id, stages_completed)
+            if gap_failure is not None:
+                return gap_failure
+
+            if STAGE_REPORTING not in checkpoint_stages:
+                report_failure = self._execute_stage(
+                    task.id,
+                    STAGE_REPORTING,
+                    self._run_report,
+                    stages_completed,
+                )
+                if report_failure is not None:
+                    return report_failure
+                report_stage_result = self._latest_stage_result(task.id, STAGE_REPORTING)
+                if report_stage_result is not None:
+                    report_artifact_id = report_stage_result.get("report_artifact_id")
+                    report_version = report_stage_result.get("report_version")
+                    report_markdown_preview = report_stage_result.get("report_markdown_preview")
+            else:
+                stages_completed.append(STAGE_REPORTING)
+        except DebugPipelineInterrupted:
+            refreshed_task = self._get_task(task.id)
+            return DebugPipelineResult(
+                task=refreshed_task,
+                completed=False,
+                stages_completed=stages_completed,
+                counts=self._safe_counts(task.id),
+                report_artifact_id=report_artifact_id,
+                report_version=report_version,
+                report_markdown_preview=report_markdown_preview,
+                failure=None,
+                dependencies=self.dependencies,
+            )
 
         completed_task = self._mark_completed(task.id)
         return DebugPipelineResult(
@@ -262,14 +307,267 @@ class DebugRealPipelineRunner:
             dependencies=self.dependencies,
         )
 
-    def _run_search(self, task_id: UUID) -> dict[str, Any]:
+    def _execute_stage(
+        self,
+        task_id: UUID,
+        stage: str,
+        action: Callable[[UUID], dict[str, Any]],
+        stages_completed: list[str],
+    ) -> DebugPipelineResult | None:
+        self._ensure_task_can_continue(task_id)
+        self._record_stage_started(task_id, stage)
+        try:
+            stage_result = action(task_id)
+        except DebugPipelineInterrupted:
+            raise
+        except Exception as error:  # noqa: BLE001 - pipeline must report exact blocker.
+            self.session.rollback()
+            counts = self._safe_counts(task_id)
+            failure = DebugPipelineFailure(
+                stage=stage,
+                reason=_classify_failure(error),
+                exception=type(error).__name__,
+                message=str(error),
+                next_action=_next_action_for_failure(stage=stage, error=error),
+                counts=counts,
+                details=getattr(error, "details", None),
+            )
+            self._record_failure(task_id, failure)
+            refreshed_task = self._get_task(task_id)
+            return DebugPipelineResult(
+                task=refreshed_task,
+                completed=False,
+                stages_completed=stages_completed,
+                counts=counts,
+                report_artifact_id=None,
+                report_version=None,
+                report_markdown_preview=None,
+                failure=failure,
+                dependencies=self.dependencies,
+            )
+
+        stages_completed.append(stage)
+        self._record_stage_completed(
+            task_id,
+            stage,
+            stage_result,
+            stages_completed=stages_completed,
+        )
+        self._ensure_task_can_continue(task_id)
+        return None
+
+    def _run_gap_rounds(
+        self,
+        task_id: UUID,
+        stages_completed: list[str],
+    ) -> DebugPipelineResult | None:
+        task = self._get_task(task_id)
+        max_rounds = self._resolve_max_gap_rounds(task)
+        round_no = 1
+        while True:
+            self._ensure_task_can_continue(task_id)
+            analysis = analyze_required_slot_gaps(
+                task.query,
+                slot_coverage_summary=self._current_slot_coverage_summary(task_id),
+                round_no=round_no,
+                max_rounds=max_rounds,
+                max_queries_per_round=self.gap_max_queries_per_round,
+                existing_query_texts=self._existing_search_query_texts(task_id),
+            )
+            self._record_gap_analysis(task_id, analysis.to_payload())
+            if not analysis.triggered:
+                break
+            analysis_payload = analysis.to_payload()
+
+            def run_gap_stage(
+                current_task_id: UUID,
+                *,
+                payload: dict[str, Any] = analysis_payload,
+            ) -> dict[str, Any]:
+                return self._run_research_more_round(current_task_id, payload)
+
+            failure = self._execute_stage(
+                task_id,
+                STAGE_RESEARCHING_MORE,
+                run_gap_stage,
+                stages_completed,
+            )
+            if failure is not None:
+                return failure
+            round_no += 1
+        return None
+
+    def _run_research_more_round(
+        self,
+        task_id: UUID,
+        gap_analysis: dict[str, Any],
+    ) -> dict[str, Any]:
+        task = self._get_task(task_id)
+        planned_queries = _planned_queries_from_gap_analysis(gap_analysis)
+        search_result = self._run_search(
+            task_id,
+            planned_search_queries=planned_queries,
+            include_default_expansions=False,
+            require_candidates=False,
+        )
+        candidate_ids = [
+            UUID(source["candidate_url_id"])
+            for source in search_result.get("selected_sources", [])
+            if isinstance(source.get("candidate_url_id"), str)
+        ]
+        selected_candidate_ids = candidate_ids[: self.max_supplemental_sources]
+        warnings: list[str] = []
+        fallback_sources: list[dict[str, Any]] = []
+        skipped_fallback_sources: list[dict[str, Any]] = []
+        if not selected_candidate_ids:
+            fallback_candidates, skipped_fallback_sources = _select_supplemental_candidates(
+                self.session,
+                task_id,
+                query=task.query,
+                limit=self.max_supplemental_sources,
+            )
+            selected_candidate_ids = [candidate.id for candidate in fallback_candidates]
+            fallback_sources = [
+                {
+                    **_candidate_url_summary(candidate, query=task.query),
+                    "selected_by": "gap_round_unattempted_candidate",
+                }
+                for candidate in fallback_candidates
+            ]
+            if not selected_candidate_ids:
+                warnings.append("Gap round produced no new or unattempted candidate URLs.")
+                return {
+                    "gap_analysis": gap_analysis,
+                    "search": search_result,
+                    "fallback_sources": fallback_sources,
+                    "skipped_fallback_sources": skipped_fallback_sources,
+                    "warnings": warnings,
+                    "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                }
+            warnings.append(
+                "Gap round search added no new URLs; attempting existing unattempted high-value "
+                "candidates."
+            )
+
+        acquisition = self.acquisition_service.acquire_candidates(
+            task_id,
+            candidate_url_ids=selected_candidate_ids,
+            limit=len(selected_candidate_ids),
+            target_successful_snapshots=None,
+        )
+        acquisition_result = _acquisition_stage_result(acquisition)
+        snapshot_ids = [
+            entry.content_snapshot.id for entry in acquisition.entries if entry.content_snapshot
+        ]
+        if not snapshot_ids:
+            warnings.append("Gap round fetched no successful content snapshots.")
+            return {
+                "gap_analysis": gap_analysis,
+                "search": search_result,
+                "acquisition": acquisition_result,
+                "fallback_sources": fallback_sources,
+                "skipped_fallback_sources": skipped_fallback_sources,
+                "warnings": warnings,
+                "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+            }
+
+        parse_result = self.parsing_service.parse_snapshots(
+            task_id,
+            content_snapshot_ids=snapshot_ids,
+            limit=len(snapshot_ids),
+        )
+        parse_decisions = [parse_entry_diagnostic(entry) for entry in parse_result.entries]
+        source_chunk_ids: list[UUID] = []
+        for entry in parse_result.entries:
+            if entry.source_document is None:
+                continue
+            source_chunk_ids.extend(chunk.id for chunk in entry.source_document.chunks)
+        parsing_result = {
+            "created": parse_result.created,
+            "updated": parse_result.updated,
+            "skipped_existing": parse_result.skipped_existing,
+            "skipped_unsupported": parse_result.skipped_unsupported,
+            "failed": parse_result.failed,
+            "parse_decisions": parse_decisions,
+        }
+        if not source_chunk_ids:
+            warnings.append("Gap round parsed no source chunks.")
+            return {
+                "gap_analysis": gap_analysis,
+                "search": search_result,
+                "acquisition": acquisition_result,
+                "parsing": parsing_result,
+                "fallback_sources": fallback_sources,
+                "skipped_fallback_sources": skipped_fallback_sources,
+                "warnings": warnings,
+                "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+            }
+
+        index_result = self.indexing_service.index_source_chunks(
+            task_id,
+            source_chunk_ids=source_chunk_ids,
+            limit=len(source_chunk_ids),
+        )
+        indexing_result = {"indexed_count": len(index_result.indexed_chunks)}
+        try:
+            drafting_result = self._run_draft_claims(task_id)
+        except DebugPipelinePreconditionError as error:
+            warnings.append(f"Gap round produced no new draft claims: {error}")
+            drafting_result = {
+                "created_claims": 0,
+                "reused_claims": 0,
+                "diagnostics": _json_safe(error.details or {}),
+            }
+        try:
+            verification_result = self._run_verify_claims(task_id)
+        except DebugPipelinePreconditionError as error:
+            warnings.append(f"Gap round found no draft claims to verify: {error}")
+            verification_result = {
+                "verified_claims": 0,
+                "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+            }
+
+        slot_coverage_summary = self._current_slot_coverage_summary(task_id)
+        remaining_required_gaps = [
+            slot
+            for slot in slot_coverage_summary
+            if slot.get("required") is True and slot.get("status") in {"missing", "weak"}
+        ]
+        if remaining_required_gaps:
+            warnings.append("Required answer slots remain missing or weak after this gap round.")
+        return {
+            "gap_analysis": gap_analysis,
+            "search": search_result,
+            "acquisition": acquisition_result,
+            "parsing": parsing_result,
+            "indexing": indexing_result,
+            "drafting": drafting_result,
+            "verification": verification_result,
+            "slot_coverage_summary": slot_coverage_summary,
+            "remaining_required_gaps": remaining_required_gaps,
+            "fallback_sources": fallback_sources,
+            "skipped_fallback_sources": skipped_fallback_sources,
+            "warnings": warnings,
+            "query": task.query,
+        }
+
+    def _run_search(
+        self,
+        task_id: UUID,
+        *,
+        planned_search_queries: list[PlannedSearchQuery] | None = None,
+        include_default_expansions: bool = True,
+        require_candidates: bool = True,
+    ) -> dict[str, Any]:
+        effective_planned_queries = planned_search_queries
+        if effective_planned_queries is None and self.research_plan is not None:
+            effective_planned_queries = self.research_plan.search_queries
         result = self.search_service.discover_candidates(
             task_id,
-            planned_search_queries=(
-                self.research_plan.search_queries if self.research_plan is not None else None
-            ),
+            planned_search_queries=effective_planned_queries,
+            include_default_expansions=include_default_expansions,
         )
-        if not result.candidate_urls:
+        if require_candidates and not result.candidate_urls:
             raise DebugPipelinePreconditionError("search produced no candidate URLs")
         search_queries = []
         search_result_count = 0
@@ -297,7 +595,8 @@ class DebugRealPipelineRunner:
             "search_queries": search_queries,
             "search_query_count": len(result.search_queries),
             "search_result_count": search_result_count,
-            "research_plan_used": self.research_plan is not None,
+            "research_plan_used": self.research_plan is not None and planned_search_queries is None,
+            "supplemental_search": planned_search_queries is not None,
             "raw_planner_queries": (
                 list(self.research_plan.raw_planner_queries)
                 if self.research_plan is not None
@@ -334,9 +633,13 @@ class DebugRealPipelineRunner:
         }
 
     def _run_planner_if_configured(self, task_id: UUID) -> None:
+        task = self._get_task(task_id)
+        existing_plan = self._latest_existing_research_plan(task)
+        if existing_plan is not None:
+            self.research_plan = existing_plan
+            return
         if self.planner_service is None:
             return
-        task = self._get_task(task_id)
         try:
             plan = self.planner_service.plan(
                 task_id=task_id,
@@ -349,6 +652,11 @@ class DebugRealPipelineRunner:
                 "research_plan.failed",
                 {
                     **self._pipeline_payload(from_status=task.status, to_status=task.status),
+                    "changes": {
+                        "revision_no": task.revision_no,
+                        "research_plan_source": "pipeline_failed",
+                    },
+                    "stage": "PLANNING",
                     "planner_enabled": True,
                     "planner_status": "failed",
                     "fallback": "original_query",
@@ -366,6 +674,11 @@ class DebugRealPipelineRunner:
             "research_plan.created",
             {
                 **self._pipeline_payload(from_status=task.status, to_status=task.status),
+                "changes": {
+                    "revision_no": task.revision_no,
+                    "research_plan_source": "pipeline_generated",
+                },
+                "stage": "PLANNING",
                 "planner_enabled": True,
                 "planner_status": "created",
                 "planner_mode": plan.planner_mode,
@@ -377,6 +690,27 @@ class DebugRealPipelineRunner:
             },
         )
         self.session.commit()
+
+    def _latest_existing_research_plan(self, task: ResearchTask) -> ResearchPlan | None:
+        for event in reversed(self.event_repository.list_for_task(task.id)):
+            if event.event_type != "research_plan.created":
+                continue
+            payload = event.payload_json or {}
+            if not isinstance(payload, dict):
+                continue
+            changes = payload.get("changes")
+            if isinstance(changes, dict):
+                revision_no = changes.get("revision_no")
+                if isinstance(revision_no, int) and revision_no != task.revision_no:
+                    continue
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                continue
+            plan_payload = result.get("research_plan")
+            if not isinstance(plan_payload, dict):
+                continue
+            return research_plan_from_serialized_payload(plan_payload)
+        return None
 
     def _run_fetch(self, task_id: UUID) -> dict[str, Any]:
         target_successful_snapshots = self.target_successful_snapshots
@@ -455,7 +789,7 @@ class DebugRealPipelineRunner:
             query=task.query,
             limit=max(self.claim_limit, 8),
         )
-        result = self.claims_service.draft_claims(
+        result: Any = self.claims_service.draft_claims(
             task_id,
             query=task.query,
             source_chunk_ids=source_chunk_ids,
@@ -677,6 +1011,9 @@ class DebugRealPipelineRunner:
         return {
             "report_artifact_id": result.artifact.id,
             "report_version": result.artifact.version,
+            "report_language": result.report_language,
+            "report_writer_mode": result.writer_mode,
+            "llm_writer_status": result.llm_writer_status,
             "supported_claims": result.supported_claims,
             "mixed_claims": result.mixed_claims,
             "unsupported_claims": result.unsupported_claims,
@@ -688,28 +1025,49 @@ class DebugRealPipelineRunner:
             "evidence_yield_summary": manifest.get("evidence_yield_summary", {}),
             "verification_summary": manifest.get("verification_summary", {}),
             "dropped_sources": manifest.get("dropped_sources", []),
+            "report_writer": manifest.get("report_writer", {}),
             "warnings": source_quality_summary["warnings"],
         }
 
     def _mark_started(self, task: ResearchTask) -> None:
         from_status = task.status
+        run = self._get_or_create_current_run(task)
         task.started_at = task.started_at or datetime.now(UTC)
         self.task_repository.set_status(task, STATUS_RUNNING, ended_at=None)
+        self._update_run_checkpoint(
+            run,
+            current_state=STATUS_RUNNING,
+            checkpoint_patch={
+                "phase": "pipeline",
+                "current_stage": STATUS_RUNNING,
+                "stages_completed": sorted(self._checkpoint_completed_stages(task)),
+            },
+        )
         self._record_event(
             task.id,
             self._event_type("started"),
             {
                 **self._pipeline_payload(from_status=from_status, to_status=STATUS_RUNNING),
                 "stage": STATUS_RUNNING,
-                "status_note": "synchronous pipeline run started",
+                "status_note": "pipeline worker run started",
+                "running_mode": _running_mode_from_dependencies(self.dependencies),
+                "dependencies": _json_safe(self.dependencies),
             },
+            run_id=run.id,
         )
         self.session.commit()
 
     def _mark_completed(self, task_id: UUID) -> ResearchTask:
         task = self._get_task(task_id)
         from_status = task.status
+        run = self._get_or_create_current_run(task)
         self.task_repository.set_status(task, STATUS_COMPLETED, ended_at=datetime.now(UTC))
+        self._update_run_checkpoint(
+            run,
+            current_state=STATUS_COMPLETED,
+            ended_at=datetime.now(UTC),
+            checkpoint_patch={"current_stage": STATUS_COMPLETED},
+        )
         self._record_event(
             task.id,
             self._event_type("completed"),
@@ -718,6 +1076,7 @@ class DebugRealPipelineRunner:
                 "stage": STATUS_COMPLETED,
                 "counts": _counts_to_dict(self._safe_counts(task.id)),
             },
+            run_id=run.id,
         )
         self.session.commit()
         self.session.refresh(task)
@@ -726,7 +1085,13 @@ class DebugRealPipelineRunner:
     def _record_stage_started(self, task_id: UUID, stage: str) -> None:
         task = self._get_task(task_id)
         from_status = task.status
+        run = self._get_or_create_current_run(task)
         self.task_repository.set_status(task, stage, ended_at=None)
+        self._update_run_checkpoint(
+            run,
+            current_state=stage,
+            checkpoint_patch={"current_stage": stage},
+        )
         self._record_event(
             task_id,
             self._event_type("stage_started"),
@@ -734,6 +1099,7 @@ class DebugRealPipelineRunner:
                 **self._pipeline_payload(from_status=from_status, to_status=stage),
                 "stage": stage,
             },
+            run_id=run.id,
         )
         self.session.commit()
 
@@ -742,8 +1108,20 @@ class DebugRealPipelineRunner:
         task_id: UUID,
         stage: str,
         stage_result: dict[str, Any],
+        *,
+        stages_completed: list[str],
     ) -> None:
         task = self._get_task(task_id)
+        run = self._get_or_create_current_run(task)
+        self._update_run_checkpoint(
+            run,
+            current_state=task.status,
+            checkpoint_patch={
+                "current_stage": task.status,
+                "last_completed_stage": stage,
+                "stages_completed": list(stages_completed),
+            },
+        )
         self._record_event(
             task_id,
             self._event_type("stage_completed"),
@@ -754,13 +1132,25 @@ class DebugRealPipelineRunner:
                 "counts": _counts_to_dict(self._safe_counts(task_id)),
                 "warnings": _stage_warnings(stage_result),
             },
+            run_id=run.id,
         )
         self.session.commit()
 
     def _record_failure(self, task_id: UUID, failure: DebugPipelineFailure) -> None:
         task = self._get_task(task_id)
         from_status = task.status
+        run = self._get_or_create_current_run(task)
         self.task_repository.set_status(task, STATUS_FAILED, ended_at=datetime.now(UTC))
+        self._update_run_checkpoint(
+            run,
+            current_state=STATUS_FAILED,
+            ended_at=datetime.now(UTC),
+            checkpoint_patch={
+                "current_stage": STATUS_FAILED,
+                "failed_stage": failure.stage,
+                "failure_reason": failure.reason,
+            },
+        )
         self._record_event(
             task_id,
             self._event_type("failed"),
@@ -774,6 +1164,28 @@ class DebugRealPipelineRunner:
                 "counts": _counts_to_dict(failure.counts),
                 "details": _json_safe(failure.details) if failure.details is not None else None,
             },
+            run_id=run.id,
+        )
+        self.session.commit()
+
+    def _record_gap_analysis(self, task_id: UUID, gap_analysis: dict[str, Any]) -> None:
+        task = self._get_task(task_id)
+        run = self._get_or_create_current_run(task)
+        self._update_run_checkpoint(
+            run,
+            current_state=task.status,
+            checkpoint_patch={"last_gap_analysis": _json_safe(gap_analysis)},
+        )
+        self._record_event(
+            task_id,
+            self._event_type("gap_analysis"),
+            {
+                **self._pipeline_payload(from_status=task.status, to_status=task.status),
+                "stage": STAGE_RESEARCHING_MORE,
+                "result": _json_safe(gap_analysis),
+                "warnings": _stage_warnings(gap_analysis),
+            },
+            run_id=run.id,
         )
         self.session.commit()
 
@@ -782,11 +1194,14 @@ class DebugRealPipelineRunner:
         task_id: UUID,
         event_type: str,
         payload_json: dict[str, Any],
+        *,
+        run_id: UUID | None = None,
     ) -> None:
         self.event_repository.record(
             task_id=task_id,
             event_type=event_type,
             payload_json=payload_json,
+            run_id=run_id,
         )
 
     def _event_type(self, name: str) -> str:
@@ -813,6 +1228,95 @@ class DebugRealPipelineRunner:
         if task is None:
             raise TaskNotFoundError(task_id)
         return task
+
+    def _ensure_task_can_continue(self, task_id: UUID) -> None:
+        task = self._get_task(task_id)
+        if task.status in {STATUS_PAUSED, STATUS_CANCELLED}:
+            raise DebugPipelineInterrupted(task_id, task.status)
+
+    def _get_or_create_current_run(self, task: ResearchTask) -> ResearchRun:
+        latest_run = self.run_repository.get_latest_for_task(task.id)
+        if latest_run is not None and _run_revision_no(latest_run) == task.revision_no:
+            return latest_run
+        next_round_no = 1 if latest_run is None else latest_run.round_no + 1
+        return self.run_repository.add(
+            ResearchRun(
+                task_id=task.id,
+                round_no=next_round_no,
+                current_state=task.status,
+                checkpoint_json={
+                    "task_revision_no": task.revision_no,
+                    "phase": "pipeline",
+                    "stages_completed": [],
+                },
+            )
+        )
+
+    def _update_run_checkpoint(
+        self,
+        run: ResearchRun,
+        *,
+        current_state: str,
+        checkpoint_patch: dict[str, Any],
+        ended_at: datetime | None = None,
+    ) -> None:
+        checkpoint = dict(run.checkpoint_json or {})
+        checkpoint.update(
+            {
+                **checkpoint_patch,
+                "task_revision_no": checkpoint.get("task_revision_no")
+                or self._get_task(run.task_id).revision_no,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        run.current_state = current_state
+        run.checkpoint_json = _json_safe(checkpoint)
+        if ended_at is not None:
+            run.ended_at = ended_at
+        self.session.flush()
+
+    def _checkpoint_completed_stages(self, task: ResearchTask) -> set[str]:
+        latest_run = self.run_repository.get_latest_for_task(task.id)
+        if latest_run is None or _run_revision_no(latest_run) != task.revision_no:
+            return set()
+        value = (latest_run.checkpoint_json or {}).get("stages_completed")
+        if not isinstance(value, list):
+            return set()
+        return {stage for stage in value if isinstance(stage, str)}
+
+    def _latest_stage_result(self, task_id: UUID, stage: str) -> dict[str, Any] | None:
+        for event in reversed(self.event_repository.list_for_task(task_id)):
+            payload = event.payload_json or {}
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("stage") != stage:
+                continue
+            result = payload.get("result")
+            if isinstance(result, dict):
+                return result
+        return None
+
+    def _resolve_max_gap_rounds(self, task: ResearchTask) -> int:
+        constraints = task.constraints_json or {}
+        raw_value = constraints.get("max_gap_rounds", constraints.get("max_rounds"))
+        if isinstance(raw_value, int) and raw_value >= 0:
+            return raw_value
+        return self.max_gap_rounds
+
+    def _current_slot_coverage_summary(self, task_id: UUID) -> list[dict[str, Any]]:
+        task = self._get_task(task_id)
+        return build_slot_coverage_summary(
+            task.query,
+            evidence_candidates=_evidence_candidates_from_claims(self.session, task_id),
+            claim_rows=_claim_rows_for_slot_summary_from_claims(self.session, task_id),
+        )
+
+    def _existing_search_query_texts(self, task_id: UUID) -> set[str]:
+        return {
+            item.query_text
+            for item in SearchQueryRepository(self.session).list_for_task(task_id)
+            if item.query_text.strip()
+        }
 
     def _is_planner_overview_run(self) -> bool:
         return bool(
@@ -861,6 +1365,11 @@ def _counts_to_dict(counts: DebugPipelineCounts) -> dict[str, int]:
         "claim_evidence": counts.claim_evidence,
         "report_artifacts": counts.report_artifacts,
     }
+
+
+def _run_revision_no(run: ResearchRun) -> int | None:
+    value = (run.checkpoint_json or {}).get("task_revision_no")
+    return value if isinstance(value, int) else None
 
 
 def _candidate_url_summary(candidate_url: Any, *, query: str | None = None) -> dict[str, Any]:
@@ -1089,6 +1598,46 @@ def _merge_draft_results(first: Any, second: Any) -> _MergedDraftResult:
             "post_supplemental_diagnostics": dict(second.diagnostics),
         },
     )
+
+
+def _planned_queries_from_gap_analysis(gap_analysis: dict[str, Any]) -> list[PlannedSearchQuery]:
+    raw_queries = gap_analysis.get("supplemental_queries")
+    if not isinstance(raw_queries, list):
+        return []
+    planned: list[PlannedSearchQuery] = []
+    for index, item in enumerate(raw_queries, start=1):
+        if not isinstance(item, dict):
+            continue
+        query_text = item.get("query_text")
+        if not isinstance(query_text, str) or not query_text.strip():
+            continue
+        rationale = item.get("rationale")
+        expected_source_type = item.get("expected_source_type")
+        priority = item.get("priority")
+        planned.append(
+            PlannedSearchQuery(
+                query_text=query_text.strip(),
+                rationale=(
+                    rationale.strip()
+                    if isinstance(rationale, str) and rationale.strip()
+                    else "Fill missing or weak required answer slots."
+                ),
+                expected_source_type=(
+                    expected_source_type.strip()
+                    if isinstance(expected_source_type, str) and expected_source_type.strip()
+                    else "official_or_reference"
+                ),
+                priority=priority if isinstance(priority, int) and priority > 0 else index,
+                query_source="gap_analyzer",
+                metadata={
+                    "gap_round_no": item.get("round_no"),
+                    "slot_ids": (
+                        item.get("slot_ids") if isinstance(item.get("slot_ids"), list) else []
+                    ),
+                },
+            )
+        )
+    return planned
 
 
 def _select_claim_drafting_chunk_ids(
@@ -1680,7 +2229,8 @@ def _fetch_dropped_reason(source: dict[str, Any]) -> str:
     if source.get("fetch_status") == "UNATTEMPTED":
         return "not_selected_low_priority"
     error_code = str(source.get("error_code") or "")
-    trace = source.get("trace") if isinstance(source.get("trace"), dict) else {}
+    raw_trace = source.get("trace")
+    trace: dict[str, Any] = raw_trace if isinstance(raw_trace, dict) else {}
     if "policy" in error_code or trace.get("decision_reason") is not None:
         return "blocked_by_policy"
     if source.get("fetch_status") == "FAILED":
@@ -1951,6 +2501,24 @@ def _stage_warnings(stage_result: dict[str, Any]) -> list[str]:
     if not isinstance(warnings, list):
         return []
     return [item for item in warnings if isinstance(item, str) and item.strip()]
+
+
+def _running_mode_from_dependencies(dependencies: dict[str, Any]) -> str:
+    return "+".join(
+        [
+            str(
+                dependencies.get("search_mode")
+                or dependencies.get("search_provider")
+                or "unknown-search"
+            ),
+            str(
+                dependencies.get("index_mode")
+                or dependencies.get("index_backend")
+                or "unknown-index"
+            ),
+            str(dependencies.get("llm_mode") or "unknown-llm"),
+        ]
+    )
 
 
 def _classify_failure(error: Exception) -> str:

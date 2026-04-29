@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
-from packages.db.repositories import TaskEventRepository
+from packages.db.repositories import ResearchTaskRepository, TaskEventRepository
 from services.orchestrator.app.acquisition import HttpFetchResult
 from services.orchestrator.app.api.routes.acquisition import (
     get_http_acquisition_client,
@@ -380,7 +380,7 @@ def test_debug_real_pipeline_runs_existing_services_to_report(
         client_generator.close()
 
 
-def test_pipeline_run_endpoint_completes_task_and_records_product_events(
+def test_pipeline_run_endpoint_queues_task_for_worker(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
 ) -> None:
@@ -400,42 +400,26 @@ def test_pipeline_run_endpoint_completes_task_and_records_product_events(
 
         assert pipeline_response.status_code == 200
         pipeline_payload = pipeline_response.json()
-        assert pipeline_payload["completed"] is True
-        assert pipeline_payload["status"] == "COMPLETED"
+        assert pipeline_payload["completed"] is False
+        assert pipeline_payload["status"] == "QUEUED"
         assert pipeline_payload["running_mode"].endswith("+no-LLM")
-        assert pipeline_payload["stages_completed"] == [
-            "SEARCHING",
-            "ACQUIRING",
-            "PARSING",
-            "INDEXING",
-            "DRAFTING_CLAIMS",
-            "VERIFYING",
-            "REPORTING",
-        ]
-        assert pipeline_payload["counts"]["source_documents"] > 0
-        assert pipeline_payload["counts"]["source_chunks"] > 0
-        assert pipeline_payload["counts"]["claims"] > 0
-        assert pipeline_payload["counts"]["claim_evidence"] > 0
-        assert pipeline_payload["counts"]["report_artifacts"] > 0
+        assert pipeline_payload["stages_completed"] == []
+        assert pipeline_payload["counts"]["source_documents"] == 0
+        assert pipeline_payload["dependencies"]["uses_worker_or_queue"] is True
 
         assert detail_response.status_code == 200
-        assert detail_response.json()["status"] == "COMPLETED"
-        assert detail_response.json()["progress"]["current_state"] == "COMPLETED"
+        assert detail_response.json()["status"] == "QUEUED"
+        assert detail_response.json()["progress"]["current_state"] == "QUEUED"
         observability = detail_response.json()["progress"]["observability"]
-        assert observability["search_result_count"] == 2
-        assert len(observability["selected_sources"]) == 2
-        assert observability["fetch_succeeded"] == 2
-        assert observability["fetch_failed"] == 0
-        assert "source_yield_summary" in observability
-        assert "evidence_yield_summary" in observability
-        assert "slot_coverage_summary" in observability
-        assert "verification_summary" in observability
+        assert observability["dependencies"]["uses_worker_or_queue"] is True
 
         event_types = [event["event_type"] for event in events_response.json()["events"]]
-        assert "pipeline.started" in event_types
-        assert "pipeline.stage_started" in event_types
-        assert "pipeline.stage_completed" in event_types
-        assert "pipeline.completed" in event_types
+        assert "pipeline.queued" in event_types
+        with session_factory() as session:
+            task = ResearchTaskRepository(session).get(UUID(task_id))
+            assert task is not None
+            ResearchTaskRepository(session).set_status(task, "PLANNED", ended_at=None)
+            session.commit()
     finally:
         client_generator.close()
 
@@ -499,7 +483,7 @@ def test_pipeline_events_record_fetch_failure_details_and_low_source_warning(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
 
@@ -516,7 +500,7 @@ def test_pipeline_events_record_fetch_failure_details_and_low_source_warning(
         acquire_events = [
             event
             for event in events_response.json()["events"]
-            if event["event_type"] == "pipeline.stage_completed"
+            if event["event_type"] == "debug.pipeline.stage_completed"
             and event["payload"].get("stage") == "ACQUIRING"
         ]
         assert acquire_events
@@ -547,7 +531,7 @@ def test_pipeline_acquisition_continues_after_failures_and_runs_with_one_snapsho
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
 
         assert pipeline_response.status_code == 200
@@ -587,7 +571,7 @@ def test_pipeline_acquisition_failure_records_attempt_diagnostics(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
 
@@ -595,7 +579,7 @@ def test_pipeline_acquisition_failure_records_attempt_diagnostics(
         payload = pipeline_response.json()
         assert payload["completed"] is False
         assert payload["status"] == "FAILED"
-        assert payload["failure"]["failed_stage"] == "ACQUIRING"
+        assert payload["failure"]["stage"] == "ACQUIRING"
         assert payload["failure"]["reason"] == "pipeline_precondition_failed"
 
         details = payload["failure"]["details"]
@@ -617,7 +601,7 @@ def test_pipeline_acquisition_failure_records_attempt_diagnostics(
         failed_events = [
             event
             for event in events_response.json()["events"]
-            if event["event_type"] == "pipeline.failed"
+            if event["event_type"] == "debug.pipeline.failed"
         ]
         assert failed_events
         failed_details = failed_events[-1]["payload"]["details"]
@@ -645,7 +629,7 @@ def test_pipeline_run_endpoint_returns_structured_failure_and_failed_status(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
 
@@ -653,13 +637,13 @@ def test_pipeline_run_endpoint_returns_structured_failure_and_failed_status(
         pipeline_payload = pipeline_response.json()
         assert pipeline_payload["completed"] is False
         assert pipeline_payload["status"] == "FAILED"
-        assert pipeline_payload["failure"]["failed_stage"] == "SEARCHING"
+        assert pipeline_payload["failure"]["stage"] == "SEARCHING"
         assert pipeline_payload["failure"]["reason"] == "pipeline_precondition_failed"
         assert "SEARCH_PROVIDER" in pipeline_payload["failure"]["next_action"]
 
         assert detail_response.json()["status"] == "FAILED"
         event_types = [event["event_type"] for event in events_response.json()["events"]]
-        assert "pipeline.failed" in event_types
+        assert "debug.pipeline.failed" in event_types
     finally:
         client_generator.close()
 
@@ -683,7 +667,7 @@ def test_pipeline_parse_failure_records_snapshot_decisions(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
 
@@ -691,7 +675,7 @@ def test_pipeline_parse_failure_records_snapshot_decisions(
         payload = pipeline_response.json()
         assert payload["completed"] is False
         assert payload["status"] == "FAILED"
-        assert payload["failure"]["failed_stage"] == "PARSING"
+        assert payload["failure"]["stage"] == "PARSING"
         assert payload["failure"]["reason"] == "pipeline_precondition_failed"
         assert "snapshot_id=" in payload["failure"]["message"]
         assert "mime_type=text/html" in payload["failure"]["message"]
@@ -712,7 +696,7 @@ def test_pipeline_parse_failure_records_snapshot_decisions(
         failed_events = [
             event
             for event in events_response.json()["events"]
-            if event["event_type"] == "pipeline.failed"
+            if event["event_type"] == "debug.pipeline.failed"
         ]
         assert failed_events
         assert (
@@ -742,14 +726,14 @@ def test_pipeline_claim_drafting_failure_includes_candidate_diagnostics(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
 
         assert pipeline_response.status_code == 200
         payload = pipeline_response.json()
         assert payload["completed"] is False
         assert payload["status"] == "FAILED"
-        assert payload["failure"]["failed_stage"] == "DRAFTING_CLAIMS"
+        assert payload["failure"]["stage"] == "DRAFTING_CLAIMS"
 
         details = payload["failure"]["details"]
         assert details["total_chunks_seen"] >= 1
@@ -767,7 +751,7 @@ def test_pipeline_claim_drafting_failure_includes_candidate_diagnostics(
         failed_events = [
             event
             for event in events_response.json()["events"]
-            if event["event_type"] == "pipeline.failed"
+            if event["event_type"] == "debug.pipeline.failed"
         ]
         assert failed_events
         assert failed_events[-1]["payload"]["details"]["candidate_sentences_count"] >= 2
@@ -793,7 +777,7 @@ def test_pipeline_planner_disabled_records_no_research_plan_event(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
 
         assert pipeline_response.status_code == 200
@@ -805,6 +789,60 @@ def test_pipeline_planner_disabled_records_no_research_plan_event(
         client_generator.close()
         monkeypatch.delenv("LLM_ENABLED", raising=False)
         monkeypatch.delenv("RESEARCH_PLANNER_ENABLED", raising=False)
+        get_settings.cache_clear()
+
+
+def test_pipeline_reuses_pre_run_research_plan_when_planner_disabled(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "false")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "false")
+    monkeypatch.setenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", "3")
+    get_settings.cache_clear()
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(
+        session_factory,
+        tmp_path,
+        index_backend,
+        http_client=SearXNGExplanatoryHttpAcquisitionClient(),
+    )
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is SearXNG and how does it work?"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        plan_response = client.post(f"/api/v1/research/tasks/{task_id}/plan")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+        search_queries_response = client.get(f"/api/v1/research/tasks/{task_id}/search-queries")
+
+        assert plan_response.status_code == 200
+        assert plan_response.json()["planner_mode"] == "deterministic"
+        assert pipeline_response.status_code == 200
+        assert pipeline_response.json()["completed"] is True
+
+        events = events_response.json()["events"]
+        event_types = [event["event_type"] for event in events]
+        assert event_types.count("research_plan.created") == 1
+        assert event_types.index("research_plan.created") < event_types.index(
+            "debug.pipeline.started"
+        )
+
+        persisted_queries = search_queries_response.json()["search_queries"]
+        query_texts = [item["query_text"] for item in persisted_queries]
+        assert "What is SearXNG and how does it work?" in query_texts
+        assert "SearXNG official documentation" in query_texts
+        assert len(query_texts) == len(set(query_texts))
+    finally:
+        client_generator.close()
+        monkeypatch.delenv("LLM_ENABLED", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_ENABLED", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", raising=False)
         get_settings.cache_clear()
 
 
@@ -835,14 +873,14 @@ def test_pipeline_noop_planner_records_plan_and_uses_planner_queries(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
         search_queries_response = client.get(f"/api/v1/research/tasks/{task_id}/search-queries")
 
         assert pipeline_response.status_code == 200
         assert pipeline_response.json()["completed"] is True
-        assert pipeline_response.json()["running_mode"].endswith("+planner-noop")
+        assert pipeline_response.json()["dependencies"]["llm_mode"] == "planner-noop"
 
         events_payload = events_response.json()
         event_types = [event["event_type"] for event in events_payload["events"]]
@@ -899,7 +937,7 @@ def test_pipeline_llm_planner_failure_falls_back_to_original_query(
         )
         task_id = create_response.json()["task_id"]
 
-        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
         search_queries_response = client.get(f"/api/v1/research/tasks/{task_id}/search-queries")
@@ -917,9 +955,17 @@ def test_pipeline_llm_planner_failure_falls_back_to_original_query(
         assert any("research planner failed" in item for item in observability["warnings"])
 
         persisted_queries = search_queries_response.json()["search_queries"]
-        assert [item["query_text"] for item in persisted_queries] == [
+        assert persisted_queries[0]["query_text"] == (
             "Planner provider failure should not fail the pipeline"
-        ]
+        )
+        assert any(
+            item["metadata"].get("expansion_metadata", {}).get("query_source") == "gap_analyzer"
+            for item in persisted_queries[1:]
+        )
+        assert any(
+            item["metadata"].get("expansion_metadata", {}).get("gap_round_no") == 1
+            for item in persisted_queries[1:]
+        )
     finally:
         client_generator.close()
         monkeypatch.delenv("LLM_ENABLED", raising=False)

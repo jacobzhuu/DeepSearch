@@ -16,6 +16,9 @@ class ReportResponse(BaseModel):
     storage_key: str
     created_at: datetime
     markdown: str
+    report_language: str
+    writer_mode: str
+    llm_writer_status: str | None = None
 
 
 class GenerateReportResponse(ReportResponse):

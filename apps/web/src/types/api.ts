@@ -1,6 +1,7 @@
 export interface TaskConstraints {
   domains_allow?: string[];
   language?: string;
+  report_language?: string;
   max_rounds?: number;
 }
 
@@ -9,6 +10,8 @@ export interface ResearchTaskProgress {
   events_total: number;
   latest_event_at: string;
   observability?: {
+    running_mode?: string | null;
+    dependencies?: Record<string, any> | null;
     planner_enabled?: boolean | null;
     planner_mode?: string | null;
     planner_status?: string | null;
@@ -41,6 +44,8 @@ export interface ResearchTaskProgress {
     evidence_yield_summary?: Record<string, any> | null;
     verification_summary?: Record<string, any> | null;
     supplemental_acquisition?: Record<string, any> | null;
+    gap_analysis?: Record<string, any> | null;
+    gap_rounds?: Array<Record<string, any>>;
     failure_diagnostics?: Record<string, any> | null;
     warnings: string[];
   } | null;
@@ -49,7 +54,7 @@ export interface ResearchTaskProgress {
 export interface ResearchTask {
   task_id: string;
   query: string;
-  status: 'PLANNED' | 'PAUSED' | 'CANCELLED' | 'QUEUED' | 'RUNNING' | 'SEARCHING' | 'ACQUIRING' | 'PARSING' | 'INDEXING' | 'DRAFTING_CLAIMS' | 'VERIFYING' | 'REPORTING' | 'FAILED' | 'COMPLETED' | 'NEEDS_REVISION';
+  status: 'PLANNED' | 'PAUSED' | 'CANCELLED' | 'QUEUED' | 'RUNNING' | 'SEARCHING' | 'ACQUIRING' | 'PARSING' | 'INDEXING' | 'DRAFTING_CLAIMS' | 'VERIFYING' | 'RESEARCHING_MORE' | 'REPORTING' | 'FAILED' | 'COMPLETED' | 'NEEDS_REVISION';
   constraints: TaskConstraints;
   revision_no: number;
   created_at: string;
@@ -108,6 +113,20 @@ export interface PipelineRunResponse {
   report_markdown_preview: string | null;
   failure: PipelineFailure | null;
   dependencies: Record<string, any>;
+}
+
+export interface ResearchPlanResponse {
+  task_id: string;
+  status: ResearchTask['status'];
+  revision_no: number;
+  updated_at: string;
+  planner_status: string;
+  planner_mode: string;
+  plan_source: string;
+  research_plan: Record<string, any>;
+  running_mode: string;
+  dependencies: Record<string, any>;
+  warnings: string[];
 }
 
 export interface CandidateUrl {
@@ -200,4 +219,7 @@ export interface ReportArtifact {
   storage_key: string;
   created_at: string;
   markdown: string;
+  report_language: string;
+  writer_mode: string;
+  llm_writer_status?: string | null;
 }

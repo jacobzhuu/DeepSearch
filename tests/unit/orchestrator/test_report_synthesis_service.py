@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from packages.db.models import (
@@ -18,12 +20,32 @@ from packages.db.models import (
 )
 from packages.db.repositories import ReportArtifactRepository
 from packages.db.repositories.sources import SourceChunkRepository, SourceDocumentRepository
+from services.orchestrator.app.llm import LLMRequest, LLMResponse
 from services.orchestrator.app.services.reporting import (
     ReportArtifactContentMismatchError,
     create_report_synthesis_service,
 )
 from services.orchestrator.app.services.research_tasks import create_research_task_service
 from services.orchestrator.app.storage import FilesystemSnapshotObjectStore
+
+
+class FakeReportLLMProvider:
+    name = "fake-report-llm"
+
+    def __init__(self, response_payload: dict[str, object]) -> None:
+        self.response_payload = response_payload
+        self.requests: list[LLMRequest] = []
+
+    def generate(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        return LLMResponse(
+            text=json.dumps(self.response_payload),
+            model=request.model or "fake-report-model",
+            provider=self.name,
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            raw_response_id="fake-response",
+            finish_reason="stop",
+        )
 
 
 def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
@@ -80,6 +102,110 @@ def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
         in first_result.markdown
     )
     assert stored_bytes.decode("utf-8") == first_result.markdown
+
+
+def test_report_synthesis_service_can_use_grounded_llm_writer(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    seeded = _seed_verified_claims(db_session)
+    claim, evidence = _first_supported_claim_and_evidence(db_session, seeded.task_id)
+    provider = FakeReportLLMProvider(
+        {
+            "title": "Grounded synthesized report",
+            "executive_summary": [
+                {
+                    "text": "The supported position is grounded in the cited ledger evidence.",
+                    "claim_ids": [str(claim.id)],
+                    "claim_evidence_ids": [str(evidence.id)],
+                    "citation_span_ids": [str(evidence.citation_span_id)],
+                }
+            ],
+            "sections": [
+                {
+                    "heading": "Verified finding",
+                    "items": [
+                        {
+                            "text": "This finding is tied to the verified claim.",
+                            "claim_ids": [str(claim.id)],
+                            "claim_evidence_ids": [str(evidence.id)],
+                            "citation_span_ids": [str(evidence.citation_span_id)],
+                        }
+                    ],
+                }
+            ],
+            "uncertainties": [],
+            "unresolved": [],
+        }
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+        llm_provider=provider,
+        llm_model="fake-report-model",
+        llm_report_writer_enabled=True,
+    )
+
+    result = service.generate_markdown_report(seeded.task_id)
+
+    assert provider.requests
+    assert provider.requests[0].metadata["purpose"] == "grounded_report_writer"
+    assert result.writer_mode == "llm_grounded"
+    assert result.llm_writer_status == "used"
+    assert result.title == "Grounded synthesized report"
+    assert "The supported position is grounded in the cited ledger evidence." in result.markdown
+    assert str(claim.id) in result.markdown
+    assert str(evidence.id) in result.markdown
+    assert "Appendix: Claim Evidence Mapping" in result.markdown
+    assert result.artifact.manifest_json["report_writer"]["mode"] == "llm_grounded"
+    assert result.artifact.manifest_json["report_writer"]["status"] == "used"
+
+
+def test_report_synthesis_service_falls_back_when_llm_ids_are_not_grounded(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    seeded = _seed_verified_claims(db_session)
+    provider = FakeReportLLMProvider(
+        {
+            "title": "Invalid ungrounded report",
+            "executive_summary": [
+                {
+                    "text": "This unsupported LLM-only sentence must not be rendered.",
+                    "claim_ids": ["not-a-real-claim"],
+                    "claim_evidence_ids": ["not-real-evidence"],
+                    "citation_span_ids": ["not-real-citation"],
+                }
+            ],
+            "sections": [],
+            "uncertainties": [],
+            "unresolved": [],
+        }
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+        llm_provider=provider,
+        llm_model="fake-report-model",
+        llm_report_writer_enabled=True,
+    )
+
+    result = service.generate_markdown_report(seeded.task_id)
+
+    assert result.writer_mode == "deterministic"
+    assert result.llm_writer_status == "fallback_after_llm_validation_error"
+    assert "This unsupported LLM-only sentence must not be rendered." not in result.markdown
+    assert "## Executive Summary" in result.markdown
+    assert (
+        result.artifact.manifest_json["report_writer"]["status"]
+        == "fallback_after_llm_validation_error"
+    )
 
 
 def test_get_latest_report_returns_stored_artifact_even_if_ledger_later_changes(
@@ -598,6 +724,23 @@ def test_report_synthesis_excludes_supported_other_and_setup_claims(
 class SeededReportClaims:
     def __init__(self, task_id: UUID) -> None:
         self.task_id = task_id
+
+
+def _first_supported_claim_and_evidence(
+    db_session: Session,
+    task_id: UUID,
+) -> tuple[Claim, ClaimEvidence]:
+    claim = db_session.scalars(
+        select(Claim)
+        .where(Claim.task_id == task_id)
+        .where(Claim.verification_status == "supported")
+    ).one()
+    evidence = db_session.scalars(
+        select(ClaimEvidence)
+        .where(ClaimEvidence.claim_id == claim.id)
+        .where(ClaimEvidence.relation_type == "support")
+    ).one()
+    return claim, evidence
 
 
 def _seed_verified_claims(db_session: Session) -> SeededReportClaims:

@@ -9,6 +9,8 @@ from services.orchestrator.app.services.research_tasks import (
     PHASE2_CANCELLED_STATUS,
     PHASE2_EXECUTABLE_CANDIDATE_STATUS,
     PHASE2_PAUSED_STATUS,
+    PIPELINE_QUEUED_EVENT,
+    RUNTIME_QUEUED_STATUS,
     TASK_CANCELLED_EVENT,
     TASK_CREATED_EVENT,
     TASK_PAUSED_EVENT,
@@ -52,7 +54,7 @@ def test_pause_resume_and_cancel_transitions_record_events(db_session: Session) 
     events = TaskEventRepository(db_session).list_for_task(task.id)
 
     assert paused_status == PHASE2_PAUSED_STATUS
-    assert resumed_status == PHASE2_ACTIVE_STATUS
+    assert resumed_status == RUNTIME_QUEUED_STATUS
     assert cancelled.status == PHASE2_CANCELLED_STATUS
     assert cancelled.ended_at is not None
     assert [event.sequence_no for event in events] == [1, 2, 3, 4]
@@ -112,6 +114,27 @@ def test_runtime_status_placeholders_do_not_change_current_resume_target() -> No
         "NEEDS_REVISION",
     )
     assert PHASE2_EXECUTABLE_CANDIDATE_STATUS == "PLANNED"
+    assert RUNTIME_QUEUED_STATUS == "QUEUED"
+
+
+def test_enqueue_task_records_queue_event(db_session: Session) -> None:
+    service = _create_service(db_session)
+    task = service.create_task(query="Queued task", constraints={})
+
+    queued = service.enqueue_task(
+        task.id,
+        dependencies={"uses_worker_or_queue": True},
+        running_mode="smoke-search+deterministic-local+no-LLM",
+    )
+    events = TaskEventRepository(db_session).list_for_task(task.id)
+
+    assert queued.status == RUNTIME_QUEUED_STATUS
+    assert events[-1].event_type == PIPELINE_QUEUED_EVENT
+    assert events[-1].payload_json["from_status"] == PHASE2_ACTIVE_STATUS
+    assert events[-1].payload_json["to_status"] == RUNTIME_QUEUED_STATUS
+    assert events[-1].payload_json["stage"] == RUNTIME_QUEUED_STATUS
+    ResearchTaskRepository(db_session).set_status(queued, PHASE2_ACTIVE_STATUS, ended_at=None)
+    db_session.commit()
 
 
 def test_invalid_transition_raises_conflict_error(db_session: Session) -> None:

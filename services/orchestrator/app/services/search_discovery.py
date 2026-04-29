@@ -85,6 +85,7 @@ class SearchDiscoveryService:
         task_id: UUID,
         *,
         planned_search_queries: list[PlannedSearchQuery] | None = None,
+        include_default_expansions: bool = True,
     ) -> SearchDiscoveryResult:
         task = self._get_task(task_id)
         if task.status not in self.allowed_statuses:
@@ -95,6 +96,7 @@ class SearchDiscoveryService:
             task.query,
             constraints=constraints,
             planned_search_queries=planned_search_queries,
+            include_default_expansions=include_default_expansions,
         )
         if not expanded_queries:
             raise ValueError(f"task {task.id} does not have a valid searchable query")
@@ -200,8 +202,20 @@ class SearchDiscoveryService:
                 constraints=constraints,
             )
             for known_path in known_path_candidates:
-                canonical = canonicalize_url(known_path["url"])
+                known_path_url = known_path.get("url")
+                known_path_title = known_path.get("title")
+                known_path_rank = known_path.get("rank")
+                if not isinstance(known_path_url, str) or not isinstance(
+                    known_path_title,
+                    str,
+                ):
+                    filtered_for_query += 1
+                    continue
+                canonical = canonicalize_url(known_path_url)
                 if canonical is None:
+                    filtered_for_query += 1
+                    continue
+                if not isinstance(known_path_rank, int):
                     filtered_for_query += 1
                     continue
                 if canonical.canonical_url in existing_candidates:
@@ -214,8 +228,8 @@ class SearchDiscoveryService:
                         original_url=canonical.original_url,
                         canonical_url=canonical.canonical_url,
                         domain=canonical.domain,
-                        title=known_path["title"],
-                        rank=int(known_path["rank"]),
+                        title=known_path_title,
+                        rank=known_path_rank,
                         selected=False,
                         metadata_json={
                             "provider": provider_response.provider,
@@ -310,6 +324,7 @@ class SearchDiscoveryService:
         *,
         constraints: dict[str, Any],
         planned_search_queries: list[PlannedSearchQuery] | None,
+        include_default_expansions: bool,
     ) -> list[ExpandedQuery]:
         base_expanded = self.query_expansion_strategy.expand(query, constraints=constraints)
         if not planned_search_queries:
@@ -330,16 +345,18 @@ class SearchDiscoveryService:
                         "expected_source_type": planned_query.expected_source_type,
                         "priority": planned_query.priority,
                         "query_source": planned_query.query_source,
+                        **dict(planned_query.metadata),
                     },
                 )
             )
             seen_query_texts.add(query_text)
 
-        for expanded_query in base_expanded:
-            if expanded_query.query_text in seen_query_texts:
-                continue
-            expanded_queries.append(expanded_query)
-            seen_query_texts.add(expanded_query.query_text)
+        if include_default_expansions:
+            for expanded_query in base_expanded:
+                if expanded_query.query_text in seen_query_texts:
+                    continue
+                expanded_queries.append(expanded_query)
+                seen_query_texts.add(expanded_query.query_text)
 
         return expanded_queries
 

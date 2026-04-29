@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 from packages.db.models import ResearchTask
 from services.orchestrator.app.api.schemas.research_tasks import (
     CreateResearchTaskRequest,
+    PlanResearchTaskRequest,
+    ResearchPlanMutationResponse,
     ResearchTaskDetailResponse,
     ResearchTaskMutationResponse,
     ResearchTaskObservabilityResponse,
@@ -19,6 +21,12 @@ from services.orchestrator.app.api.schemas.research_tasks import (
     TaskEventResponse,
 )
 from services.orchestrator.app.db import get_db_session
+from services.orchestrator.app.planning import (
+    ResearchPlannerError,
+    build_default_research_plan,
+    build_research_plan_from_payload,
+    create_research_planner_service,
+)
 from services.orchestrator.app.services.research_tasks import (
     ResearchTaskService,
     TaskNotFoundError,
@@ -26,6 +34,7 @@ from services.orchestrator.app.services.research_tasks import (
     TaskStateConflictError,
     create_research_task_service,
 )
+from services.orchestrator.app.settings import get_settings
 
 router = APIRouter(prefix="/api/v1/research/tasks", tags=["research-tasks"])
 SessionDep = Annotated[Session, Depends(get_db_session)]
@@ -50,7 +59,14 @@ def create_research_task(
     request: CreateResearchTaskRequest,
     service: ServiceDep,
 ) -> ResearchTaskMutationResponse:
-    task = service.create_task(query=request.query, constraints=request.constraints)
+    task = service.create_task(
+        query=request.query,
+        constraints=_constraints_with_report_language(
+            request.constraints,
+            report_language=request.report_language,
+        )
+        or {},
+    )
     return ResearchTaskMutationResponse(
         task_id=task.id,
         status=task.status,
@@ -97,6 +113,80 @@ def get_research_task_events(
     )
 
 
+@router.post("/{task_id}/plan", response_model=ResearchPlanMutationResponse)
+def plan_research_task(
+    task_id: UUID,
+    service: ServiceDep,
+    request: PlanResearchTaskRequest | None = None,
+) -> ResearchPlanMutationResponse:
+    request = request or PlanResearchTaskRequest()
+    snapshot = _get_task_snapshot_or_404(service, task_id)
+    settings = get_settings()
+    dependencies = _dependency_summary(settings)
+
+    try:
+        if request.research_plan is not None:
+            plan = build_research_plan_from_payload(
+                request.research_plan,
+                query=snapshot.task.query,
+                planner_mode="operator_edited",
+                max_subquestions=settings.research_planner_max_subquestions,
+                max_search_queries=settings.research_planner_max_search_queries,
+            )
+            plan_source = "operator_edited"
+        else:
+            planner_service = create_research_planner_service(settings)
+            if planner_service is None:
+                plan = build_default_research_plan(
+                    snapshot.task.query,
+                    max_subquestions=settings.research_planner_max_subquestions,
+                    max_search_queries=settings.research_planner_max_search_queries,
+                    planner_mode="deterministic",
+                )
+                plan_source = "deterministic_fallback"
+            else:
+                plan = planner_service.plan(
+                    task_id=task_id,
+                    query=snapshot.task.query,
+                    constraints=dict(snapshot.task.constraints_json),
+                )
+                plan_source = "planner_generated"
+    except ResearchPlannerError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=error.to_payload(),
+        ) from error
+
+    try:
+        running_mode = _running_mode(dependencies)
+        task = service.record_research_plan_created(
+            task_id,
+            research_plan=plan.to_payload(),
+            planner_mode=plan.planner_mode,
+            plan_source=plan_source,
+            summary=plan.summary_payload(),
+            warnings=_runtime_warnings(dependencies) + list(plan.warnings),
+            dependencies=dependencies,
+            running_mode=running_mode,
+        )
+    except TaskStateConflictError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    return ResearchPlanMutationResponse(
+        task_id=task.id,
+        status=task.status,
+        revision_no=task.revision_no,
+        updated_at=task.updated_at,
+        planner_status="created",
+        planner_mode=plan.planner_mode,
+        plan_source=plan_source,
+        research_plan=plan.to_payload(),
+        running_mode=running_mode,
+        dependencies=dependencies,
+        warnings=_runtime_warnings(dependencies) + list(plan.warnings),
+    )
+
+
 @router.post("/{task_id}/pause", response_model=ResearchTaskMutationResponse)
 def pause_research_task(task_id: UUID, service: ServiceDep) -> ResearchTaskMutationResponse:
     return _run_task_mutation(service.pause_task, task_id)
@@ -119,7 +209,14 @@ def revise_research_task(
     service: ServiceDep,
 ) -> ResearchTaskMutationResponse:
     try:
-        task = service.revise_task(task_id, query=request.query, constraints=request.constraints)
+        task = service.revise_task(
+            task_id,
+            query=request.query,
+            constraints=_constraints_with_report_language(
+                request.constraints,
+                report_language=request.report_language,
+            ),
+        )
     except TaskNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
     except TaskStateConflictError as error:
@@ -131,6 +228,18 @@ def revise_research_task(
         revision_no=task.revision_no,
         updated_at=task.updated_at,
     )
+
+
+def _constraints_with_report_language(
+    constraints: dict[str, Any] | None,
+    *,
+    report_language: str | None,
+) -> dict[str, Any] | None:
+    if report_language is None:
+        return constraints
+    normalized_constraints = dict(constraints or {})
+    normalized_constraints["report_language"] = report_language
+    return normalized_constraints
 
 
 def _run_task_mutation(
@@ -185,7 +294,112 @@ def _serialize_task_snapshot(snapshot: TaskSnapshot) -> ResearchTaskDetailRespon
     )
 
 
+def _dependency_summary(settings: Any) -> dict[str, Any]:
+    search_mode = settings.search_provider.strip().lower()
+    index_mode = settings.index_backend.strip().lower()
+    return {
+        "search_provider": search_mode,
+        "search_mode": "smoke-search" if search_mode == "smoke" else "real-search",
+        "searxng_base_url": settings.searxng_base_url,
+        "snapshot_storage_backend": settings.snapshot_storage_backend,
+        "snapshot_storage_root": settings.snapshot_storage_root,
+        "snapshot_storage_bucket": settings.snapshot_storage_bucket,
+        "report_storage_bucket": settings.report_storage_bucket,
+        "index_backend": index_mode,
+        "index_mode": "deterministic-local" if index_mode in {"local", "memory"} else index_mode,
+        "opensearch_base_url": settings.opensearch_base_url,
+        "opensearch_index_name": settings.opensearch_index_name,
+        "uses_llm_api": _uses_llm_api(settings),
+        "llm_mode": _llm_mode(settings),
+        "llm_provider": settings.llm_provider.strip().lower() or "noop",
+        "llm_model": settings.llm_model.strip(),
+        "llm_base_url_configured": bool(settings.llm_base_url.strip()),
+        "research_planner_enabled": bool(
+            settings.research_planner_enabled and settings.llm_enabled
+        ),
+        "llm_report_writer_enabled": _llm_report_writer_configured(settings),
+        "report_writer_mode": (
+            "llm-grounded" if _llm_report_writer_configured(settings) else "deterministic"
+        ),
+        "uses_worker_or_queue": True,
+    }
+
+
+def _llm_mode(settings: Any) -> str:
+    planner_configured = bool(settings.research_planner_enabled and settings.llm_enabled)
+    report_configured = _llm_report_writer_configured(settings)
+    if report_configured and planner_configured:
+        return "planner+report-LLM"
+    if report_configured:
+        return "report-LLM"
+    if not planner_configured:
+        return "no-LLM"
+    normalized_provider = settings.llm_provider.strip().lower() or "noop"
+    if normalized_provider == "noop":
+        return "planner-noop"
+    return "planner-LLM"
+
+
+def _uses_llm_api(settings: Any) -> bool:
+    return bool(
+        settings.llm_enabled
+        and settings.llm_provider.strip().lower() not in {"", "noop"}
+        and (settings.research_planner_enabled or settings.llm_report_writer_enabled)
+    )
+
+
+def _llm_report_writer_configured(settings: Any) -> bool:
+    return bool(
+        settings.llm_enabled
+        and settings.llm_report_writer_enabled
+        and settings.llm_provider.strip().lower() not in {"", "noop"}
+    )
+
+
+def _running_mode(dependencies: dict[str, Any]) -> str:
+    return "+".join(
+        [
+            str(
+                dependencies.get("search_mode")
+                or dependencies.get("search_provider")
+                or "unknown-search"
+            ),
+            str(
+                dependencies.get("index_mode")
+                or dependencies.get("index_backend")
+                or "unknown-index"
+            ),
+            str(dependencies.get("llm_mode") or "unknown-llm"),
+        ]
+    )
+
+
+def _runtime_warnings(dependencies: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    if dependencies.get("search_provider") == "smoke":
+        warnings.append(
+            "Development smoke mode is active; sources are synthetic fixtures, "
+            "not real web evidence."
+        )
+    if dependencies.get("index_mode") == "deterministic-local":
+        warnings.append(
+            "Local deterministic index backend is active; retrieval is for smoke validation, "
+            "not durable research."
+        )
+    if dependencies.get("llm_mode") == "no-LLM":
+        warnings.append(
+            "No LLM planner is active; generated plans use deterministic fallback only."
+        )
+    elif not dependencies.get("research_planner_enabled"):
+        warnings.append(
+            "No LLM planner is active; generated plans use deterministic fallback only."
+        )
+    return warnings
+
+
 def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityResponse | None:
+    running_mode: str | None = None
+    dependencies: dict[str, Any] | None = None
     planner_enabled: bool | None = None
     planner_mode: str | None = None
     planner_status: str | None = None
@@ -218,8 +432,11 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     evidence_yield_summary: dict[str, Any] | None = None
     verification_summary: dict[str, Any] | None = None
     supplemental_acquisition: dict[str, Any] | None = None
+    gap_analysis: dict[str, Any] | None = None
+    gap_rounds: list[dict[str, Any]] = []
     failure_diagnostics: dict[str, Any] | None = None
     warnings: list[str] = []
+    runtime_warnings: list[str] = []
 
     for event in snapshot.events:
         payload = event.payload_json or {}
@@ -230,6 +447,13 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             result = {}
 
         stage = payload.get("stage")
+        dependency_payload = payload.get("dependencies")
+        if isinstance(dependency_payload, dict):
+            dependencies = dependency_payload
+            running_mode = _string_or_none(payload.get("running_mode")) or _running_mode(
+                dependency_payload
+            )
+            runtime_warnings.extend(_runtime_warnings(dependency_payload))
         if event.event_type == "research_plan.created":
             planner_enabled = True
             planner_status = "created"
@@ -380,6 +604,55 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             slot_coverage_summary = (
                 _object_list(result.get("slot_coverage_summary")) or slot_coverage_summary
             )
+        elif stage == "RESEARCHING_MORE":
+            if result:
+                gap_rounds.append(result)
+            gap = result.get("gap_analysis")
+            if isinstance(gap, dict):
+                gap_analysis = gap
+            search = result.get("search")
+            if isinstance(search, dict):
+                value = search.get("search_result_count")
+                if isinstance(value, int):
+                    search_result_count = value
+                selected_sources = _object_list(search.get("selected_sources")) or selected_sources
+            acquisition = result.get("acquisition")
+            if isinstance(acquisition, dict):
+                succeeded = acquisition.get(
+                    "fetch_succeeded",
+                    acquisition.get("succeeded"),
+                )
+                failed = acquisition.get("fetch_failed", acquisition.get("failed"))
+                if isinstance(succeeded, int):
+                    fetch_succeeded = succeeded
+                if isinstance(failed, int):
+                    fetch_failed = failed
+                attempted_sources = (
+                    _object_list(acquisition.get("attempted_sources")) or attempted_sources
+                )
+                unattempted_sources = (
+                    _object_list(acquisition.get("unattempted_sources")) or unattempted_sources
+                )
+                failed_sources = _object_list(acquisition.get("failed_sources"))
+            parsing = result.get("parsing")
+            if isinstance(parsing, dict):
+                parse_decisions = _object_list(parsing.get("parse_decisions")) or parse_decisions
+            drafting = result.get("drafting")
+            if isinstance(drafting, dict):
+                source_yield_summary = (
+                    _object_list(drafting.get("source_yield_summary")) or source_yield_summary
+                )
+                evidence_summary = drafting.get("evidence_yield_summary")
+                if isinstance(evidence_summary, dict):
+                    evidence_yield_summary = evidence_summary
+            verification = result.get("verification")
+            if isinstance(verification, dict):
+                verification_payload = verification.get("verification_summary")
+                if isinstance(verification_payload, dict):
+                    verification_summary = verification_payload
+            slot_coverage_summary = (
+                _object_list(result.get("slot_coverage_summary")) or slot_coverage_summary
+            )
         elif stage == "REPORTING":
             quality_summary = result.get("source_quality_summary")
             if isinstance(quality_summary, dict):
@@ -431,8 +704,10 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
 
         warnings.extend(_string_list(payload.get("warnings")))
         warnings.extend(_string_list(result.get("warnings")))
+        if event.event_type.endswith(".gap_analysis") and isinstance(result, dict):
+            gap_analysis = result
 
-    deduped_warnings = list(dict.fromkeys(warnings))
+    deduped_warnings = list(dict.fromkeys(warnings + runtime_warnings))
     source_yield_rows = source_yield_summary or answer_yield
     selected_sources = _sources_with_yield(selected_sources, source_yield_rows)
     attempted_sources = _sources_with_yield(attempted_sources, source_yield_rows)
@@ -464,10 +739,14 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and supplemental_acquisition is None
         and failure_diagnostics is None
         and not deduped_warnings
+        and running_mode is None
+        and dependencies is None
     ):
         return None
 
     return ResearchTaskObservabilityResponse(
+        running_mode=running_mode,
+        dependencies=dependencies,
         planner_enabled=planner_enabled,
         planner_mode=planner_mode,
         planner_status=planner_status,
@@ -500,6 +779,8 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         evidence_yield_summary=evidence_yield_summary or {},
         verification_summary=verification_summary or {},
         supplemental_acquisition=supplemental_acquisition,
+        gap_analysis=gap_analysis,
+        gap_rounds=gap_rounds,
         failure_diagnostics=failure_diagnostics,
         warnings=deduped_warnings,
     )

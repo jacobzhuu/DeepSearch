@@ -116,6 +116,35 @@ def test_get_report_returns_stored_artifact_after_task_query_changes(
         client_generator.close()
 
 
+def test_report_generation_uses_zh_cn_template_from_task_constraints(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    with session_factory() as session:
+        task_id = _seed_verified_claims(
+            session,
+            constraints={"language": "zh-CN", "report_language": "zh-CN"},
+        )
+
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "reports"))
+    object_store.validate_configuration()
+    client_generator = _build_client(session_factory, object_store)
+    client = next(client_generator)
+    try:
+        generate_response = client.post(f"/api/v1/research/tasks/{task_id}/report")
+
+        assert generate_response.status_code == 200
+        payload = generate_response.json()
+        assert payload["report_language"] == "zh-CN"
+        assert payload["writer_mode"] == "deterministic"
+        assert payload["title"].startswith("研究报告：")
+        assert "## 研究问题" in payload["markdown"]
+        assert "## 执行摘要" in payload["markdown"]
+        assert "## 附录：claim/evidence/citation 映射" in payload["markdown"]
+    finally:
+        client_generator.close()
+
+
 def test_get_report_returns_500_when_artifact_hash_verification_fails(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
@@ -164,10 +193,10 @@ def _build_client(
     app.dependency_overrides.clear()
 
 
-def _seed_verified_claims(session: Session) -> UUID:
+def _seed_verified_claims(session: Session, constraints: dict[str, object] | None = None) -> UUID:
     task = create_research_task_service(session).create_task(
         query="What is the current verified position?",
-        constraints={},
+        constraints=constraints or {},
     )
     source_document = SourceDocumentRepository(session).add(
         SourceDocument(

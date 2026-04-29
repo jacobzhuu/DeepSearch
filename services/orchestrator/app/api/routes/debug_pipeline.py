@@ -24,6 +24,7 @@ from services.orchestrator.app.api.schemas.debug_pipeline import (
 )
 from services.orchestrator.app.db import get_db_session
 from services.orchestrator.app.indexing import ChunkIndexBackend
+from services.orchestrator.app.llm import create_llm_provider
 from services.orchestrator.app.planning import create_research_planner_service
 from services.orchestrator.app.search import QueryExpansionStrategy, SearchProvider
 from services.orchestrator.app.services.acquisition import create_acquisition_service
@@ -79,6 +80,9 @@ def run_debug_real_pipeline(
 
     dependencies = _dependency_summary(settings)
     _validate_required_configuration(dependencies)
+    llm_report_provider = (
+        create_llm_provider(settings) if _llm_report_writer_configured(settings) else None
+    )
 
     runner = DebugRealPipelineRunner(
         session,
@@ -125,6 +129,10 @@ def run_debug_real_pipeline(
             session,
             object_store=snapshot_object_store,
             report_storage_bucket=settings.report_storage_bucket,
+            llm_provider=llm_report_provider,
+            llm_model=settings.llm_model,
+            llm_report_writer_enabled=llm_report_provider is not None,
+            llm_report_max_output_tokens=settings.llm_report_max_output_tokens,
         ),
         planner_service=create_research_planner_service(settings),
         dependencies=dependencies,
@@ -137,6 +145,8 @@ def run_debug_real_pipeline(
         target_successful_snapshots=settings.acquisition_target_successful_snapshots,
         min_answer_sources=settings.acquisition_min_answer_sources,
         max_supplemental_sources=settings.acquisition_max_supplemental_sources,
+        max_gap_rounds=settings.research_gap_max_rounds,
+        gap_max_queries_per_round=settings.research_gap_max_queries_per_round,
     )
 
     try:
@@ -185,11 +195,7 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
         "index_mode": settings.index_backend,
         "opensearch_base_url": settings.opensearch_base_url,
         "opensearch_index_name": settings.opensearch_index_name,
-        "uses_llm_api": bool(
-            settings.llm_enabled
-            and settings.research_planner_enabled
-            and settings.llm_provider.strip().lower() not in {"", "noop"}
-        ),
+        "uses_llm_api": _uses_llm_api(settings),
         "llm_mode": _llm_mode(settings),
         "llm_provider": settings.llm_provider.strip().lower() or "noop",
         "llm_model": settings.llm_model.strip(),
@@ -197,17 +203,43 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
         "research_planner_enabled": bool(
             settings.research_planner_enabled and settings.llm_enabled
         ),
+        "llm_report_writer_enabled": _llm_report_writer_configured(settings),
+        "report_writer_mode": (
+            "llm-grounded" if _llm_report_writer_configured(settings) else "deterministic"
+        ),
         "uses_worker_or_queue": False,
     }
 
 
 def _llm_mode(settings: Any) -> str:
-    if not settings.research_planner_enabled or not settings.llm_enabled:
+    planner_configured = bool(settings.research_planner_enabled and settings.llm_enabled)
+    report_configured = _llm_report_writer_configured(settings)
+    if report_configured and planner_configured:
+        return "planner+report-LLM"
+    if report_configured:
+        return "report-LLM"
+    if not planner_configured:
         return "no-LLM"
     normalized_provider = settings.llm_provider.strip().lower() or "noop"
     if normalized_provider == "noop":
         return "planner-noop"
     return "planner-LLM"
+
+
+def _uses_llm_api(settings: Any) -> bool:
+    return bool(
+        settings.llm_enabled
+        and settings.llm_provider.strip().lower() not in {"", "noop"}
+        and (settings.research_planner_enabled or settings.llm_report_writer_enabled)
+    )
+
+
+def _llm_report_writer_configured(settings: Any) -> bool:
+    return bool(
+        settings.llm_enabled
+        and settings.llm_report_writer_enabled
+        and settings.llm_provider.strip().lower() not in {"", "noop"}
+    )
 
 
 def _validate_required_configuration(dependencies: dict[str, Any]) -> None:

@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
+from services.orchestrator.app.reporting.language import (
+    DEFAULT_REPORT_LANGUAGE,
+    is_chinese_report_language,
+    normalize_report_language,
+)
 from services.orchestrator.app.research_quality import (
     answer_slot_coverage,
     answer_slots_for_query,
@@ -103,9 +108,12 @@ def render_markdown_report(
     revision_no: int,
     claims: list[ReportClaimItem],
     sources: list[ReportSourceItem],
+    report_language: str = DEFAULT_REPORT_LANGUAGE,
     answer_relevant_claim_count: int | None = None,
     excluded_low_quality_claim_count: int = 0,
 ) -> RenderedMarkdownReport:
+    normalized_language = normalize_report_language(report_language)
+    labels = _report_labels(normalized_language)
     ordered_claims = sorted(claims, key=_claim_sort_key)
     supported_claims = [item for item in ordered_claims if item.verification_status == "supported"]
     weak_supported_claims = [
@@ -122,7 +130,7 @@ def render_markdown_report(
     if answer_relevant_claim_count is None:
         answer_relevant_claim_count = len(ordered_claims)
 
-    title = build_report_title(research_question)
+    title = build_report_title(research_question, report_language=normalized_language)
     supported_by_category = _claims_by_category(strong_supported_claims)
     covered_categories = set(supported_by_category)
     slot_coverage = answer_slot_coverage(research_question, covered_categories)
@@ -143,13 +151,13 @@ def render_markdown_report(
     lines = [
         f"# {title}",
         "",
-        f"_Generated from research task `{task_id}` at revision `{revision_no}`._",
+        labels["generated"].format(task_id=task_id, revision_no=revision_no),
         "",
-        "## Research Question",
+        f"## {labels['research_question']}",
         "",
         _normalize_inline(research_question),
         "",
-        "## Executive Summary",
+        f"## {labels['executive_summary']}",
         "",
     ]
 
@@ -157,36 +165,38 @@ def render_markdown_report(
         for claim in strong_supported_claims[:6]:
             lines.append(f"- {_normalize_inline(claim.statement)}")
     else:
-        lines.append(
-            "- No strongly supported claims are currently available in the persisted ledger."
-        )
+        lines.append(f"- {labels['no_strong_claims']}")
     if weak_supported_claims:
         lines.append(
-            f"- {len(weak_supported_claims)} claim(s) have weak lexical support only and "
-            "are kept out of the main answer sections."
+            "- " + labels["weak_supported_claims"].format(count=len(weak_supported_claims))
         )
     if answer_relevant_claim_count < 2 or missing_core_categories:
         lines.append(
-            "- Coverage is limited because no "
-            f"{'/'.join(missing_core_categories) or 'additional'} claims were generated."
+            "- "
+            + labels["coverage_limited"].format(
+                categories="/".join(missing_core_categories) or labels["additional"]
+            )
         )
     if mixed_claims or unsupported_claims or draft_claims:
         lines.append(
-            "- Current uncertainty remains:"
-            f" {len(mixed_claims)} mixed,"
-            f" {len(unsupported_claims)} unsupported,"
-            f" {len(draft_claims)} draft."
+            "- "
+            + labels["uncertainty_counts"].format(
+                mixed=len(mixed_claims),
+                unsupported=len(unsupported_claims),
+                draft=len(draft_claims),
+            )
         )
     lines.extend(
         [
             "",
-            "## Answer",
+            f"## {labels['answer']}",
             "",
         ]
     )
 
     for slot in answer_slots_for_query(research_question):
-        lines.extend([f"### {slot.label}", ""])
+        slot_label = _slot_label(slot.label, report_language=normalized_language)
+        lines.extend([f"### {slot_label}", ""])
         section_claims = [
             claim
             for claim in strong_supported_claims
@@ -196,41 +206,37 @@ def render_markdown_report(
             for claim in section_claims:
                 lines.append(f"- {_normalize_inline(claim.statement)}")
         else:
-            lines.append(
-                f"- Coverage is limited because no strongly supported {slot.label.lower()} "
-                "claims were generated."
-            )
+            lines.append("- " + labels["slot_coverage_limited"].format(slot=slot_label.lower()))
         lines.append("")
 
-    lines.extend(["## Answer Slot Coverage", ""])
+    lines.extend([f"## {labels['answer_slot_coverage']}", ""])
     if slot_coverage_summary:
         lines.extend(
             [
-                "| Slot | Status | Evidence candidates | Accepted evidence | "
-                "Strong claims | Weak claims | Sources |",
+                labels["slot_coverage_header"],
                 "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
-        for slot in slot_coverage_summary:
+        for coverage_slot in slot_coverage_summary:
             lines.append(
                 "| "
-                f"{_escape_table_cell(str(slot.get('slot_id', 'unknown')))} | "
-                f"{_escape_table_cell(str(slot.get('status', 'unknown')))} | "
-                f"{slot.get('evidence_candidate_count', 0)} | "
-                f"{slot.get('accepted_evidence_count', 0)} | "
-                f"{slot.get('supported_claim_count', 0)} | "
-                f"{slot.get('weak_supported_claim_count', 0)} | "
-                f"{slot.get('source_count', 0)} |"
+                f"{_escape_table_cell(str(coverage_slot.get('slot_id', 'unknown')))} | "
+                f"{_escape_table_cell(str(coverage_slot.get('status', 'unknown')))} | "
+                f"{coverage_slot.get('evidence_candidate_count', 0)} | "
+                f"{coverage_slot.get('accepted_evidence_count', 0)} | "
+                f"{coverage_slot.get('supported_claim_count', 0)} | "
+                f"{coverage_slot.get('weak_supported_claim_count', 0)} | "
+                f"{coverage_slot.get('source_count', 0)} |"
             )
     else:
-        lines.append("No answer-slot coverage summary is available.")
+        lines.append(labels["no_slot_coverage"])
 
-    lines.extend(["", "## Evidence Table", ""])
+    lines.extend(["", f"## {labels['evidence_table']}", ""])
     evidence_rows = _evidence_rows(supported_claims)
     if evidence_rows:
         lines.extend(
             [
-                "| Claim category | Support detail | Claim | Evidence domain | Source |",
+                labels["evidence_table_header"],
                 "| --- | --- | --- | --- | --- |",
             ]
         )
@@ -244,39 +250,41 @@ def render_markdown_report(
                 f"{_escape_table_cell(evidence.canonical_url)} |"
             )
     else:
-        lines.append("No support evidence rows are currently available.")
+        lines.append(labels["no_evidence_rows"])
 
-    lines.extend(["", "## Source Scope and Limitations", ""])
+    lines.extend(["", f"## {labels['source_scope']}", ""])
+    lines.append(f"- {labels['source_scope_strict']}")
+    lines.append(f"- {labels['deterministic_generation']}")
     lines.append(
-        "- This report is synthesized strictly from persisted task, claim, citation, "
-        "evidence, and verification records."
+        "- "
+        + labels["claim_counts"].format(
+            strong=len(strong_supported_claims),
+            weak=len(weak_supported_claims),
+            mixed=len(mixed_claims),
+            unsupported=len(unsupported_claims),
+            draft=len(draft_claims),
+        )
+    )
+    lines.append("- " + labels["answer_relevant"].format(count=answer_relevant_claim_count))
+    lines.append("- " + labels["excluded_claims"].format(count=excluded_low_quality_claim_count))
+    lines.append(
+        "- "
+        + labels["answer_slot_count"].format(
+            covered=sum(1 for slot in slot_coverage if slot["covered"]),
+            total=len(slot_coverage),
+        )
     )
     lines.append(
-        "- No new search, fetch, parse, index, verifier, or LLM report-writing logic was "
-        "executed while generating this artifact."
-    )
-    lines.append(
-        "- Claim counts:"
-        f" {len(strong_supported_claims)} strongly supported,"
-        f" {len(weak_supported_claims)} weak-supported,"
-        f" {len(mixed_claims)} mixed,"
-        f" {len(unsupported_claims)} unsupported,"
-        f" {len(draft_claims)} draft."
-    )
-    lines.append(f"- Answer-relevant claims included: {answer_relevant_claim_count}.")
-    lines.append(f"- Excluded low-quality or off-query claims: {excluded_low_quality_claim_count}.")
-    lines.append(
-        "- Answer slot coverage:"
-        f" {sum(1 for slot in slot_coverage if slot['covered'])}/{len(slot_coverage)}."
-    )
-    lines.append(
-        "- Evidence-linked source documents:"
-        f" {len(sources)} across domains: {', '.join(source_domains) or 'none'}."
+        "- "
+        + labels["evidence_sources"].format(
+            count=len(sources),
+            domains=", ".join(source_domains) or labels["none"],
+        )
     )
     if len(source_domains) == 1:
-        lines.append("- Warning: source coverage uses only one evidence domain.")
+        lines.append(f"- {labels['one_domain_warning']}")
 
-    lines.extend(["", "## Unresolved / Low Coverage Areas", ""])
+    lines.extend(["", f"## {labels['unresolved']}", ""])
     unresolved_claims = weak_supported_claims + mixed_claims + unsupported_claims + draft_claims
     weak_or_missing_slots = [
         slot
@@ -287,31 +295,35 @@ def render_markdown_report(
         weak_missing_labels = ", ".join(
             str(slot.get("label") or slot.get("slot_id")) for slot in weak_or_missing_slots
         )
-        lines.append("- Missing or weak required answer slots:" f" {weak_missing_labels}.")
+        lines.append("- " + labels["weak_missing_slots"].format(slots=weak_missing_labels))
     if missing_required_slots:
         lines.append(
-            "- Missing required answer slots:"
-            f" {', '.join(str(slot['label']) for slot in missing_required_slots)}."
+            "- "
+            + labels["missing_required_slots"].format(
+                slots=", ".join(str(slot["label"]) for slot in missing_required_slots)
+            )
         )
     if missing_core_categories:
-        lines.append("- Missing answer coverage:" f" {', '.join(missing_core_categories)}.")
+        lines.append(
+            "- "
+            + labels["missing_answer_coverage"].format(
+                categories=", ".join(missing_core_categories)
+            )
+        )
     if unresolved_claims:
         for claim in unresolved_claims:
             lines.append(f"- {_normalize_inline(claim.statement)}")
     elif not ordered_claims:
-        lines.append("- The ledger currently contains no claims to synthesize.")
+        lines.append(f"- {labels['no_claims']}")
     elif not missing_core_categories:
-        lines.append(
-            "- No additional unresolved questions were inferred beyond the current"
-            " verified claim set."
-        )
+        lines.append(f"- {labels['no_extra_unresolved']}")
 
-    lines.extend(["", "## Appendix: Claim Evidence Mapping", ""])
+    lines.extend(["", f"## {labels['claim_mapping']}", ""])
     if ordered_claims:
         for claim in ordered_claims:
-            lines.extend(_render_claim_mapping(claim))
+            lines.extend(_render_claim_mapping(claim, report_language=normalized_language))
     else:
-        lines.append("No claim-to-citation mappings are currently available.")
+        lines.append(labels["no_mappings"])
 
     markdown = "\n".join(lines).strip() + "\n"
     return RenderedMarkdownReport(
@@ -326,8 +338,16 @@ def render_markdown_report(
     )
 
 
-def build_report_title(research_question: str) -> str:
+def build_report_title(
+    research_question: str,
+    *,
+    report_language: str = DEFAULT_REPORT_LANGUAGE,
+) -> str:
     normalized = _normalize_inline(research_question)
+    if is_chinese_report_language(report_language):
+        if not normalized:
+            return "研究报告"
+        return f"研究报告：{normalized}"
     if not normalized:
         return "Research Report"
     return f"Research Report: {normalized}"
@@ -391,10 +411,15 @@ def _render_claim_section(index: int, claim: ReportClaimItem) -> list[str]:
     return lines
 
 
-def _render_claim_mapping(claim: ReportClaimItem) -> list[str]:
+def _render_claim_mapping(
+    claim: ReportClaimItem,
+    *,
+    report_language: str = DEFAULT_REPORT_LANGUAGE,
+) -> list[str]:
+    labels = _report_labels(report_language)
     lines = [
         (
-            f"- Claim `{claim.claim_id}` [{claim.verification_status.upper()}]:"
+            f"- {labels['claim_label']} `{claim.claim_id}` [{claim.verification_status.upper()}]:"
             f" {_normalize_inline(claim.statement)}"
         ),
     ]
@@ -408,19 +433,20 @@ def _render_claim_mapping(claim: ReportClaimItem) -> list[str]:
         ),
     )
     if not evidence_items:
-        lines.append("  - No citation spans recorded.")
+        lines.append(f"  - {labels['no_citation_spans']}")
         return lines
     for evidence in evidence_items:
         lines.append(
             "  - "
             f"{evidence.relation_type}"
             f"({evidence.relation_detail or evidence.support_level or 'n/a'})"
-            f" | citation `{evidence.citation_span_id}`"
-            f" | source `{evidence.source_document_id}`"
-            f" | chunk `{evidence.source_chunk_id}` #{evidence.chunk_no}"
-            f" | offsets `{evidence.start_offset}:{evidence.end_offset}`"
+            f" | {labels['claim_evidence_id']} `{evidence.claim_evidence_id}`"
+            f" | {labels['citation']} `{evidence.citation_span_id}`"
+            f" | {labels['source']} `{evidence.source_document_id}`"
+            f" | {labels['chunk']} `{evidence.source_chunk_id}` #{evidence.chunk_no}"
+            f" | {labels['offsets']} `{evidence.start_offset}:{evidence.end_offset}`"
             f" | {evidence.canonical_url}"
-            f' | excerpt: "{_normalize_inline(evidence.excerpt)}"'
+            f' | {labels["excerpt"]}: "{_normalize_inline(evidence.excerpt)}"'
         )
     return lines
 
@@ -487,6 +513,155 @@ def _claim_support_level(claim: ReportClaimItem) -> str:
 
 def _evidence_detail(evidence: ReportEvidenceItem) -> str:
     return evidence.relation_detail or evidence.support_level or "support"
+
+
+def _slot_label(label: str, *, report_language: str) -> str:
+    if not is_chinese_report_language(report_language):
+        return label
+    mapping = {
+        "What it is": "是什么",
+        "How it works": "工作机制",
+        "Privacy / tracking behavior": "隐私 / 追踪行为",
+        "Key features / limitations": "关键功能 / 限制",
+        "Deployment target": "部署目标",
+        "Deployment steps": "部署步骤",
+        "Configuration / operations": "配置 / 运维",
+        "Evidence quality": "证据质量",
+    }
+    return mapping.get(label, label)
+
+
+def _report_labels(report_language: str) -> dict[str, str]:
+    if is_chinese_report_language(report_language):
+        return {
+            "additional": "更多",
+            "answer": "研究结论",
+            "answer_relevant": "已纳入与问题相关的 claim：{count}。",
+            "answer_slot_count": "答案槽位覆盖：{covered}/{total}。",
+            "answer_slot_coverage": "答案槽位覆盖",
+            "chunk": "chunk",
+            "citation": "citation",
+            "claim_counts": (
+                "Claim 计数：{strong} 条强支持、{weak} 条弱支持、{mixed} 条混合、"
+                "{unsupported} 条不支持、{draft} 条草稿。"
+            ),
+            "claim_evidence_id": "claim_evidence",
+            "claim_label": "Claim",
+            "claim_mapping": "附录：claim/evidence/citation 映射",
+            "coverage_limited": "覆盖有限，因为未生成 {categories} 类 claim。",
+            "deterministic_generation": (
+                "生成该 artifact 时没有执行新的搜索、抓取、解析、索引、验证器或 LLM 报告写作逻辑。"
+            ),
+            "evidence_sources": "带证据链接的来源文档：{count} 个；域名：{domains}。",
+            "evidence_table": "证据表",
+            "evidence_table_header": "| Claim 类别 | 支持细节 | Claim | 证据域名 | 来源 |",
+            "excluded_claims": "已排除低质量或偏离问题的 claim：{count}。",
+            "excerpt": "摘录",
+            "executive_summary": "执行摘要",
+            "generated": "_由 research_task `{task_id}` revision `{revision_no}` 生成。_",
+            "missing_answer_coverage": "缺失答案覆盖：{categories}。",
+            "missing_required_slots": "缺失必需答案槽位：{slots}。",
+            "no_citation_spans": "未记录 citation span。",
+            "no_claims": "当前 ledger 中没有可综合的 claim。",
+            "no_evidence_rows": "当前没有支持性证据行。",
+            "no_extra_unresolved": "除当前已验证 claim 集外，未推断额外未解决问题。",
+            "no_mappings": "当前没有 claim 到 citation 的映射。",
+            "no_slot_coverage": "当前没有答案槽位覆盖摘要。",
+            "no_strong_claims": "当前 persisted ledger 中没有强支持 claim。",
+            "none": "无",
+            "offsets": "offsets",
+            "one_domain_warning": "警告：来源覆盖仅使用一个证据域名。",
+            "research_question": "研究问题",
+            "slot_coverage_header": (
+                "| 槽位 | 状态 | 候选证据 | 已采纳证据 | 强支持 claim | 弱支持 claim | 来源数 |"
+            ),
+            "slot_coverage_limited": "覆盖有限，因为未生成强支持的 {slot} claim。",
+            "source": "source",
+            "source_scope": "来源范围与限制",
+            "source_scope_strict": (
+                "本报告严格由已持久化的 task、claim、citation、evidence 和 verification 记录综合。"
+            ),
+            "uncertainty_counts": (
+                "当前仍有不确定性：{mixed} 条 mixed、{unsupported} 条 unsupported、"
+                "{draft} 条 draft。"
+            ),
+            "unresolved": "未解决问题 / 低覆盖区域",
+            "weak_missing_slots": "缺失或较弱的必需答案槽位：{slots}。",
+            "weak_supported_claims": ("{count} 条 claim 只有弱词法支持，已从主要答案章节中排除。"),
+        }
+    return {
+        "additional": "additional",
+        "answer": "Answer",
+        "answer_relevant": "Answer-relevant claims included: {count}.",
+        "answer_slot_count": "Answer slot coverage: {covered}/{total}.",
+        "answer_slot_coverage": "Answer Slot Coverage",
+        "chunk": "chunk",
+        "citation": "citation",
+        "claim_counts": (
+            "Claim counts: {strong} strongly supported, {weak} weak-supported, "
+            "{mixed} mixed, {unsupported} unsupported, {draft} draft."
+        ),
+        "claim_evidence_id": "claim_evidence",
+        "claim_label": "Claim",
+        "claim_mapping": "Appendix: Claim Evidence Mapping",
+        "coverage_limited": "Coverage is limited because no {categories} claims were generated.",
+        "deterministic_generation": (
+            "No new search, fetch, parse, index, verifier, or LLM report-writing logic was "
+            "executed while generating this artifact."
+        ),
+        "evidence_sources": (
+            "Evidence-linked source documents: {count} across domains: {domains}."
+        ),
+        "evidence_table": "Evidence Table",
+        "evidence_table_header": (
+            "| Claim category | Support detail | Claim | Evidence domain | Source |"
+        ),
+        "excluded_claims": "Excluded low-quality or off-query claims: {count}.",
+        "excerpt": "excerpt",
+        "executive_summary": "Executive Summary",
+        "generated": "_Generated from research task `{task_id}` at revision `{revision_no}`._",
+        "missing_answer_coverage": "Missing answer coverage: {categories}.",
+        "missing_required_slots": "Missing required answer slots: {slots}.",
+        "no_citation_spans": "No citation spans recorded.",
+        "no_claims": "The ledger currently contains no claims to synthesize.",
+        "no_evidence_rows": "No support evidence rows are currently available.",
+        "no_extra_unresolved": (
+            "No additional unresolved questions were inferred beyond the current verified "
+            "claim set."
+        ),
+        "no_mappings": "No claim-to-citation mappings are currently available.",
+        "no_slot_coverage": "No answer-slot coverage summary is available.",
+        "no_strong_claims": (
+            "No strongly supported claims are currently available in the persisted ledger."
+        ),
+        "none": "none",
+        "offsets": "offsets",
+        "one_domain_warning": "Warning: source coverage uses only one evidence domain.",
+        "research_question": "Research Question",
+        "slot_coverage_header": (
+            "| Slot | Status | Evidence candidates | Accepted evidence | "
+            "Strong claims | Weak claims | Sources |"
+        ),
+        "slot_coverage_limited": (
+            "Coverage is limited because no strongly supported {slot} claims were generated."
+        ),
+        "source": "source",
+        "source_scope": "Source Scope and Limitations",
+        "source_scope_strict": (
+            "This report is synthesized strictly from persisted task, claim, citation, "
+            "evidence, and verification records."
+        ),
+        "uncertainty_counts": (
+            "Current uncertainty remains: {mixed} mixed, {unsupported} unsupported, "
+            "{draft} draft."
+        ),
+        "unresolved": "Unresolved / Low Coverage Areas",
+        "weak_missing_slots": "Missing or weak required answer slots: {slots}.",
+        "weak_supported_claims": (
+            "{count} claim(s) have weak lexical support only and are kept out of the main "
+            "answer sections."
+        ),
+    }
 
 
 def _format_domains(sources: list[ReportSourceItem]) -> list[str]:

@@ -288,6 +288,7 @@ class ResearchTaskService:
         research_plan: dict[str, Any],
         planner_mode: str,
         plan_source: str,
+        planner_status: str,
         summary: dict[str, Any],
         warnings: list[str],
         dependencies: dict[str, Any] | None = None,
@@ -309,7 +310,7 @@ class ResearchTaskService:
             {
                 "stage": "PLANNING",
                 "planner_enabled": True,
-                "planner_status": "created",
+                "planner_status": planner_status,
                 "planner_mode": planner_mode,
                 "plan_source": plan_source,
                 "result": {

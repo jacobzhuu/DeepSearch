@@ -159,6 +159,21 @@ This plan treats the LLM as an advisory component. The deterministic pipeline re
   - rationale: the next work spans planner, search discovery, acquisition ranking, gap behavior, reporting, settings, observability, and tests; implementation needs a staged plan before code changes.
   - validation: documentation-only checks pending.
   - next: review plan, then implement Milestone 1 only.
+- 2026-04-30 / Milestone 1 implementation:
+  - changes: implemented optional LLM planner strict JSON validation, deterministic fallback for invalid/unavailable providers, planner source/status diagnostics in task events and observability, and targeted planner/API/pipeline tests.
+  - rationale: planner-only is the first LLM-assisted surface; source judge, gap reasoner, and report-writer behavior remain out of scope.
+  - validation: targeted planner/provider/API/pipeline pytest passed; ruff, black --check, and `git diff --check` passed.
+  - next: keep source judge work deferred to Milestone 2 shadow mode.
+- 2026-04-30 / Milestone 1 runtime acceptance follow-up:
+  - changes: tightened planner JSON extraction and expected-source-type validation, added parse-stage and schema-error diagnostics, preserved fallback diagnostics through operator-edited plan events, changed successful LLM provenance to `planner_status=success` / `plan_source=llm_planner`, and updated planner warning text plus docs/tests.
+  - rationale: planner-only runtime acceptance needs strict JSON handling, actionable schema diagnostics, and correct planner provenance without broadening into source judge, gap reasoner, or report-writer work.
+  - validation: targeted planner/provider/API/debug-pipeline tests passed; full research-task API and debug-pipeline suites passed; `python3 -m ruff check .`, `python3 -m black --check .`, and `git diff --check` passed. Live DeepSeek planner-only rerun was not possible in this shell because required LLM environment variables were absent.
+  - next: rerun DeepSeek planner acceptance from the configured runtime shell; if it still falls back, inspect `research_plan.planner_diagnostics.validation_errors`, `raw_output_preview`, and `json_extraction_error`.
+- 2026-04-30 / Milestone 1 full-runtime acceptance follow-up:
+  - changes: applied deterministic LangGraph owned-source guardrails after successful LLM planning, preserved mechanism/site/GitHub/trust guardrail queries, added planner-domain correction diagnostics, added deterministic LangGraph known-path candidates, and made supplemental gap search outages non-fatal when the task already has usable evidence for a partial report.
+  - rationale: the accepted DeepSeek plan was schema-valid but weaker than deterministic planning; generic sources were attempted before owned docs/reference/upstream GitHub, then a SearXNG gap-round outage failed the whole task despite existing claims and chunks.
+  - validation: targeted planner/source-selection/gap/research-task tests passed; `python3 -m ruff check .`, `python3 -m black --check .`, and `git diff --check` passed. Async `/run` live smoke created task `f9944264-5dce-468e-b739-f2f292ceb088` but failed in the existing worker before planning with `UnicodeEncodeError`; a synchronous real-pipeline fallback created task `61f0134a-988d-44bc-a0f7-769e7bf2ce40` and completed with `planner_status=success`, `plan_source=llm_planner`, `schema_validated=true`, preserved LangGraph guardrail queries, and official docs/reference attempts before generic sources.
+  - next: source judge, LLM gap reasoner, and report-writer changes remain deferred.
 
 ## 8. Validation
 

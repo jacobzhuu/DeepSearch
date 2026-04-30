@@ -34,8 +34,8 @@ from services.orchestrator.app.indexing import IndexedChunkPage
 from services.orchestrator.app.planning import (
     PlannedSearchQuery,
     ResearchPlan,
-    ResearchPlannerError,
     ResearchPlannerService,
+    build_optional_research_plan,
     research_plan_from_serialized_payload,
 )
 from services.orchestrator.app.research_quality import (
@@ -111,6 +111,8 @@ INDEXING_ALLOWED_STATUSES = (
 DRAFT_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_DRAFTING_CLAIMS, STAGE_RESEARCHING_MORE)
 VERIFY_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_VERIFYING, STAGE_RESEARCHING_MORE)
 MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD = 2
+GAP_SEARCH_UNAVAILABLE_WARNING = "gap_search_unavailable"
+SUPPLEMENTAL_SEARCH_FAILED_WARNING = "supplemental_search_failed"
 
 
 @dataclass(frozen=True)
@@ -404,12 +406,40 @@ class DebugRealPipelineRunner:
     ) -> dict[str, Any]:
         task = self._get_task(task_id)
         planned_queries = _planned_queries_from_gap_analysis(gap_analysis)
-        search_result = self._run_search(
-            task_id,
-            planned_search_queries=planned_queries,
-            include_default_expansions=False,
-            require_candidates=False,
-        )
+        try:
+            search_result = self._run_search(
+                task_id,
+                planned_search_queries=planned_queries,
+                include_default_expansions=False,
+                require_candidates=False,
+            )
+        except SearchProviderError as error:
+            existing_evidence = self._existing_evidence_status_for_gap_fallback(task_id)
+            if not existing_evidence["usable_evidence"]:
+                raise
+            warnings = [
+                GAP_SEARCH_UNAVAILABLE_WARNING,
+                (
+                    f"{SUPPLEMENTAL_SEARCH_FAILED_WARNING}: {error.reason}; "
+                    "continuing to reporting with existing evidence."
+                ),
+            ]
+            return {
+                "gap_analysis": gap_analysis,
+                "search": {
+                    "supplemental_search": True,
+                    "failed": True,
+                    "reason": error.reason,
+                    "error": error.to_payload(),
+                    "planned_queries": [query.to_payload() for query in planned_queries],
+                    "search_query_count": 0,
+                    "search_result_count": 0,
+                },
+                "warnings": warnings,
+                "existing_evidence": existing_evidence,
+                "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                "continuing_with_existing_evidence": True,
+            }
         selected_candidate_ids, skipped_gap_search_sources = _select_gap_search_candidate_ids(
             search_result,
             limit=self.max_supplemental_sources,
@@ -643,13 +673,17 @@ class DebugRealPipelineRunner:
             return
         if self.planner_service is None:
             return
-        try:
-            plan = self.planner_service.plan(
-                task_id=task_id,
-                query=task.query,
-                constraints=dict(task.constraints_json),
-            )
-        except ResearchPlannerError as error:
+        planner_result = build_optional_research_plan(
+            planner_service=self.planner_service,
+            task_id=task_id,
+            query=task.query,
+            constraints=dict(task.constraints_json),
+            max_subquestions=self.planner_service.max_subquestions,
+            max_search_queries=self.planner_service.max_search_queries,
+            llm_plan_source="llm_planner",
+            failure_plan_source="pipeline_deterministic_fallback_after_llm_failure",
+        )
+        if planner_result.failure is not None:
             self._record_event(
                 task_id,
                 "research_plan.failed",
@@ -662,15 +696,14 @@ class DebugRealPipelineRunner:
                     "stage": "PLANNING",
                     "planner_enabled": True,
                     "planner_status": "failed",
-                    "fallback": "original_query",
-                    "reason": error.reason,
-                    "details": _json_safe(error.to_payload()),
-                    "warnings": ["research planner failed; continuing with the original query."],
+                    "fallback": "deterministic_plan",
+                    "reason": planner_result.failure.get("reason"),
+                    "details": _json_safe(planner_result.failure),
+                    "warnings": planner_result.warnings,
                 },
             )
-            self.session.commit()
-            return
 
+        plan = planner_result.plan
         self.research_plan = plan
         self._record_event(
             task_id,
@@ -679,17 +712,18 @@ class DebugRealPipelineRunner:
                 **self._pipeline_payload(from_status=task.status, to_status=task.status),
                 "changes": {
                     "revision_no": task.revision_no,
-                    "research_plan_source": "pipeline_generated",
+                    "research_plan_source": planner_result.plan_source,
                 },
                 "stage": "PLANNING",
                 "planner_enabled": True,
-                "planner_status": "created",
+                "planner_status": planner_result.planner_status,
                 "planner_mode": plan.planner_mode,
+                "plan_source": planner_result.plan_source,
                 "result": {
                     "research_plan": plan.to_payload(),
                     **plan.summary_payload(),
                 },
-                "warnings": plan.warnings,
+                "warnings": planner_result.warnings,
             },
         )
         self.session.commit()
@@ -1313,6 +1347,27 @@ class DebugRealPipelineRunner:
             evidence_candidates=_evidence_candidates_from_claims(self.session, task_id),
             claim_rows=_claim_rows_for_slot_summary_from_claims(self.session, task_id),
         )
+
+    def _existing_evidence_status_for_gap_fallback(self, task_id: UUID) -> dict[str, Any]:
+        counts = self._safe_counts(task_id)
+        slot_coverage_summary = self._current_slot_coverage_summary(task_id)
+        covered_required_slots = [
+            slot.get("slot_id")
+            for slot in slot_coverage_summary
+            if slot.get("required") is True and slot.get("status") in {"covered", "weak"}
+        ]
+        partial_report_possible = (
+            counts.source_documents > 0
+            and counts.source_chunks > 0
+            and (counts.claims > 0 or counts.claim_evidence > 0)
+        )
+        usable_evidence = partial_report_possible or bool(covered_required_slots)
+        return {
+            "usable_evidence": usable_evidence,
+            "partial_report_possible": partial_report_possible,
+            "covered_required_slots": covered_required_slots,
+            "counts": _counts_to_dict(counts),
+        }
 
     def _existing_search_query_texts(self, task_id: UUID) -> set[str]:
         return {

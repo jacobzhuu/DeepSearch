@@ -26,6 +26,7 @@ from services.orchestrator.app.indexing import (
 )
 from services.orchestrator.app.main import create_app
 from services.orchestrator.app.search import (
+    SearchProviderError,
     SearchRequest,
     SearchResponse,
     SearchResultItem,
@@ -116,6 +117,97 @@ class FiveCandidateSearchProvider:
             source_engines=("fake-search",),
             result_count=len(results),
             results=results[: request.limit],
+            metadata={"test_provider": True},
+        )
+
+
+class LangGraphMixedSearchProvider:
+    name = "searxng"
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def search(self, request: SearchRequest) -> SearchResponse:
+        self.queries.append(request.query_text)
+        results = (
+            SearchResultItem(
+                url="https://blockchain.news/news/langchain-unveils-langgraph-cloud",
+                title="LangChain unveils LangGraph Cloud",
+                snippet="A generic article mentioning LangGraph.",
+                source_engine="fake-search",
+                rank=1,
+            ),
+            SearchResultItem(
+                url="https://docs.langchain.com/oss/python/langgraph/overview",
+                title="LangGraph overview - Docs by LangChain",
+                snippet="Official LangGraph documentation.",
+                source_engine="fake-search",
+                rank=2,
+            ),
+            SearchResultItem(
+                url="https://reference.langchain.com/python/langgraph/",
+                title="langgraph - LangChain Reference Docs",
+                snippet="LangGraph reference docs.",
+                source_engine="fake-search",
+                rank=3,
+            ),
+            SearchResultItem(
+                url="https://github.com/langchain-ai/langgraph",
+                title="langchain-ai/langgraph",
+                snippet="Upstream LangGraph repository.",
+                source_engine="fake-search",
+                rank=4,
+            ),
+            SearchResultItem(
+                url="https://wfcoding.com/articles/practice/langgraph",
+                title="LangGraph tutorial",
+                snippet="Generic tutorial content.",
+                source_engine="fake-search",
+                rank=5,
+            ),
+        )
+        return SearchResponse(
+            provider=self.name,
+            source_engines=("fake-search",),
+            result_count=len(results),
+            results=results[: request.limit],
+            metadata={"test_provider": True},
+        )
+
+
+class GapFailingAfterInitialSearchProvider:
+    name = "searxng"
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def search(self, request: SearchRequest) -> SearchResponse:
+        self.queries.append(request.query_text)
+        if len(self.queries) > 1:
+            raise SearchProviderError(
+                reason="searxng_empty_results_with_unresponsive_engines",
+                message=(
+                    "SearXNG returned no results and reported unresponsive engines: "
+                    "brave, duckduckgo."
+                ),
+                status_code=200,
+                content_type="application/json",
+                body_preview=None,
+                unresponsive_engines=["brave", "duckduckgo"],
+            )
+        return SearchResponse(
+            provider=self.name,
+            source_engines=("fake-search",),
+            result_count=1,
+            results=(
+                SearchResultItem(
+                    url="https://docs.langchain.com/oss/python/langgraph/overview",
+                    title="LangGraph overview - Docs by LangChain",
+                    snippet="Official LangGraph definition source.",
+                    source_engine="fake-search",
+                    rank=1,
+                ),
+            ),
             metadata={"test_provider": True},
         )
 
@@ -226,6 +318,54 @@ class SearXNGExplanatoryHttpAcquisitionClient:
             content=body,
             content_hash="sha256:searxng-explanatory",
             trace={"test_fetch": True},
+        )
+
+
+class LangGraphExplanatoryHttpAcquisitionClient:
+    def fetch(self, url: str) -> HttpFetchResult:
+        body = (
+            "<html><head><title>LangGraph</title></head><body><main>"
+            "<p>LangGraph is a low-level orchestration framework and runtime for "
+            "building stateful agents.</p>"
+            "<p>LangGraph works by representing application steps as graph nodes and "
+            "routing state between those nodes until a workflow reaches a result.</p>"
+            "<p>LangGraph provides durable execution, streaming, memory, checkpointing, "
+            "and human-in-the-loop controls for long-running agents.</p>"
+            f"<p>Fetched from {url}</p>"
+            "</main></body></html>"
+        ).encode()
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=body,
+            content_hash=f"sha256:langgraph:{url}",
+            trace={"test_fetch": True, "requested_url": url, "final_url": url},
+        )
+
+
+class LangGraphDefinitionOnlyHttpAcquisitionClient:
+    def fetch(self, url: str) -> HttpFetchResult:
+        body = (
+            "<html><head><title>LangGraph definition</title></head><body><main>"
+            "<p>LangGraph is a low-level orchestration framework and runtime for "
+            "building stateful agents.</p>"
+            "<p>LangGraph supports durable execution and human-in-the-loop controls "
+            "for long-running agent applications.</p>"
+            f"<p>Fetched from {url}</p>"
+            "</main></body></html>"
+        ).encode()
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=body,
+            content_hash=f"sha256:langgraph-definition:{url}",
+            trace={"test_fetch": True, "requested_url": url, "final_url": url},
         )
 
 
@@ -959,7 +1099,120 @@ def test_pipeline_noop_planner_records_plan_and_uses_planner_queries(
         get_settings.cache_clear()
 
 
-def test_pipeline_llm_planner_failure_falls_back_to_original_query(
+def test_pipeline_planner_mode_attempts_langgraph_owned_sources_before_generic_articles(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_PROVIDER", "noop")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "true")
+    monkeypatch.setenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", "5")
+    get_settings.cache_clear()
+
+    search_provider = LangGraphMixedSearchProvider()
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(
+        session_factory,
+        tmp_path,
+        index_backend,
+        search_provider=search_provider,
+        http_client=LangGraphExplanatoryHttpAcquisitionClient(),
+    )
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is LangGraph and how does it work?"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+
+        assert pipeline_response.status_code == 200
+        assert pipeline_response.json()["completed"] is True
+        observability = detail_response.json()["progress"]["observability"]
+        assert observability["planner_enabled"] is True
+        final_queries = [
+            item["query_text"] for item in observability["research_plan"]["final_search_queries"]
+        ]
+        assert "LangGraph site:docs.langchain.com how it works" in final_queries
+        assert "LangGraph github langchain-ai langgraph" in final_queries
+
+        attempted_urls = [source["canonical_url"] for source in observability["attempted_sources"]]
+        assert attempted_urls[:3] == [
+            "https://docs.langchain.com/oss/python/langgraph/overview",
+            "https://www.langchain.com/langgraph",
+            "https://reference.langchain.com/python/langgraph/",
+        ]
+        generic_urls = [
+            url for url in attempted_urls if "blockchain.news" in url or "wfcoding.com" in url
+        ]
+        assert not generic_urls
+    finally:
+        client_generator.close()
+        monkeypatch.delenv("LLM_ENABLED", raising=False)
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_ENABLED", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", raising=False)
+        get_settings.cache_clear()
+
+
+def test_gap_search_provider_failure_continues_to_reporting_with_existing_evidence(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    search_provider = GapFailingAfterInitialSearchProvider()
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(
+        session_factory,
+        tmp_path,
+        index_backend,
+        search_provider=search_provider,
+        http_client=LangGraphDefinitionOnlyHttpAcquisitionClient(),
+    )
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is LangGraph and how does it work?"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+
+        assert pipeline_response.status_code == 200
+        payload = pipeline_response.json()
+        assert payload["completed"] is True
+        assert payload["status"] == "COMPLETED"
+        assert len(search_provider.queries) > 1
+
+        observability = detail_response.json()["progress"]["observability"]
+        assert "gap_search_unavailable" in observability["warnings"]
+        assert detail_response.json()["status"] == "COMPLETED"
+
+        gap_events = [
+            event
+            for event in events_response.json()["events"]
+            if event["event_type"] == "debug.pipeline.stage_completed"
+            and event["payload"].get("stage") == "RESEARCHING_MORE"
+        ]
+        assert gap_events
+        gap_result = gap_events[-1]["payload"]["result"]
+        assert gap_result["search"]["failed"] is True
+        assert gap_result["search"]["reason"] == "searxng_empty_results_with_unresponsive_engines"
+        assert gap_result["existing_evidence"]["usable_evidence"] is True
+        assert gap_result["continuing_with_existing_evidence"] is True
+    finally:
+        client_generator.close()
+
+
+def test_pipeline_llm_planner_failure_falls_back_to_deterministic_plan(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
     monkeypatch,
@@ -993,15 +1246,24 @@ def test_pipeline_llm_planner_failure_falls_back_to_original_query(
         events_payload = events_response.json()
         event_types = [event["event_type"] for event in events_payload["events"]]
         assert "research_plan.failed" in event_types
+        assert "research_plan.created" in event_types
         assert "test-api-key" not in str(events_payload)
 
         observability = detail_response.json()["progress"]["observability"]
-        assert observability["planner_status"] == "failed"
-        assert any("research planner failed" in item for item in observability["warnings"])
+        assert observability["planner_status"] == "fallback"
+        assert observability["plan_source"] == "pipeline_deterministic_fallback_after_llm_failure"
+        assert (
+            "LLM planner failed validation/provider call; deterministic fallback was used."
+            in observability["warnings"]
+        )
+        assert (
+            "No LLM planner is active; deterministic planner used." not in observability["warnings"]
+        )
 
         persisted_queries = search_queries_response.json()["search_queries"]
-        assert persisted_queries[0]["query_text"] == (
-            "Planner provider failure should not fail the pipeline"
+        assert any(
+            item["query_text"].startswith("Planner provider failure should not fail the pipeline")
+            for item in persisted_queries
         )
         gap_queries = [
             item

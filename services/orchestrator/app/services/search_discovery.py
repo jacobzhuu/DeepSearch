@@ -437,39 +437,72 @@ def _known_path_candidates_for_query(
     provider_results: tuple[Any, ...],
     constraints: dict[str, Any],
 ) -> list[dict[str, object]]:
-    if not _is_searxng_overview_query(query):
-        return []
-
-    saw_searxng_official = False
-    for result in provider_results:
-        canonical = canonicalize_url(result.url)
-        if canonical is None:
-            continue
-        normalized_domain = canonical.domain.removeprefix("www.")
-        if normalized_domain in {"searxng.org", "docs.searxng.org"}:
-            saw_searxng_official = True
-            break
-    if not saw_searxng_official:
+    candidates: list[dict[str, object]] = []
+    if _is_searxng_overview_query(query) and _provider_results_include_searxng_official(
+        provider_results
+    ):
+        candidates.extend(
+            [
+                {
+                    "url": "https://docs.searxng.org/user/about.html",
+                    "title": "SearXNG about",
+                    "snippet": "Deterministic known overview path for SearXNG documentation.",
+                    "rank": 10001,
+                    "reason": (
+                        "known_path_candidate: official about page for SearXNG overview query"
+                    ),
+                },
+                {
+                    "url": "https://en.wikipedia.org/wiki/SearXNG",
+                    "title": "SearXNG - Wikipedia",
+                    "snippet": (
+                        "Deterministic stable reference candidate for SearXNG overview query."
+                    ),
+                    "rank": 10002,
+                    "reason": (
+                        "known_path_candidate: Wikipedia reference for SearXNG overview query"
+                    ),
+                },
+            ]
+        )
+    if _is_langgraph_overview_query(query):
+        candidates.extend(
+            [
+                {
+                    "url": "https://docs.langchain.com/oss/python/langgraph/overview",
+                    "title": "LangGraph overview - Docs by LangChain",
+                    "snippet": "Deterministic owned LangGraph documentation candidate.",
+                    "rank": 10011,
+                    "reason": "known_path_candidate: owned LangGraph docs overview",
+                },
+                {
+                    "url": "https://reference.langchain.com/python/langgraph/",
+                    "title": "langgraph - LangChain Reference Docs",
+                    "snippet": "Deterministic owned LangGraph reference candidate.",
+                    "rank": 10012,
+                    "reason": "known_path_candidate: owned LangGraph reference docs",
+                },
+                {
+                    "url": "https://www.langchain.com/langgraph",
+                    "title": "LangGraph - LangChain",
+                    "snippet": "Deterministic official LangGraph product page candidate.",
+                    "rank": 10013,
+                    "reason": "known_path_candidate: official LangGraph product page",
+                },
+                {
+                    "url": "https://github.com/langchain-ai/langgraph",
+                    "title": "langchain-ai/langgraph",
+                    "snippet": "Deterministic upstream LangGraph repository candidate.",
+                    "rank": 10014,
+                    "reason": "known_path_candidate: upstream LangGraph repository",
+                },
+            ]
+        )
+    if not candidates:
         return []
 
     allow_domains = _resolve_domains(constraints.get("domains_allow"))
     deny_domains = _resolve_domains(constraints.get("domains_deny"))
-    candidates = [
-        {
-            "url": "https://docs.searxng.org/user/about.html",
-            "title": "SearXNG about",
-            "snippet": "Deterministic known overview path for SearXNG documentation.",
-            "rank": 10001,
-            "reason": "known_path_candidate: official about page for SearXNG overview query",
-        },
-        {
-            "url": "https://en.wikipedia.org/wiki/SearXNG",
-            "title": "SearXNG - Wikipedia",
-            "snippet": "Deterministic stable reference candidate for SearXNG overview query.",
-            "rank": 10002,
-            "reason": "known_path_candidate: Wikipedia reference for SearXNG overview query",
-        },
-    ]
     filtered: list[dict[str, object]] = []
     for candidate in candidates:
         canonical = canonicalize_url(str(candidate["url"]))
@@ -485,6 +518,17 @@ def _known_path_candidates_for_query(
     return filtered
 
 
+def _provider_results_include_searxng_official(provider_results: tuple[Any, ...]) -> bool:
+    for result in provider_results:
+        canonical = canonicalize_url(result.url)
+        if canonical is None:
+            continue
+        normalized_domain = canonical.domain.removeprefix("www.")
+        if normalized_domain in {"searxng.org", "docs.searxng.org"}:
+            return True
+    return False
+
+
 def _is_searxng_overview_query(query: str) -> bool:
     lower = query.lower()
     return "searxng" in lower and (
@@ -493,6 +537,20 @@ def _is_searxng_overview_query(query: str) -> bool:
         or "how does" in lower
         or "how it works" in lower
         or lower.startswith("explain ")
+    )
+
+
+def _is_langgraph_overview_query(query: str) -> bool:
+    lower = query.lower()
+    return "langgraph" in lower and (
+        "what is" in lower
+        or "overview" in lower
+        or "how does" in lower
+        or "how it works" in lower
+        or lower.startswith("explain ")
+        or "site:docs.langchain.com" in lower
+        or "site:reference.langchain.com" in lower
+        or "langchain-ai langgraph" in lower
     )
 
 

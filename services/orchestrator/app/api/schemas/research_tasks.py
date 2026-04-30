@@ -102,6 +102,7 @@ class ResearchTaskObservabilityResponse(BaseModel):
     planner_enabled: bool | None = None
     planner_mode: str | None = None
     planner_status: str | None = None
+    plan_source: str | None = None
     subquestion_count: int | None = None
     search_query_count: int | None = None
     research_plan: dict[str, Any] | None = None

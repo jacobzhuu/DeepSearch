@@ -178,7 +178,9 @@ For technical library/framework overview queries such as `What is LangGraph and 
 | `RESEARCH_PLANNER_MAX_SUBQUESTIONS` | Planner subquestion cap | `5` |
 | `RESEARCH_PLANNER_MAX_SEARCH_QUERIES` | Planner search-query cap | `8` |
 
-The planner is disabled by default. The web workspace can still create a deterministic fallback plan through `POST /api/v1/research/tasks/{task_id}/plan`; this is useful for reviewing search intent but is not an LLM-generated plan. When LLM planning is enabled, the same endpoint uses the configured provider. Both generated and operator-edited plans emit `research_plan.created` before `SEARCHING`, and the pipeline reuses the latest current-revision plan instead of generating a hidden duplicate. If planner generation fails inside the pipeline, it emits `research_plan.failed`, falls back to the original query, and continues the deterministic pipeline.
+The planner is disabled by default. The web workspace can still create a deterministic fallback plan through `POST /api/v1/research/tasks/{task_id}/plan`; this is useful for reviewing search intent but is not an LLM-generated plan. When LLM planning is enabled, the same endpoint uses the configured provider and requires strict structured JSON with the top-level keys listed in the planner prompt. Valid output must be one JSON object, or one safely extractable fenced JSON object; unfenced prose around JSON is rejected. Planner search queries may use only these `expected_source_type` values: `general_web`, `official_docs`, `official_about`, `official_installation_admin`, `official_or_reference`, `official_repository`, `github_readme_or_repo`, and `reference`. Missing keys, invalid JSON, schema failures, provider errors, timeouts, and unavailable configuration do not fail the task; they produce a deterministic fallback plan with `planner_status=fallback`, `plan_source=deterministic_fallback_after_llm_failure`, warning text `LLM planner failed validation/provider call; deterministic fallback was used.`, and planner diagnostics in the persisted `research_plan.created` event. Successful LLM plans use `planner_status=success`, `plan_source=llm_planner`, and `LLM planner generated this research plan.` Disabled planner runs use `No LLM planner is active; deterministic planner used.` Pipeline execution also emits `research_plan.failed` for the provider/planner failure, then records the deterministic fallback as `research_plan.created` and continues. Both generated and operator-edited plans emit `research_plan.created` before `SEARCHING`, and the pipeline reuses the latest current-revision plan instead of generating a hidden duplicate.
+
+Planner diagnostics are sanitized for task events and task detail. They include parse-stage flags for `raw_text`, `json_extracted`, and `schema_validated`, a capped raw-output preview, a raw-output hash, the JSON extraction method or extraction error, and validation errors categorized as missing field, extra field, invalid enum value, wrong type, or generic validation error. If an operator edits a fallback plan, task detail preserves the prior diagnostics so the original provider or schema failure remains actionable.
 
 For definition and overview queries such as `What is SearXNG and how does it work?`,
 planner output is post-processed as a bounded suggestion. Wikipedia cannot be treated as a
@@ -187,6 +189,14 @@ query plus official documentation, about/how-it-works, Wikipedia, and software-p
 GitHub README searches when an entity can be extracted. SearXNG overview runs also add
 deterministic known-path candidates for `https://docs.searxng.org/user/about.html` and
 `https://en.wikipedia.org/wiki/SearXNG` when official SearXNG search results are present.
+For `What is LangGraph and how does it work?`, LLM plans are merged with deterministic
+owned-source guardrails for `docs.langchain.com`, `reference.langchain.com`,
+`www.langchain.com/langgraph`, and `github.com/langchain-ai/langgraph`; broad
+`github.com/langchain-ai` preferences are supplemented with the concrete LangGraph repo,
+and `langchain-ai.github.io` / `blog.langchain.dev` are marked secondary/downweighted
+unless independently verified. The final planner diagnostics expose these query and domain
+corrections in `final_search_queries`, `dropped_or_downweighted_planner_queries`,
+`source_preferences.secondary_preferred_domains`, and `source_preferences.planner_domain_corrections`.
 Source selection prioritizes official about/reference pages over admin architecture,
 installation, API, or developer pages unless the user explicitly asks about those topics.
 
@@ -224,7 +234,10 @@ LLM_API_KEY=sk-...
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-chat
 RESEARCH_PLANNER_ENABLED=true
+LLM_REPORT_WRITER_ENABLED=false
 ```
+
+Planner-only mode leaves claim drafting, verification, gap analysis, and report writing deterministic. Use `progress.observability.planner_status`, `progress.observability.plan_source`, `progress.observability.research_plan.planner_diagnostics`, and `research_plan.created` / `research_plan.failed` events to confirm whether a task used an LLM plan or deterministic fallback. For successful DeepSeek planner acceptance, expect `planner_status=success`, `plan_source=llm_planner`, and `research_plan.planner_diagnostics.schema_validated=true`. If the planner still falls back, inspect `planner_diagnostics.validation_errors`, `planner_diagnostics.raw_output_preview`, and `planner_diagnostics.json_extraction_error` to identify the exact failure. Do not enable source judge, gap reasoner, or grounded report-writer flags for Phase 1 validation.
 
 Grounded report-writer configuration uses the same provider, but is controlled independently:
 
@@ -840,6 +853,7 @@ At minimum, that route would still need:
 - if `DRAFTING_CLAIMS` fails with `claim drafting produced no claims`, inspect `pipeline.failed.details`; it should include `why_supplemental_acquisition_triggered`, `supplemental_sources_attempted`, `supplemental_sources_skipped`, `unattempted_high_quality_sources`, `why_wikipedia_or_about_not_attempted`, `per_source_answer_yield`, `top_rejected_candidates`, `rejection_reason_distribution`, and an operator `next_action`
 - if a planner-enabled overview task only attempted low-yield home/developer pages, inspect `progress.observability.final_search_queries`, the Source Selection Table in Task Detail, and candidate metadata `source_category` / `downrank_reason`; official about and Wikipedia candidates should outrank `dev/index`, API, install, and architecture pages unless the query asks for those topics
 - if a technical concept task attempts generic tutorial domains before official docs/reference/GitHub, inspect `progress.observability.selected_sources_from_search` and `unattempted_sources`; generic `What is ...` pages should now stay `generic_article`, localized mirrors should stay `secondary_reference`, third-party GitHub repositories should not be `github_readme_or_repo`, off-subject official docs should show `off_subject_source_downranked_for_query`, and gap rounds should fall back to unattempted high-value candidates when new search results are low-value or duplicates
+- if planner-LLM mode reaches `RESEARCHING_MORE` and SearXNG reports empty results with unresponsive engines, inspect `progress.observability.gap_rounds`; tasks with existing usable documents/chunks/claims should continue to reporting with `gap_search_unavailable` / `supplemental_search_failed` warnings, while tasks with no usable evidence should still fail at the main failing stage
 - if task detail appears to show `fetch_succeeded = 0` while source summaries show fetched/parsed sources, inspect `progress.observability.gap_rounds`; task-level `fetch_succeeded` and `fetch_failed` are cumulative over initial acquisition plus gap-round acquisition, while each gap round still carries its own per-round acquisition counters
 - query the intermediate resources:
   - `GET /candidate-urls`

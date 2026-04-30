@@ -86,17 +86,116 @@ def test_plan_endpoint_records_visible_pre_run_research_plan(
     assert plan_payload["plan_source"] == "deterministic_fallback"
     assert plan_payload["research_plan"]["search_queries"]
     assert plan_payload["running_mode"].endswith("+no-LLM")
+    assert "No LLM planner is active; deterministic planner used." in plan_payload["warnings"]
 
     detail_payload = detail_response.json()
     assert detail_payload["status"] == "PLANNED"
     assert detail_payload["progress"]["current_state"] == "PLANNING"
     observability = detail_payload["progress"]["observability"]
     assert observability["planner_status"] == "created"
+    assert observability["plan_source"] == "deterministic_fallback"
     assert observability["research_plan"]["intent"] == "definition_how_it_works"
     assert observability["running_mode"].endswith("+no-LLM")
+    assert "No LLM planner is active; deterministic planner used." in observability["warnings"]
 
     event_types = [event["event_type"] for event in events_response.json()["events"]]
     assert event_types == ["task.created", "research_plan.created"]
+    get_settings.cache_clear()
+
+
+def test_plan_endpoint_llm_provider_failure_records_deterministic_fallback(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "true")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    get_settings.cache_clear()
+    create_response = client.post(
+        "/api/v1/research/tasks",
+        json={"query": "What is LangGraph and how does it work?", "constraints": {}},
+    )
+    task_id = create_response.json()["task_id"]
+
+    plan_response = client.post(f"/api/v1/research/tasks/{task_id}/plan")
+    detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+    events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+
+    assert plan_response.status_code == 200
+    plan_payload = plan_response.json()
+    assert plan_payload["planner_status"] == "fallback"
+    assert plan_payload["planner_mode"] == "deterministic"
+    assert plan_payload["plan_source"] == "deterministic_fallback_after_llm_failure"
+    assert (
+        "LLM planner failed validation/provider call; deterministic fallback was used."
+        in plan_payload["warnings"]
+    )
+    assert "No LLM planner is active; deterministic planner used." not in plan_payload["warnings"]
+    assert "test-api-key" not in str(events_response.json())
+
+    observability = detail_response.json()["progress"]["observability"]
+    assert observability["planner_status"] == "fallback"
+    assert observability["plan_source"] == "deterministic_fallback_after_llm_failure"
+    assert observability["research_plan"]["planner_diagnostics"]["planner_fallback"] is True
+    assert (
+        "LLM planner failed validation/provider call; deterministic fallback was used."
+        in observability["warnings"]
+    )
+    assert "No LLM planner is active; deterministic planner used." not in observability["warnings"]
+    get_settings.cache_clear()
+
+
+def test_plan_endpoint_preserves_planner_diagnostics_after_operator_edit(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "true")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    get_settings.cache_clear()
+    create_response = client.post(
+        "/api/v1/research/tasks",
+        json={"query": "What is LangGraph and how does it work?", "constraints": {}},
+    )
+    task_id = create_response.json()["task_id"]
+
+    fallback_response = client.post(f"/api/v1/research/tasks/{task_id}/plan")
+    edited_plan = dict(fallback_response.json()["research_plan"])
+    edited_plan.pop("planner_diagnostics", None)
+    edited_plan["subquestions"] = [*edited_plan["subquestions"], "What should the operator edit?"]
+
+    edit_response = client.post(
+        f"/api/v1/research/tasks/{task_id}/plan",
+        json={"research_plan": edited_plan},
+    )
+    detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+    events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+
+    assert edit_response.status_code == 200
+    assert edit_response.json()["plan_source"] == "operator_edited"
+    diagnostics = detail_response.json()["progress"]["observability"]["research_plan"][
+        "planner_diagnostics"
+    ]
+    assert diagnostics["planner_fallback"] is True
+    assert diagnostics["fallback_reason"] == "llm_provider_failed"
+    assert diagnostics["preserved_after_operator_edit"] is True
+    created_events = [
+        event
+        for event in events_response.json()["events"]
+        if event["event_type"] == "research_plan.created"
+    ]
+    assert (
+        created_events[-1]["payload"]["result"]["research_plan"]["planner_diagnostics"][
+            "preserved_after_operator_edit"
+        ]
+        is True
+    )
     get_settings.cache_clear()
 
 

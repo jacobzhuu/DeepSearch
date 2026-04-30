@@ -44,6 +44,7 @@ class ResearchPlan:
     planner_guardrail_warnings: list[str] = field(default_factory=list)
     intent_classification: str | None = None
     extracted_entity: str | None = None
+    planner_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -65,6 +66,7 @@ class ResearchPlan:
             "planner_guardrail_warnings": list(self.planner_guardrail_warnings),
             "intent_classification": self.intent_classification,
             "extracted_entity": self.extracted_entity,
+            "planner_diagnostics": dict(self.planner_diagnostics),
         }
 
     def summary_payload(self) -> dict[str, Any]:
@@ -84,6 +86,8 @@ class ResearchPlan:
             "intent_classification": self.intent_classification,
             "extracted_entity": self.extracted_entity,
         }
+        if self.planner_diagnostics:
+            payload["planner_diagnostics"] = dict(self.planner_diagnostics)
         overridden = self.source_preferences.get("overridden_avoid_domains")
         if isinstance(overridden, list):
             payload["planner_avoid_domains_overridden"] = list(overridden)

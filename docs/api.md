@@ -117,7 +117,14 @@ Purpose: create a visible pre-run research plan for a `PLANNED` task and emit
 
 Request body is optional. Without a body, the service uses the configured planner when
 `LLM_ENABLED=true` and `RESEARCH_PLANNER_ENABLED=true`; otherwise it creates a deterministic
-fallback plan. To confirm an edited plan, send the edited plan payload:
+fallback plan. Configured LLM planner output must match the strict planner JSON schema; invalid
+JSON, schema failures, provider errors, timeouts, and missing provider configuration produce a
+deterministic fallback response instead of failing the task. Valid LLM planner output is accepted
+only as a single JSON object or as one safely extractable fenced JSON object. Unfenced prose
+around JSON is rejected. Allowed `expected_source_type` values are `general_web`,
+`official_docs`, `official_about`, `official_installation_admin`, `official_or_reference`,
+`official_repository`, `github_readme_or_repo`, and `reference`. To confirm an edited plan, send
+the edited plan payload:
 
 ```json
 {
@@ -158,7 +165,17 @@ Response `200 OK`:
 
 The endpoint does not change `research_task.status`; the task remains runnable from
 `PLANNED`. If the task is not `PLANNED`, it returns `409`. If an explicitly configured LLM
-planner fails, it returns `502` with sanitized planner details.
+planner fails, the response remains `200` with `planner_status=fallback`,
+`plan_source=deterministic_fallback_after_llm_failure`, warning text
+`LLM planner failed validation/provider call; deterministic fallback was used.`, and sanitized
+failure metadata in `research_plan.planner_diagnostics` plus the `research_plan.created` event.
+Successful LLM plans use `planner_status=success`, `plan_source=llm_planner`, and warning text
+`LLM planner generated this research plan.` Disabled planner runs use
+`No LLM planner is active; deterministic planner used.` Planner diagnostics include parse-stage
+flags for `raw_text`, `json_extracted`, and `schema_validated`, a capped sanitized raw-output
+preview, a raw-output hash, and categorized validation errors such as missing fields, extra
+fields, invalid enum values, wrong types, and failed paths when available. If the operator edits a
+fallback plan, the latest task detail still preserves the prior planner diagnostics.
 
 ### `GET /api/v1/research/tasks/{task_id}`
 
@@ -193,7 +210,8 @@ Response `200 OK`:
 When a task has generated a pre-run plan, has been queued, or has run through the worker/debug pipeline, `progress.observability` is derived from task events and may include:
 
 - `running_mode` and `dependencies`, when a pre-run plan or pipeline start event recorded the active search/index/LLM modes
-- planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`
+- planner status/source fields: `planner_status`, `planner_mode`, and `plan_source`, where planner failures use deterministic fallback instead of blocking the task
+- planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`; for LangGraph overview planner-LLM runs, deterministic owned-source domain corrections are also visible under `research_plan.source_preferences.secondary_preferred_domains` and `research_plan.source_preferences.planner_domain_corrections`
 - `search_result_count`
 - `selected_sources`, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` metadata when applicable
 - `fetch_succeeded`
@@ -211,7 +229,7 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 - `gap_analysis` and `gap_rounds`, when required answer slots were missing or weak after verification and the runner generated supplemental search queries before reporting
 - `supplemental_acquisition` with trigger status, reason, attempted sources, and skipped sources
 - `failure_diagnostics` with top rejected candidates, why required source intents were not attempted, backward-compatible about/Wikipedia details, unattempted high-quality sources, and next action when a stage fails with structured details
-- non-blocking `warnings`, such as fewer than two successful fetched sources
+- non-blocking `warnings`, such as fewer than two successful fetched sources or `gap_search_unavailable` when supplemental gap search fails but existing evidence can still support a partial report
 
 Compatibility contract:
 
@@ -1410,7 +1428,7 @@ Execution contract:
   - evidence-yield summaries and slot-coverage summaries that link answer slots to candidate evidence, accepted evidence, strong/weak support, unsupported claims, and contributing source counts
   - verification summaries that identify the deterministic lexical verifier method and distinguish strong support from weak lexical support
   - supplemental acquisition trigger reason, attempted sources, skipped sources, and bounded retry status
-  - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, LangGraph owned-source fallback queries for LangChain docs/reference/GitHub when relevant, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates or low-value results, max-round terminal reasons, and per-round `RESEARCHING_MORE` results
+  - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, LangGraph owned-source fallback queries for LangChain docs/reference/GitHub when relevant, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates or low-value results, non-fatal `gap_search_unavailable` / `supplemental_search_failed` warnings when supplemental search fails after usable evidence exists, max-round terminal reasons, and per-round `RESEARCHING_MORE` results
   - technical concept source selection diagnostics: generic title-only tutorial pages remain `generic_article`, localized mirrors such as `github.langchain.ac.cn`, `langgraph.com.cn`, and `langchain-doc.cn` remain `secondary_reference`, third-party GitHub tutorials do not receive upstream repository priority, off-subject official-looking docs can be downranked with `off_subject_source_downranked_for_query`, and job/freelance/listing URLs stay low quality for overview queries
   - claim-drafting failure diagnostics when a no-claims failure remains after supplemental acquisition, including why supplemental acquisition triggered, top rejected candidates, unattempted high-quality sources, why about/Wikipedia was not attempted, per-source answer yield, and an operator `next_action`
   - warnings when fewer than two sources fetch successfully; this does not block completion when at least one source succeeds

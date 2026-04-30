@@ -22,8 +22,10 @@ from services.orchestrator.app.api.schemas.research_tasks import (
 )
 from services.orchestrator.app.db import get_db_session
 from services.orchestrator.app.planning import (
-    ResearchPlannerError,
-    build_default_research_plan,
+    DISABLED_PLANNER_WARNING,
+    LLM_PLANNER_FALLBACK_WARNING,
+    LLM_PLANNER_SUCCESS_WARNING,
+    build_optional_research_plan,
     build_research_plan_from_payload,
     create_research_planner_service,
 )
@@ -124,48 +126,54 @@ def plan_research_task(
     settings = get_settings()
     dependencies = _dependency_summary(settings)
 
-    try:
-        if request.research_plan is not None:
-            plan = build_research_plan_from_payload(
-                request.research_plan,
-                query=snapshot.task.query,
-                planner_mode="operator_edited",
-                max_subquestions=settings.research_planner_max_subquestions,
-                max_search_queries=settings.research_planner_max_search_queries,
-            )
-            plan_source = "operator_edited"
-        else:
-            planner_service = create_research_planner_service(settings)
-            if planner_service is None:
-                plan = build_default_research_plan(
-                    snapshot.task.query,
-                    max_subquestions=settings.research_planner_max_subquestions,
-                    max_search_queries=settings.research_planner_max_search_queries,
-                    planner_mode="deterministic",
-                )
-                plan_source = "deterministic_fallback"
-            else:
-                plan = planner_service.plan(
-                    task_id=task_id,
-                    query=snapshot.task.query,
-                    constraints=dict(snapshot.task.constraints_json),
-                )
-                plan_source = "planner_generated"
-    except ResearchPlannerError as error:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=error.to_payload(),
-        ) from error
+    planner_status = "created"
+    planner_failure: dict[str, Any] | None = None
+    if request.research_plan is not None:
+        research_plan_payload = dict(request.research_plan)
+        if not isinstance(research_plan_payload.get("planner_diagnostics"), dict):
+            previous_diagnostics = _latest_planner_diagnostics(snapshot)
+            if previous_diagnostics:
+                previous_diagnostics = dict(previous_diagnostics)
+                previous_diagnostics["preserved_after_operator_edit"] = True
+                research_plan_payload["planner_diagnostics"] = previous_diagnostics
+        plan = build_research_plan_from_payload(
+            research_plan_payload,
+            query=snapshot.task.query,
+            planner_mode="operator_edited",
+            max_subquestions=settings.research_planner_max_subquestions,
+            max_search_queries=settings.research_planner_max_search_queries,
+        )
+        plan_source = "operator_edited"
+    else:
+        planner_result = build_optional_research_plan(
+            planner_service=create_research_planner_service(settings),
+            task_id=task_id,
+            query=snapshot.task.query,
+            constraints=dict(snapshot.task.constraints_json),
+            max_subquestions=settings.research_planner_max_subquestions,
+            max_search_queries=settings.research_planner_max_search_queries,
+        )
+        plan = planner_result.plan
+        plan_source = planner_result.plan_source
+        planner_status = planner_result.planner_status
+        planner_failure = planner_result.failure
 
     try:
         running_mode = _running_mode(dependencies)
+        summary = plan.summary_payload()
+        if planner_failure is not None:
+            summary["planner_failure"] = planner_failure
+        response_warnings = list(
+            dict.fromkeys(_runtime_warnings(dependencies) + list(plan.warnings))
+        )
         task = service.record_research_plan_created(
             task_id,
             research_plan=plan.to_payload(),
             planner_mode=plan.planner_mode,
             plan_source=plan_source,
-            summary=plan.summary_payload(),
-            warnings=_runtime_warnings(dependencies) + list(plan.warnings),
+            planner_status=planner_status,
+            summary=summary,
+            warnings=response_warnings,
             dependencies=dependencies,
             running_mode=running_mode,
         )
@@ -177,13 +185,13 @@ def plan_research_task(
         status=task.status,
         revision_no=task.revision_no,
         updated_at=task.updated_at,
-        planner_status="created",
+        planner_status=planner_status,
         planner_mode=plan.planner_mode,
         plan_source=plan_source,
         research_plan=plan.to_payload(),
         running_mode=running_mode,
         dependencies=dependencies,
-        warnings=_runtime_warnings(dependencies) + list(plan.warnings),
+        warnings=response_warnings,
     )
 
 
@@ -266,6 +274,25 @@ def _get_task_snapshot_or_404(service: ResearchTaskService, task_id: UUID) -> Ta
         return service.get_task_snapshot(task_id)
     except TaskNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+
+def _latest_planner_diagnostics(snapshot: TaskSnapshot) -> dict[str, Any]:
+    for event in reversed(snapshot.events):
+        if event.event_type != "research_plan.created":
+            continue
+        payload = event.payload_json or {}
+        if not isinstance(payload, dict):
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            continue
+        plan = result.get("research_plan")
+        if not isinstance(plan, dict):
+            continue
+        diagnostics = plan.get("planner_diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics:
+            return dict(diagnostics)
+    return {}
 
 
 def _serialize_task_snapshot(snapshot: TaskSnapshot) -> ResearchTaskDetailResponse:
@@ -387,13 +414,9 @@ def _runtime_warnings(dependencies: dict[str, Any]) -> list[str]:
             "not durable research."
         )
     if dependencies.get("llm_mode") == "no-LLM":
-        warnings.append(
-            "No LLM planner is active; generated plans use deterministic fallback only."
-        )
+        warnings.append(DISABLED_PLANNER_WARNING)
     elif not dependencies.get("research_planner_enabled"):
-        warnings.append(
-            "No LLM planner is active; generated plans use deterministic fallback only."
-        )
+        warnings.append(DISABLED_PLANNER_WARNING)
     return warnings
 
 
@@ -403,6 +426,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     planner_enabled: bool | None = None
     planner_mode: str | None = None
     planner_status: str | None = None
+    plan_source: str | None = None
     subquestion_count: int | None = None
     planner_search_query_count: int | None = None
     research_plan: dict[str, Any] | None = None
@@ -440,6 +464,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     failure_diagnostics: dict[str, Any] | None = None
     warnings: list[str] = []
     runtime_warnings: list[str] = []
+    latest_planner_diagnostics: dict[str, Any] = {}
 
     for event in snapshot.events:
         payload = event.payload_json or {}
@@ -459,10 +484,20 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             runtime_warnings.extend(_runtime_warnings(dependency_payload))
         if event.event_type == "research_plan.created":
             planner_enabled = True
-            planner_status = "created"
+            planner_status = _string_or_none(payload.get("planner_status")) or "created"
+            plan_source = _string_or_none(payload.get("plan_source")) or plan_source
+            changes = payload.get("changes")
+            if isinstance(changes, dict):
+                plan_source = _string_or_none(changes.get("research_plan_source")) or plan_source
             result_plan = result.get("research_plan")
             if isinstance(result_plan, dict):
-                research_plan = result_plan
+                current_plan = dict(result_plan)
+                diagnostics = current_plan.get("planner_diagnostics")
+                if isinstance(diagnostics, dict) and diagnostics:
+                    latest_planner_diagnostics = dict(diagnostics)
+                elif latest_planner_diagnostics:
+                    current_plan["planner_diagnostics"] = dict(latest_planner_diagnostics)
+                research_plan = current_plan
                 planner_mode = _string_or_none(result_plan.get("planner_mode")) or planner_mode
                 subquestions = result_plan.get("subquestions")
                 if isinstance(subquestions, list):
@@ -714,7 +749,34 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         if event.event_type.endswith(".gap_analysis") and isinstance(result, dict):
             gap_analysis = result
 
-    deduped_warnings = list(dict.fromkeys(warnings + runtime_warnings))
+    if research_plan is not None:
+        diagnostics = research_plan.get("planner_diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics:
+            latest_planner_diagnostics = dict(diagnostics)
+    planner_fell_back = (
+        planner_status in {"fallback", "failed"}
+        or (plan_source is not None and "after_llm_failure" in plan_source)
+        or bool(latest_planner_diagnostics.get("planner_fallback"))
+    )
+    planner_used_llm = (
+        planner_mode == "llm" and planner_status in {"success", "created"} and not planner_fell_back
+    )
+    if planner_enabled is True or research_plan is not None:
+        runtime_warnings = [
+            item
+            for item in runtime_warnings
+            if item
+            not in {
+                DISABLED_PLANNER_WARNING,
+                "No LLM planner is active; generated plans use deterministic fallback only.",
+            }
+        ]
+    provenance_warnings: list[str] = []
+    if planner_fell_back:
+        provenance_warnings.append(LLM_PLANNER_FALLBACK_WARNING)
+    elif planner_used_llm:
+        provenance_warnings.append(LLM_PLANNER_SUCCESS_WARNING)
+    deduped_warnings = list(dict.fromkeys(provenance_warnings + warnings + runtime_warnings))
     if saw_fetch_counters:
         fetch_succeeded = fetch_succeeded_total
         fetch_failed = fetch_failed_total
@@ -751,6 +813,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and not deduped_warnings
         and running_mode is None
         and dependencies is None
+        and plan_source is None
     ):
         return None
 
@@ -760,6 +823,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         planner_enabled=planner_enabled,
         planner_mode=planner_mode,
         planner_status=planner_status,
+        plan_source=plan_source,
         subquestion_count=subquestion_count,
         search_query_count=planner_search_query_count,
         research_plan=research_plan,

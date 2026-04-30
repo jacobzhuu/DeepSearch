@@ -1,12 +1,30 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from dataclasses import dataclass
 from json import JSONDecodeError
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from services.orchestrator.app.llm import LLMError, LLMProvider, LLMRequest, create_llm_provider
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+    field_validator,
+)
+
+from services.orchestrator.app.llm import (
+    LLMError,
+    LLMProvider,
+    LLMRequest,
+    LLMResponse,
+    create_llm_provider,
+)
 from services.orchestrator.app.llm.providers import NoopLLMProvider
 from services.orchestrator.app.planning.types import PlannedSearchQuery, ResearchPlan
 from services.orchestrator.app.research_quality import answer_slots_for_query
@@ -15,20 +33,154 @@ from services.orchestrator.app.settings import Settings
 SYSTEM_PROMPT = """You plan evidence-first web research.
 Return one JSON object only. Do not use markdown fences, explanations, claims, or final answers."""
 
+PLANNER_PROMPT_VERSION = "research_planner_v1"
+PLANNER_OUTPUT_SCHEMA_VERSION = "research_planner_output_v1"
+MAX_RAW_OUTPUT_PREVIEW_CHARS = 500
+DISABLED_PLANNER_WARNING = "No LLM planner is active; deterministic planner used."
+LLM_PLANNER_SUCCESS_WARNING = "LLM planner generated this research plan."
+LLM_PLANNER_FALLBACK_WARNING = (
+    "LLM planner failed validation/provider call; deterministic fallback was used."
+)
+ALLOWED_EXPECTED_SOURCE_TYPES = (
+    "general_web",
+    "official_docs",
+    "official_about",
+    "official_installation_admin",
+    "official_or_reference",
+    "official_repository",
+    "github_readme_or_repo",
+    "reference",
+)
+LANGGRAPH_GUARDRAIL_PREFERRED_DOMAINS = (
+    "docs.langchain.com",
+    "reference.langchain.com",
+    "www.langchain.com",
+    "langchain.com",
+    "github.com/langchain-ai/langgraph",
+)
+LANGGRAPH_WEAK_SECONDARY_DOMAINS = (
+    "langchain-ai.github.io",
+    "blog.langchain.dev",
+)
+LANGGRAPH_BROAD_GITHUB_PREFERENCE = "github.com/langchain-ai"
+LANGGRAPH_UPSTREAM_GITHUB_PREFERENCE = "github.com/langchain-ai/langgraph"
+ExpectedSourceType = Literal[
+    "general_web",
+    "official_docs",
+    "official_about",
+    "official_installation_admin",
+    "official_or_reference",
+    "official_repository",
+    "github_readme_or_repo",
+    "reference",
+]
+
 USER_PROMPT_TEMPLATE = """Create a bounded research plan for this query.
 
 Query:
 {query}
 
-Return a JSON object with exactly these top-level keys:
+Return raw JSON only. Do not wrap it in markdown fences. Do not include explanatory text.
+
+Return one JSON object with exactly these top-level keys:
 intent, normalized_question, subquestions, search_queries, source_preferences,
 answer_outline, risk_notes, planner_mode, warnings.
 
+Use no more than {max_subquestions} subquestions and no more than
+{max_search_queries} search_queries.
 Use planner_mode = "llm".
 
 Each search_queries item must include query_text, rationale, expected_source_type, priority.
+Use only these expected_source_type values:
+{allowed_expected_source_types}.
+
 source_preferences must include preferred_domains, avoid_domains, and freshness_required.
-Prefer official and reference sources when possible. Return JSON only."""
+preferred_domains and avoid_domains must be arrays of strings.
+freshness_required must be a JSON boolean true or false.
+answer_outline, risk_notes, and warnings must be arrays of strings.
+priority must be a JSON integer.
+Prefer official and reference sources when possible.
+
+Schema-conforming compact example:
+{example_json}"""
+
+
+class _LLMPlannerSearchQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query_text: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    expected_source_type: ExpectedSourceType
+    priority: StrictInt
+
+    @field_validator("query_text", "rationale", "expected_source_type", mode="before")
+    @classmethod
+    def _strip_required_text(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class _LLMPlannerSourcePreferences(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preferred_domains: list[str]
+    avoid_domains: list[str]
+    freshness_required: StrictBool
+
+
+class _LLMPlannerPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: str = Field(min_length=1)
+    normalized_question: str = Field(min_length=1)
+    subquestions: list[str] = Field(min_length=1)
+    search_queries: list[_LLMPlannerSearchQuery] = Field(min_length=1)
+    source_preferences: _LLMPlannerSourcePreferences
+    answer_outline: list[str]
+    risk_notes: list[str]
+    planner_mode: str = Field(min_length=1)
+    warnings: list[str]
+
+    @field_validator("intent", "normalized_question", "planner_mode", mode="before")
+    @classmethod
+    def _strip_required_text(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+    @field_validator("subquestions", "answer_outline", "risk_notes", "warnings")
+    @classmethod
+    def _strip_string_list(cls, values: list[str]) -> list[str]:
+        stripped: list[str] = []
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("all items must be strings")
+            normalized = value.strip()
+            if normalized:
+                stripped.append(normalized)
+        return stripped
+
+
+@dataclass(frozen=True)
+class PlannerRunResult:
+    plan: ResearchPlan
+    plan_source: str
+    planner_status: str
+    warnings: list[str]
+    failure: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _PlannerJsonParseResult:
+    payload: dict[str, Any] | None
+    diagnostics: dict[str, Any]
 
 
 class ResearchPlannerError(RuntimeError):
@@ -85,14 +237,20 @@ class ResearchPlannerService:
 
         request = LLMRequest(
             system_prompt=SYSTEM_PROMPT,
-            user_prompt=USER_PROMPT_TEMPLATE.format(query=normalized_query),
+            user_prompt=USER_PROMPT_TEMPLATE.format(
+                query=normalized_query,
+                max_subquestions=self.max_subquestions,
+                max_search_queries=self.max_search_queries,
+                allowed_expected_source_types=", ".join(ALLOWED_EXPECTED_SOURCE_TYPES),
+                example_json=_compact_planner_example_json(),
+            ),
             model=self.model,
             max_output_tokens=self.max_output_tokens,
             temperature=0.0,
             metadata={
                 "query": normalized_query,
                 "constraints": _safe_constraints(constraints),
-                "purpose": "research_planner_v1",
+                "purpose": PLANNER_PROMPT_VERSION,
             },
         )
         try:
@@ -108,6 +266,7 @@ class ResearchPlannerService:
             response.text,
             query=normalized_query,
             planner_mode="noop" if isinstance(self.provider, NoopLLMProvider) else "llm",
+            response=response,
         )
 
     def parse_plan(
@@ -116,19 +275,34 @@ class ResearchPlannerService:
         *,
         query: str,
         planner_mode: str,
+        response: LLMResponse | None = None,
     ) -> ResearchPlan:
-        payload = _parse_json_object(text)
-        if payload is None:
+        parse_result = _parse_json_object_with_diagnostics(text)
+        if parse_result.payload is None:
             raise ResearchPlannerError(
                 message="planner output was not valid JSON",
                 reason="invalid_json",
+                details=parse_result.diagnostics,
             )
-        return _plan_from_payload(
-            payload,
+        strict_payload = _validate_llm_plan_payload(
+            parse_result.payload,
+            diagnostics=parse_result.diagnostics,
+        )
+        plan = _plan_from_payload(
+            strict_payload,
             query=query,
             planner_mode=planner_mode,
             max_subquestions=self.max_subquestions,
             max_search_queries=self.max_search_queries,
+        )
+        return _plan_with_updates(
+            plan,
+            diagnostics=_planner_success_diagnostics(
+                response=response,
+                raw_text=text,
+                parsed_payload=strict_payload,
+                parse_diagnostics=parse_result.diagnostics,
+            ),
         )
 
 
@@ -316,6 +490,74 @@ def build_research_plan_from_payload(
     )
 
 
+def build_optional_research_plan(
+    *,
+    planner_service: ResearchPlannerService | None,
+    task_id: UUID,
+    query: str,
+    constraints: dict[str, Any],
+    max_subquestions: int,
+    max_search_queries: int,
+    disabled_plan_source: str = "deterministic_fallback",
+    llm_plan_source: str = "llm_planner",
+    failure_plan_source: str = "deterministic_fallback_after_llm_failure",
+) -> PlannerRunResult:
+    if planner_service is None:
+        plan = build_default_research_plan(
+            query,
+            max_subquestions=max_subquestions,
+            max_search_queries=max_search_queries,
+            planner_mode="deterministic",
+        )
+        plan = _plan_with_updates(plan, warnings=[DISABLED_PLANNER_WARNING])
+        return PlannerRunResult(
+            plan=plan,
+            plan_source=disabled_plan_source,
+            planner_status="created",
+            warnings=list(plan.warnings),
+        )
+
+    try:
+        plan = planner_service.plan(task_id=task_id, query=query, constraints=constraints)
+    except ResearchPlannerError as error:
+        failure = error.to_payload()
+        reason_warning = f"research planner failed; using deterministic fallback ({error.reason})."
+        fallback_plan = build_default_research_plan(
+            query,
+            max_subquestions=max_subquestions,
+            max_search_queries=max_search_queries,
+            planner_mode="deterministic",
+        )
+        fallback_plan = _plan_with_updates(
+            fallback_plan,
+            warnings=[LLM_PLANNER_FALLBACK_WARNING, reason_warning],
+            diagnostics={
+                "planner_fallback": True,
+                "fallback_reason": error.reason,
+                "planner_failure": failure,
+                "planner_prompt_version": PLANNER_PROMPT_VERSION,
+                "planner_output_schema_version": PLANNER_OUTPUT_SCHEMA_VERSION,
+                **_failure_diagnostics(error),
+            },
+        )
+        return PlannerRunResult(
+            plan=fallback_plan,
+            plan_source=failure_plan_source,
+            planner_status="fallback",
+            warnings=list(fallback_plan.warnings),
+            failure=failure,
+        )
+
+    if plan.planner_mode == "llm":
+        plan = _plan_with_updates(plan, warnings=[LLM_PLANNER_SUCCESS_WARNING])
+    return PlannerRunResult(
+        plan=plan,
+        plan_source=llm_plan_source if plan.planner_mode == "llm" else "noop_planner",
+        planner_status="success" if plan.planner_mode == "llm" else "created",
+        warnings=list(plan.warnings),
+    )
+
+
 def research_plan_from_serialized_payload(payload: dict[str, Any]) -> ResearchPlan | None:
     search_queries = _planned_search_queries(payload.get("search_queries"))
     if not search_queries:
@@ -348,69 +590,370 @@ def research_plan_from_serialized_payload(payload: dict[str, Any]) -> ResearchPl
         planner_guardrail_warnings=_string_list(payload.get("planner_guardrail_warnings")),
         intent_classification=_optional_string(payload.get("intent_classification")),
         extracted_entity=_optional_string(payload.get("extracted_entity")),
+        planner_diagnostics=(
+            dict(payload.get("planner_diagnostics"))
+            if isinstance(payload.get("planner_diagnostics"), dict)
+            else {}
+        ),
     )
 
 
-def _parse_json_object(text: str) -> dict[str, Any] | None:
-    stripped = _extract_json_object_text(text)
-    if stripped is None:
-        return None
+def _validate_llm_plan_payload(
+    payload: dict[str, Any],
+    *,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
     try:
-        payload = json.loads(stripped)
+        validated = _LLMPlannerPayload.model_validate(payload)
+    except ValidationError as error:
+        validation_errors = _simplified_validation_errors(error)
+        raise ResearchPlannerError(
+            message="planner output did not match the required schema",
+            reason="invalid_schema",
+            details={
+                **_schema_validation_diagnostics(diagnostics, schema_validated=False),
+                "validation_errors": validation_errors,
+            },
+        ) from error
+
+    normalized = validated.model_dump()
+    if not _string_list(normalized.get("subquestions")):
+        raise ResearchPlannerError(
+            message="planner output did not include usable subquestions",
+            reason="invalid_schema",
+            details={
+                **_schema_validation_diagnostics(diagnostics, schema_validated=False),
+                "validation_errors": [
+                    {
+                        "loc": ["subquestions"],
+                        "path": "subquestions",
+                        "msg": "empty list",
+                        "type": "value_error",
+                        "category": "missing_field",
+                    }
+                ],
+            },
+        )
+    if not _planned_search_queries(normalized.get("search_queries")):
+        raise ResearchPlannerError(
+            message="planner output did not include usable search queries",
+            reason="invalid_schema",
+            details={
+                **_schema_validation_diagnostics(diagnostics, schema_validated=False),
+                "validation_errors": [
+                    {
+                        "loc": ["search_queries"],
+                        "path": "search_queries",
+                        "msg": "empty list",
+                        "type": "value_error",
+                        "category": "missing_field",
+                    }
+                ],
+            },
+        )
+    return normalized
+
+
+def _simplified_validation_errors(error: ValidationError) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    for item in error.errors():
+        loc = list(item.get("loc", ()))
+        error_type = str(item.get("type", ""))
+        simplified: dict[str, Any] = {
+            "loc": loc,
+            "path": ".".join(str(part) for part in loc),
+            "msg": str(item.get("msg", "")),
+            "type": error_type,
+            "category": _validation_error_category(loc=loc, error_type=error_type),
+        }
+        if simplified["category"] == "invalid_enum_value":
+            simplified["allowed_values"] = list(ALLOWED_EXPECTED_SOURCE_TYPES)
+        errors.append(simplified)
+    return errors
+
+
+def _validation_error_category(*, loc: list[Any], error_type: str) -> str:
+    if error_type == "missing":
+        return "missing_field"
+    if error_type == "extra_forbidden":
+        return "extra_field"
+    if error_type == "literal_error" or (
+        loc and loc[-1] == "expected_source_type" and error_type.startswith("value_error")
+    ):
+        return "invalid_enum_value"
+    if error_type.endswith("_type") or error_type.endswith("_parsing"):
+        return "wrong_type"
+    return "validation_error"
+
+
+def _planner_success_diagnostics(
+    *,
+    response: LLMResponse | None,
+    raw_text: str,
+    parsed_payload: dict[str, Any],
+    parse_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        **_schema_validation_diagnostics(parse_diagnostics, schema_validated=True),
+        "planner_fallback": False,
+        "planner_prompt_version": PLANNER_PROMPT_VERSION,
+        "planner_output_schema_version": PLANNER_OUTPUT_SCHEMA_VERSION,
+        "raw_output_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+        "parsed_output": parsed_payload,
+    }
+    if response is not None:
+        diagnostics.update(
+            {
+                "provider": response.provider,
+                "model": response.model,
+                "usage": dict(response.usage or {}),
+                "raw_response_id": response.raw_response_id,
+                "finish_reason": response.finish_reason,
+            }
+        )
+    return diagnostics
+
+
+def _plan_with_updates(
+    plan: ResearchPlan,
+    *,
+    warnings: list[str] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> ResearchPlan:
+    combined_warnings = list(plan.warnings)
+    if warnings:
+        combined_warnings.extend(warnings)
+    planner_diagnostics = dict(plan.planner_diagnostics)
+    if diagnostics:
+        planner_diagnostics.update(diagnostics)
+    return ResearchPlan(
+        intent=plan.intent,
+        normalized_question=plan.normalized_question,
+        subquestions=list(plan.subquestions),
+        search_queries=list(plan.search_queries),
+        source_preferences=dict(plan.source_preferences),
+        answer_outline=list(plan.answer_outline),
+        risk_notes=list(plan.risk_notes),
+        planner_mode=plan.planner_mode,
+        warnings=list(dict.fromkeys(combined_warnings)),
+        answer_slots=list(plan.answer_slots),
+        raw_planner_queries=list(plan.raw_planner_queries),
+        final_search_queries=list(plan.final_search_queries),
+        dropped_or_downweighted_planner_queries=list(plan.dropped_or_downweighted_planner_queries),
+        planner_guardrail_warnings=list(plan.planner_guardrail_warnings),
+        intent_classification=plan.intent_classification,
+        extracted_entity=plan.extracted_entity,
+        planner_diagnostics=planner_diagnostics,
+    )
+
+
+def _parse_json_object_with_diagnostics(text: str) -> _PlannerJsonParseResult:
+    extracted = _extract_json_object_text(text)
+    diagnostics = _raw_output_diagnostics(
+        raw_text=text,
+        json_extracted=extracted is not None,
+        json_extraction_method=extracted.method if extracted is not None else None,
+        json_extraction_error=None if extracted is not None else _json_extraction_error(text),
+        schema_validated=False,
+    )
+    if extracted is None:
+        return _PlannerJsonParseResult(payload=None, diagnostics=diagnostics)
+    try:
+        payload = json.loads(extracted.json_text)
     except (JSONDecodeError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
+        diagnostics["json_extracted"] = False
+        diagnostics["parse_stages"]["json_extracted"] = False
+        diagnostics["json_extraction_error"] = "invalid_json"
+        return _PlannerJsonParseResult(payload=None, diagnostics=diagnostics)
+    if not isinstance(payload, dict):
+        diagnostics["json_extracted"] = False
+        diagnostics["parse_stages"]["json_extracted"] = False
+        diagnostics["json_extraction_error"] = "json_root_not_object"
+        return _PlannerJsonParseResult(payload=None, diagnostics=diagnostics)
+    return _PlannerJsonParseResult(payload=payload, diagnostics=diagnostics)
 
 
-def _extract_json_object_text(text: str) -> str | None:
+@dataclass(frozen=True)
+class _ExtractedJsonText:
+    json_text: str
+    method: str
+
+
+def _extract_json_object_text(text: str) -> _ExtractedJsonText | None:
     stripped = text.strip()
     if not stripped:
         return None
 
-    fenced = _strip_markdown_json_fence(stripped)
+    fenced = _extract_single_markdown_json_fence(stripped)
     if fenced is not None:
-        stripped = fenced
+        return _ExtractedJsonText(json_text=fenced, method="single_fenced_json_object")
 
-    start = stripped.find("{")
-    if start < 0:
+    if not stripped.startswith("{"):
         return None
-
-    in_string = False
-    escaped = False
-    depth = 0
-    for index in range(start, len(stripped)):
-        char = stripped[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return stripped[start : index + 1]
-    return None
-
-
-def _strip_markdown_json_fence(text: str) -> str | None:
-    if not text.startswith("```"):
+    try:
+        payload, end_index = json.JSONDecoder().raw_decode(stripped)
+    except (JSONDecodeError, ValueError):
         return None
-    lines = text.splitlines()
-    if len(lines) < 2:
+    if not isinstance(payload, dict):
         return None
-    if not lines[0].strip().startswith("```"):
+    if stripped[end_index:].strip():
         return None
-    if lines[-1].strip() == "```":
-        return "\n".join(lines[1:-1]).strip()
-    return "\n".join(lines[1:]).strip()
+    return _ExtractedJsonText(json_text=stripped, method="direct_json_object")
+
+
+def _extract_single_markdown_json_fence(text: str) -> str | None:
+    matches = list(
+        re.finditer(
+            r"```(?:json|JSON)?[^\S\r\n]*\r?\n(?P<body>.*?)\r?\n?```",
+            text,
+            flags=re.DOTALL,
+        )
+    )
+    if len(matches) != 1:
+        return None
+    body = matches[0].group("body").strip()
+    if not body:
+        return None
+    try:
+        payload, end_index = json.JSONDecoder().raw_decode(body)
+    except (JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if body[end_index:].strip():
+        return None
+    return body
+
+
+def _json_extraction_error(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "empty_output"
+    if stripped.startswith("{") or stripped.startswith("```"):
+        return "invalid_json"
+    if "{" in stripped and "}" in stripped:
+        return "prose_around_unfenced_json"
+    return "no_standalone_json_object"
+
+
+def _schema_validation_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    schema_validated: bool,
+) -> dict[str, Any]:
+    updated = dict(diagnostics)
+    parse_stages = dict(updated.get("parse_stages") or {})
+    parse_stages["schema_validated"] = schema_validated
+    updated["parse_stages"] = parse_stages
+    updated["schema_validated"] = schema_validated
+    updated["parse_stage"] = "schema_validated" if schema_validated else "json_extracted"
+    if schema_validated:
+        updated.pop("json_extraction_error", None)
+    return updated
+
+
+def _raw_output_diagnostics(
+    *,
+    raw_text: str,
+    json_extracted: bool,
+    json_extraction_method: str | None,
+    json_extraction_error: str | None,
+    schema_validated: bool,
+) -> dict[str, Any]:
+    raw_preview, preview_truncated = _sanitized_preview(
+        raw_text,
+        max_chars=MAX_RAW_OUTPUT_PREVIEW_CHARS,
+    )
+    diagnostics: dict[str, Any] = {
+        "parse_stage": "json_extracted" if json_extracted else "raw_text",
+        "parse_stages": {
+            "raw_text": True,
+            "json_extracted": json_extracted,
+            "schema_validated": schema_validated,
+        },
+        "raw_text": True,
+        "json_extracted": json_extracted,
+        "schema_validated": schema_validated,
+        "json_extraction_method": json_extraction_method,
+        "raw_output_preview": raw_preview,
+        "raw_output_preview_truncated": preview_truncated,
+        "raw_output_preview_max_chars": MAX_RAW_OUTPUT_PREVIEW_CHARS,
+        "raw_output_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+    }
+    if json_extraction_error is not None:
+        diagnostics["json_extraction_error"] = json_extraction_error
+    return diagnostics
+
+
+def _failure_diagnostics(error: ResearchPlannerError) -> dict[str, Any]:
+    details = dict(error.details or {})
+    keys = {
+        "parse_stage",
+        "parse_stages",
+        "raw_text",
+        "json_extracted",
+        "schema_validated",
+        "json_extraction_method",
+        "json_extraction_error",
+        "raw_output_preview",
+        "raw_output_preview_truncated",
+        "raw_output_preview_max_chars",
+        "raw_output_sha256",
+        "validation_errors",
+    }
+    return {key: details[key] for key in keys if key in details}
+
+
+def _sanitized_preview(text: str, *, max_chars: int) -> tuple[str, bool]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    sanitized = _redact_secret_like_values(normalized)
+    if len(sanitized) <= max_chars:
+        return sanitized, False
+    return sanitized[:max_chars], True
+
+
+def _redact_secret_like_values(text: str) -> str:
+    redacted = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "sk-[redacted]", text)
+    redacted = re.sub(
+        r"(?i)\b(bearer|api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s,}]+",
+        r"\1=[redacted]",
+        redacted,
+    )
+    return redacted
+
+
+def _compact_planner_example_json() -> str:
+    return json.dumps(
+        {
+            "intent": "definition_how_it_works",
+            "normalized_question": "What is Example and how does it work?",
+            "subquestions": ["What is Example?", "How does Example work?"],
+            "search_queries": [
+                {
+                    "query_text": "Example official documentation",
+                    "rationale": "Find the official definition.",
+                    "expected_source_type": "official_docs",
+                    "priority": 1,
+                },
+                {
+                    "query_text": "Example reference overview",
+                    "rationale": "Find stable reference context.",
+                    "expected_source_type": "reference",
+                    "priority": 2,
+                },
+            ],
+            "source_preferences": {
+                "preferred_domains": [],
+                "avoid_domains": ["reddit.com"],
+                "freshness_required": False,
+            },
+            "answer_outline": ["Definition", "Mechanism"],
+            "risk_notes": ["Prefer official sources."],
+            "planner_mode": "llm",
+            "warnings": [],
+        },
+        separators=(",", ":"),
+    )
 
 
 def _plan_from_payload(
@@ -463,11 +1006,15 @@ def _plan_from_payload(
         planner_mode=planner_mode,
         warnings=warnings,
     )
-    return _apply_research_plan_guardrails(
+    guarded_plan = _apply_research_plan_guardrails(
         plan,
         query=query,
         max_search_queries=max_search_queries,
     )
+    planner_diagnostics = payload.get("planner_diagnostics")
+    if isinstance(planner_diagnostics, dict) and planner_diagnostics:
+        return _plan_with_updates(guarded_plan, diagnostics=dict(planner_diagnostics))
+    return guarded_plan
 
 
 def _apply_research_plan_guardrails(
@@ -486,6 +1033,7 @@ def _apply_research_plan_guardrails(
     guardrail_warnings: list[str] = []
     raw_planner_queries = [item.to_payload() for item in plan.search_queries]
     overridden_avoid_domains: list[str] = []
+    source_preference_diagnostics: list[dict[str, Any]] = []
     dropped_or_downweighted: list[dict[str, Any]] = []
 
     if overview_query:
@@ -520,6 +1068,21 @@ def _apply_research_plan_guardrails(
             ],
             preferred_domains,
         )
+
+    if overview_query and extracted_entity and _is_langgraph_entity(extracted_entity):
+        preferred_domains = _string_list(source_preferences.get("preferred_domains"))
+        (
+            source_preferences["preferred_domains"],
+            source_preference_diagnostics,
+        ) = _langgraph_preferred_domains_with_guardrails(preferred_domains)
+        secondary_domains = _langgraph_secondary_domains(preferred_domains)
+        if secondary_domains:
+            source_preferences["secondary_preferred_domains"] = secondary_domains
+        if source_preference_diagnostics:
+            source_preferences["planner_domain_corrections"] = source_preference_diagnostics
+        warning = "planner_preferred_domains_supplemented_for_langgraph_owned_sources"
+        guardrail_warnings.append(warning)
+        warnings.append(warning)
 
     search_queries = plan.search_queries
     answer_outline = list(plan.answer_outline)
@@ -570,6 +1133,12 @@ def _apply_research_plan_guardrails(
                     priority=5,
                     query_source="guardrail_query",
                 )
+            )
+        if _is_langgraph_entity(extracted_entity):
+            guardrail_queries = _inject_langgraph_guardrail_queries(
+                extracted_entity,
+                query,
+                guardrail_queries,
             )
 
         search_queries, dropped_or_downweighted = _merge_and_rank_planned_queries(
@@ -637,6 +1206,10 @@ def _apply_research_plan_guardrails(
         )
 
     final_search_queries = [item.to_payload() for item in search_queries]
+    dropped_or_downweighted = [
+        *source_preference_diagnostics,
+        *dropped_or_downweighted,
+    ]
     return ResearchPlan(
         intent=guarded_intent,
         normalized_question=plan.normalized_question,
@@ -673,6 +1246,152 @@ def _source_preferences_with_defaults(
             else bool(defaults.get("freshness_required", False))
         ),
     }
+
+
+def _is_langgraph_entity(entity: str | None) -> bool:
+    return _compact_identifier(entity or "") == "langgraph"
+
+
+def _compact_identifier(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _langgraph_preferred_domains_with_guardrails(
+    preferred_domains: list[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    diagnostics: list[dict[str, Any]] = []
+    strong_supplements: list[str] = []
+    normal_supplements: list[str] = []
+    weak_supplements: list[str] = []
+
+    for domain in preferred_domains:
+        normalized = _normalize_domain_preference(domain)
+        if not normalized:
+            continue
+        if normalized == _normalize_domain_preference(LANGGRAPH_BROAD_GITHUB_PREFERENCE):
+            strong_supplements.append(LANGGRAPH_UPSTREAM_GITHUB_PREFERENCE)
+            normal_supplements.append(domain)
+            diagnostics.append(
+                {
+                    "domain": domain,
+                    "query_text": domain,
+                    "action": "domain_supplemented",
+                    "corrected_to": LANGGRAPH_UPSTREAM_GITHUB_PREFERENCE,
+                    "downrank_reason": "broad_langchain_github_supplemented_with_langgraph_repo",
+                    "query_source": "planner_source_preference",
+                }
+            )
+            continue
+        if any(
+            _domain_preference_matches(normalized, weak)
+            for weak in LANGGRAPH_WEAK_SECONDARY_DOMAINS
+        ):
+            weak_supplements.append(domain)
+            diagnostics.append(
+                {
+                    "domain": domain,
+                    "query_text": domain,
+                    "action": "domain_downweighted",
+                    "downrank_reason": "weak_langgraph_domain_marked_secondary",
+                    "query_source": "planner_source_preference",
+                }
+            )
+            continue
+        normal_supplements.append(domain)
+
+    preferred = _prepend_unique_strings(
+        list(LANGGRAPH_GUARDRAIL_PREFERRED_DOMAINS),
+        [*strong_supplements, *normal_supplements, *weak_supplements],
+    )
+    return preferred, diagnostics
+
+
+def _langgraph_secondary_domains(preferred_domains: list[str]) -> list[str]:
+    secondary = [
+        domain
+        for domain in preferred_domains
+        if any(
+            _domain_preference_matches(_normalize_domain_preference(domain), weak)
+            for weak in LANGGRAPH_WEAK_SECONDARY_DOMAINS
+        )
+    ]
+    return _prepend_unique_strings([], secondary)
+
+
+def _normalize_domain_preference(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = normalized.removeprefix("https://").removeprefix("http://")
+    normalized = normalized.strip("/")
+    return normalized.removeprefix("www.") if normalized != "www.langchain.com" else normalized
+
+
+def _domain_preference_matches(value: str, expected: str) -> bool:
+    normalized_expected = _normalize_domain_preference(expected)
+    return value == normalized_expected or value.startswith(f"{normalized_expected}/")
+
+
+def _inject_langgraph_guardrail_queries(
+    entity: str,
+    original_query: str,
+    guardrail_queries: list[PlannedSearchQuery],
+) -> list[PlannedSearchQuery]:
+    return [
+        guardrail_queries[0],
+        guardrail_queries[1],
+        PlannedSearchQuery(
+            query_text=f"{entity} site:docs.langchain.com how it works",
+            rationale="Force owned LangChain documentation into the initial LangGraph plan.",
+            expected_source_type="official_docs",
+            priority=3,
+            query_source="guardrail_query",
+        ),
+        PlannedSearchQuery(
+            query_text=f"{entity} site:reference.langchain.com how it works",
+            rationale="Force owned LangChain reference docs into the initial LangGraph plan.",
+            expected_source_type="reference",
+            priority=4,
+            query_source="guardrail_query",
+        ),
+        PlannedSearchQuery(
+            query_text=f"{entity} site:www.langchain.com/langgraph how it works",
+            rationale="Force the official LangGraph product page into the initial plan.",
+            expected_source_type="official_about",
+            priority=5,
+            query_source="guardrail_query",
+        ),
+        PlannedSearchQuery(
+            query_text=f"{entity} github langchain-ai langgraph",
+            rationale="Force the upstream LangGraph GitHub repository into the initial plan.",
+            expected_source_type="official_repository",
+            priority=6,
+            query_source="guardrail_query",
+        ),
+        PlannedSearchQuery(
+            query_text=f"{entity} how it works state graph nodes edges workflow",
+            rationale="Preserve deterministic mechanism terms for LangGraph overview coverage.",
+            expected_source_type="official_docs",
+            priority=7,
+            query_source="guardrail_query",
+        ),
+        PlannedSearchQuery(
+            query_text=f"{entity} privacy trust security human-in-the-loop data storage",
+            rationale="Preserve deterministic trust and human-in-the-loop coverage terms.",
+            expected_source_type="official_docs",
+            priority=8,
+            query_source="guardrail_query",
+        ),
+        *[
+            PlannedSearchQuery(
+                query_text=item.query_text,
+                rationale=item.rationale,
+                expected_source_type=item.expected_source_type,
+                priority=index,
+                query_source=item.query_source,
+            )
+            for index, item in enumerate(guardrail_queries[2:], start=9)
+            if item.query_text.strip().lower() != original_query.strip().lower()
+        ],
+    ]
 
 
 def _default_source_preferences() -> dict[str, Any]:
@@ -789,6 +1508,17 @@ def _merge_and_rank_planned_queries(
 
 def _planner_query_guardrail_penalty(query: PlannedSearchQuery) -> int:
     lower = query.query_text.lower()
+    if (
+        "github" in lower
+        and "repository" in lower
+        and "/" not in lower
+        and "langchain-ai langgraph" not in lower
+    ):
+        return 12
+    if any(term in lower for term in ("blog", "announcement", "tutorial")):
+        return 12
+    if any(term in lower for term in ("generic article", "use case", "use cases", "examples")):
+        return 6
     if any(term in lower for term in ("architecture", "admin", "api", "developer", "dev/")):
         return 20
     if any(term in lower for term in ("install", "installation", "setup", "docker")):
@@ -800,6 +1530,14 @@ def _planner_query_guardrail_penalty(query: PlannedSearchQuery) -> int:
 
 def _planner_query_downrank_reason(query: PlannedSearchQuery) -> str:
     lower = query.query_text.lower()
+    if "github" in lower and "repository" in lower and "/" not in lower:
+        return "broad_repository_query_supplemented_by_upstream_repo"
+    if any(term in lower for term in ("blog", "announcement")):
+        return "blog_or_announcement_query_downweighted_for_overview"
+    if "tutorial" in lower:
+        return "generic_tutorial_query_downweighted_for_overview"
+    if any(term in lower for term in ("generic article", "use case", "use cases", "examples")):
+        return "generic_or_examples_query_lower_priority_for_overview"
     if any(term in lower for term in ("architecture", "admin")):
         return "architecture_or_admin_query_downweighted_for_overview"
     if any(term in lower for term in ("api", "developer", "dev/")):
@@ -966,7 +1704,8 @@ def _planned_search_queries(value: Any) -> list[PlannedSearchQuery]:
             continue
         if isinstance(item, str):
             query_source = "planner_query"
-        if not query_text or query_text in seen_query_texts:
+        dedupe_key = query_text.lower()
+        if not query_text or dedupe_key in seen_query_texts:
             continue
         planned.append(
             PlannedSearchQuery(
@@ -977,7 +1716,7 @@ def _planned_search_queries(value: Any) -> list[PlannedSearchQuery]:
                 query_source=query_source,
             )
         )
-        seen_query_texts.add(query_text)
+        seen_query_texts.add(dedupe_key)
     return sorted(planned, key=lambda query: query.priority)
 
 

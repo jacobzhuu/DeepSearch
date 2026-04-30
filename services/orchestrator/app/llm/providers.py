@@ -351,6 +351,7 @@ def _noop_planner_json(query: str) -> str:
         "risk_notes": [
             "Prefer official documentation and stable references over community discussion.",
         ],
+        "planner_mode": "noop",
         "warnings": [],
     }
     return json.dumps(plan, sort_keys=True)

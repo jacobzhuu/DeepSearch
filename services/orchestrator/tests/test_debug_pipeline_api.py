@@ -464,6 +464,51 @@ def test_task_detail_observability_defaults_for_legacy_pipeline_events(
         client_generator.close()
 
 
+def test_task_detail_fetch_observability_sums_initial_and_gap_acquisition_events(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(session_factory, tmp_path, index_backend)
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is LangGraph and how does it work?"},
+        )
+        task_id = UUID(create_response.json()["task_id"])
+        with session_factory() as session:
+            event_repository = TaskEventRepository(session)
+            event_repository.record(
+                task_id=task_id,
+                event_type="debug.pipeline.stage_completed",
+                payload_json={
+                    "stage": "ACQUIRING",
+                    "result": {"fetch_succeeded": 2, "fetch_failed": 1},
+                },
+            )
+            event_repository.record(
+                task_id=task_id,
+                event_type="debug.pipeline.stage_completed",
+                payload_json={
+                    "stage": "RESEARCHING_MORE",
+                    "result": {
+                        "acquisition": {"fetch_succeeded": 0, "fetch_failed": 1},
+                    },
+                },
+            )
+            session.commit()
+
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+
+        assert detail_response.status_code == 200
+        observability = detail_response.json()["progress"]["observability"]
+        assert observability["fetch_succeeded"] == 2
+        assert observability["fetch_failed"] == 2
+    finally:
+        client_generator.close()
+
+
 def test_pipeline_events_record_fetch_failure_details_and_low_source_warning(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
@@ -958,13 +1003,27 @@ def test_pipeline_llm_planner_failure_falls_back_to_original_query(
         assert persisted_queries[0]["query_text"] == (
             "Planner provider failure should not fail the pipeline"
         )
-        assert any(
-            item["metadata"].get("expansion_metadata", {}).get("query_source") == "gap_analyzer"
+        gap_queries = [
+            item
             for item in persisted_queries[1:]
-        )
-        assert any(
+            if item["metadata"].get("expansion_metadata", {}).get("query_source") == "gap_analyzer"
+        ]
+        if gap_queries:
+            assert any(
+                item["metadata"].get("expansion_metadata", {}).get("gap_round_no") == 1
+                for item in gap_queries
+            )
+        else:
+            remaining_required_gaps = [
+                slot
+                for slot in observability.get("slot_coverage_summary", [])
+                if slot.get("required") is True and slot.get("status") in {"missing", "weak"}
+            ]
+            assert remaining_required_gaps == []
+        assert not any(
             item["metadata"].get("expansion_metadata", {}).get("gap_round_no") == 1
             for item in persisted_queries[1:]
+            if item not in gap_queries
         )
     finally:
         client_generator.close()

@@ -410,12 +410,10 @@ class DebugRealPipelineRunner:
             include_default_expansions=False,
             require_candidates=False,
         )
-        candidate_ids = [
-            UUID(source["candidate_url_id"])
-            for source in search_result.get("selected_sources", [])
-            if isinstance(source.get("candidate_url_id"), str)
-        ]
-        selected_candidate_ids = candidate_ids[: self.max_supplemental_sources]
+        selected_candidate_ids, skipped_gap_search_sources = _select_gap_search_candidate_ids(
+            search_result,
+            limit=self.max_supplemental_sources,
+        )
         warnings: list[str] = []
         fallback_sources: list[dict[str, Any]] = []
         skipped_fallback_sources: list[dict[str, Any]] = []
@@ -425,6 +423,7 @@ class DebugRealPipelineRunner:
                 task_id,
                 query=task.query,
                 limit=self.max_supplemental_sources,
+                high_value_only=True,
             )
             selected_candidate_ids = [candidate.id for candidate in fallback_candidates]
             fallback_sources = [
@@ -440,13 +439,14 @@ class DebugRealPipelineRunner:
                     "gap_analysis": gap_analysis,
                     "search": search_result,
                     "fallback_sources": fallback_sources,
+                    "skipped_gap_search_sources": skipped_gap_search_sources,
                     "skipped_fallback_sources": skipped_fallback_sources,
                     "warnings": warnings,
                     "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
                 }
             warnings.append(
-                "Gap round search added no new URLs; attempting existing unattempted high-value "
-                "candidates."
+                "Gap round search added no high-value URLs; attempting existing unattempted "
+                "high-value candidates."
             )
 
         acquisition = self.acquisition_service.acquire_candidates(
@@ -466,6 +466,7 @@ class DebugRealPipelineRunner:
                 "search": search_result,
                 "acquisition": acquisition_result,
                 "fallback_sources": fallback_sources,
+                "skipped_gap_search_sources": skipped_gap_search_sources,
                 "skipped_fallback_sources": skipped_fallback_sources,
                 "warnings": warnings,
                 "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
@@ -498,6 +499,7 @@ class DebugRealPipelineRunner:
                 "acquisition": acquisition_result,
                 "parsing": parsing_result,
                 "fallback_sources": fallback_sources,
+                "skipped_gap_search_sources": skipped_gap_search_sources,
                 "skipped_fallback_sources": skipped_fallback_sources,
                 "warnings": warnings,
                 "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
@@ -546,6 +548,7 @@ class DebugRealPipelineRunner:
             "slot_coverage_summary": slot_coverage_summary,
             "remaining_required_gaps": remaining_required_gaps,
             "fallback_sources": fallback_sources,
+            "skipped_gap_search_sources": skipped_gap_search_sources,
             "skipped_fallback_sources": skipped_fallback_sources,
             "warnings": warnings,
             "query": task.query,
@@ -1663,15 +1666,16 @@ def _select_claim_drafting_chunk_ids(
 
 
 def _source_document_category_priority(source_document: SourceDocument, *, query: str) -> int:
-    category = _source_document_category(source_document)
+    category = _source_document_category(source_document, query=query)
     return source_intent_priority(category, query=query)
 
 
-def _source_document_category(source_document: SourceDocument) -> str:
+def _source_document_category(source_document: SourceDocument, *, query: str | None = None) -> str:
     return classify_source_intent(
         canonical_url=source_document.canonical_url,
         domain=source_document.domain,
         title=source_document.title,
+        query=query,
     ).source_category
 
 
@@ -1731,6 +1735,7 @@ def _select_supplemental_candidates(
     *,
     query: str,
     limit: int,
+    high_value_only: bool = False,
 ) -> tuple[list[CandidateUrl], list[dict[str, Any]]]:
     if limit <= 0:
         return [], []
@@ -1745,8 +1750,9 @@ def _select_supplemental_candidates(
         "official_home",
         "github_readme_or_repo",
         "official_docs_reference",
-        "generic_article",
     }
+    if not high_value_only:
+        preferred_categories.update({"generic_article", "secondary_reference"})
     if _query_asks_deployment(query):
         preferred_categories.add("official_installation_admin")
     blocked_for_overview = {"forum_social_video", "low_quality_or_blocked"}
@@ -1801,6 +1807,42 @@ def _select_supplemental_candidates(
             )
             continue
         selected.append(candidate)
+    return selected, skipped
+
+
+def _select_gap_search_candidate_ids(
+    search_result: dict[str, Any],
+    *,
+    limit: int,
+) -> tuple[list[UUID], list[dict[str, Any]]]:
+    if limit <= 0:
+        return [], []
+    high_value_categories = {
+        "official_about",
+        "official_home",
+        "official_docs_reference",
+        "wikipedia_reference",
+        "github_readme_or_repo",
+    }
+    selected: list[UUID] = []
+    skipped: list[dict[str, Any]] = []
+    for source in search_result.get("selected_sources", []):
+        if not isinstance(source, dict):
+            continue
+        raw_id = source.get("candidate_url_id")
+        if not isinstance(raw_id, str):
+            skipped.append({**source, "skip_reason": "missing_candidate_url_id"})
+            continue
+        category = str(source.get("source_category") or "")
+        raw_priority = source.get("fetch_priority_score")
+        priority = raw_priority if isinstance(raw_priority, int) else 50
+        if category not in high_value_categories or priority >= 35:
+            skipped.append({**source, "skip_reason": "low_value_gap_search_result"})
+            continue
+        if len(selected) >= limit:
+            skipped.append({**source, "skip_reason": "gap_search_limit_reached"})
+            continue
+        selected.append(UUID(raw_id))
     return selected, skipped
 
 
@@ -1901,8 +1943,8 @@ def _build_answer_yield_metrics(
                 "canonical_url": source_document.canonical_url,
                 "domain": source_document.domain,
                 "title": source_document.title,
-                "source_category": _source_document_category(source_document),
-                "source_intent": _source_document_category(source_document),
+                "source_category": _source_document_category(source_document, query=query),
+                "source_intent": _source_document_category(source_document, query=query),
                 "source_quality_score": source_document.final_source_score,
                 "extracted_text_length": extracted_text_length,
                 "chunk_count": len(chunks),
@@ -2069,7 +2111,7 @@ def _build_source_yield_summary(
         claim_count = claims_by_source_document_id.get(str(source_document.id), 0)
         rejected_count = sum(1 for item in source_candidates if item.get("rejection_reasons"))
         chunks = chunks_by_source_document_id.get(source_document.id, [])
-        source_intent = _source_document_category(source_document)
+        source_intent = _source_document_category(source_document, query=query)
         rows.append(
             SourceYieldSummary(
                 source_document_id=str(source_document.id),

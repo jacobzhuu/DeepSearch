@@ -141,9 +141,23 @@ def assess_source_quality(
     if metadata.get("reason") == "redirect_stub":
         return SourceQuality(score=0.1, reason="redirect_stub")
 
+    source_category = str(metadata.get("source_category") or "")
+    if source_category in {"official_about", "official_docs_reference"}:
+        return SourceQuality(score=0.95, reason="official_docs")
+    if source_category == "official_home":
+        return SourceQuality(score=0.72, reason="project_homepage")
+    if source_category == "github_readme_or_repo":
+        return SourceQuality(score=0.72, reason="official_github_repository")
+    if source_category == "secondary_reference":
+        return SourceQuality(score=0.55, reason="secondary_reference")
+    if source_category == "low_quality_or_blocked":
+        return SourceQuality(score=0.1, reason="low_quality_or_blocked")
+
     normalized_domain = domain.strip().lower().removeprefix("www.")
     path = urlsplit(canonical_url).path.strip().lower()
-    if normalized_domain.startswith("docs.") or _is_docs_path(path):
+    if normalized_domain.startswith(("docs.", "reference.", "documentation.")) or _is_docs_path(
+        path
+    ):
         return SourceQuality(score=0.95, reason="official_docs")
     if normalized_domain.endswith("wikipedia.org"):
         return SourceQuality(score=0.78, reason="wikipedia_article")

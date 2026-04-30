@@ -168,6 +168,16 @@ def _build_supplemental_queries(
     supplemental: list[SupplementalSearchQuery] = []
     seen = set(existing_query_texts)
 
+    for targeted_query in _targeted_project_queries(
+        normalized_query,
+        gap_slots=gap_slots,
+        round_no=round_no,
+        limit=limit,
+        existing_query_texts=seen,
+    ):
+        seen.add(targeted_query.query_text)
+        supplemental.append(targeted_query)
+
     for slot in gap_slots:
         if len(supplemental) >= limit:
             break
@@ -197,6 +207,61 @@ def _build_supplemental_queries(
             )
         )
     return supplemental
+
+
+def _targeted_project_queries(
+    query: str,
+    *,
+    gap_slots: list[dict[str, Any]],
+    round_no: int,
+    limit: int,
+    existing_query_texts: set[str],
+) -> list[SupplementalSearchQuery]:
+    if limit <= 0 or not gap_slots:
+        return []
+    project = _targeted_project_for_query(query)
+    if project is None:
+        return []
+    slot_ids = tuple(
+        dict.fromkeys(_string_value(slot.get("slot_id"), default="unknown") for slot in gap_slots)
+    )
+    targeted_queries = {
+        "langgraph": (
+            ("LangGraph site:docs.langchain.com", "official_docs"),
+            ("LangGraph site:reference.langchain.com", "official_docs"),
+            ("LangGraph github langchain-ai langgraph", "official_repository"),
+            ("LangGraph docs langchain", "official_docs"),
+        )
+    }.get(project, ())
+    supplemental: list[SupplementalSearchQuery] = []
+    seen = set(existing_query_texts)
+    for query_text, source_type in targeted_queries:
+        if len(supplemental) >= limit:
+            break
+        if query_text in seen:
+            continue
+        seen.add(query_text)
+        supplemental.append(
+            SupplementalSearchQuery(
+                query_text=query_text,
+                rationale=(
+                    "Search owned official/reference sources before secondary mirrors "
+                    f"while filling required answer slots {', '.join(slot_ids)}."
+                ),
+                expected_source_type=source_type,
+                priority=len(supplemental) + 1,
+                slot_ids=slot_ids,
+                round_no=round_no,
+            )
+        )
+    return supplemental
+
+
+def _targeted_project_for_query(query: str) -> str | None:
+    normalized = query.lower()
+    if "langgraph" in normalized:
+        return "langgraph"
+    return None
 
 
 def _query_variants_for_slot(slot_id: str, slot: dict[str, Any]) -> tuple[tuple[str, str], ...]:

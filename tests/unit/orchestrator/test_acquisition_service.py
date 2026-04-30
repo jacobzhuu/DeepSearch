@@ -472,6 +472,110 @@ def test_acquisition_service_prioritizes_official_docs_over_social_and_repo_page
     assert docs_metadata["source_quality_score"] > youtube_metadata["source_quality_score"]
 
 
+def test_acquisition_service_prioritizes_langgraph_official_sources_before_tutorials(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task, tutorial_candidate = _seed_candidate(
+        db_session,
+        query="What is LangGraph and how does it work?",
+        canonical_url="https://www.geeksforgeeks.org/machine-learning/what-is-langgraph/",
+    )
+    tutorial_candidate.domain = "www.geeksforgeeks.org"
+    tutorial_candidate.title = "What is LangGraph - GeeksForGeeks"
+    docs_candidate = _add_candidate(
+        db_session,
+        tutorial_candidate,
+        canonical_url="https://docs.langchain.com/oss/python/langgraph/overview",
+        domain="docs.langchain.com",
+        rank=2,
+        title="LangGraph overview - Docs by LangChain",
+    )
+    reference_candidate = _add_candidate(
+        db_session,
+        tutorial_candidate,
+        canonical_url="https://reference.langchain.com/python/langgraph",
+        domain="reference.langchain.com",
+        rank=3,
+        title="langgraph - LangChain Reference Docs",
+    )
+    github_candidate = _add_candidate(
+        db_session,
+        tutorial_candidate,
+        canonical_url="https://github.com/langchain-ai/langgraph",
+        domain="github.com",
+        rank=4,
+        title="langchain-ai/langgraph: Build resilient language agents as graphs.",
+    )
+    third_party_github_candidate = _add_candidate(
+        db_session,
+        tutorial_candidate,
+        canonical_url="https://github.com/datawhalechina/easy-langent",
+        domain="github.com",
+        rank=5,
+        title="datawhalechina/easy-langent LangGraph tutorial",
+    )
+    low_value_candidate = _add_candidate(
+        db_session,
+        tutorial_candidate,
+        canonical_url="https://www.freelancer.hk/job-search/langgraph/",
+        domain="www.freelancer.hk",
+        rank=6,
+        title="LangGraph jobs",
+    )
+    unrelated_docs_candidate = _add_candidate(
+        db_session,
+        tutorial_candidate,
+        canonical_url="https://docs.langchain.com/langsmith/data-storage-and-privacy",
+        domain="docs.langchain.com",
+        rank=7,
+        title="Data storage and privacy - Docs by LangChain",
+    )
+    db_session.commit()
+
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, content=b"ok", request=request
+        )
+
+    service = _create_acquisition_service(
+        db_session,
+        transport=httpx.MockTransport(handler),
+        snapshot_root=tmp_path,
+        resolver=StaticResolver("93.184.216.34"),
+    )
+
+    service.acquire_candidates(task.id, candidate_url_ids=None, limit=5)
+
+    assert requested_urls[:3] == [
+        docs_candidate.canonical_url,
+        reference_candidate.canonical_url,
+        github_candidate.canonical_url,
+    ]
+    assert low_value_candidate.canonical_url not in requested_urls
+    tutorial_metadata = fetch_priority_metadata(tutorial_candidate, query=task.query)
+    official_github_metadata = fetch_priority_metadata(github_candidate, query=task.query)
+    third_party_github_metadata = fetch_priority_metadata(
+        third_party_github_candidate,
+        query=task.query,
+    )
+    low_value_metadata = fetch_priority_metadata(low_value_candidate, query=task.query)
+    unrelated_docs_metadata = fetch_priority_metadata(unrelated_docs_candidate, query=task.query)
+
+    assert tutorial_metadata["source_category"] == "generic_article"
+    assert official_github_metadata["source_category"] == "github_readme_or_repo"
+    assert third_party_github_metadata["source_category"] == "secondary_reference"
+    assert (
+        official_github_metadata["fetch_priority_score"]
+        < third_party_github_metadata["fetch_priority_score"]
+    )
+    assert low_value_metadata["source_category"] == "low_quality_or_blocked"
+    assert unrelated_docs_metadata["downrank_reason"] == "off_subject_source_downranked_for_query"
+
+
 def test_acquisition_service_prioritizes_searxng_about_and_wikipedia_over_admin_pages(
     db_session: Session,
     tmp_path: Path,

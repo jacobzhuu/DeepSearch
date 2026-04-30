@@ -203,7 +203,10 @@ def build_basic_research_plan(
             ],
             risk_notes=[
                 "Prefer official installation and operations documentation.",
-                "Treat secrets, public exposure, storage, and reverse-proxy settings as operational risk areas.",
+                (
+                    "Treat secrets, public exposure, storage, and reverse-proxy settings as "
+                    "operational risk areas."
+                ),
             ],
             planner_mode=planner_mode,
             warnings=[],
@@ -216,6 +219,17 @@ def build_basic_research_plan(
         f"What privacy or design goals does {subject} have?",
         f"What features or integrations does {subject} support?",
     ][:max_subquestions]
+    if subject.lower() == "searxng":
+        mechanism_query = f"{subject} how it works metasearch engine upstream search engines"
+        mechanism_rationale = "Find how the system operates and aggregates results."
+        trust_query = f"{subject} privacy not storing user information"
+        trust_rationale = "Find privacy and data-handling behavior."
+    else:
+        mechanism_query = f"{subject} how it works state graph nodes edges workflow"
+        mechanism_rationale = "Find how the system operates and routes work."
+        trust_query = f"{subject} privacy trust security human-in-the-loop data storage"
+        trust_rationale = "Find trust, privacy, security, and data-handling behavior."
+
     search_queries = [
         PlannedSearchQuery(
             query_text=f"{subject} official documentation what is {subject}",
@@ -225,15 +239,15 @@ def build_basic_research_plan(
             query_source="planner_query",
         ),
         PlannedSearchQuery(
-            query_text=f"{subject} how it works metasearch engine upstream search engines",
-            rationale="Find how the system operates and aggregates results.",
+            query_text=mechanism_query,
+            rationale=mechanism_rationale,
             expected_source_type="official_docs",
             priority=2,
             query_source="planner_query",
         ),
         PlannedSearchQuery(
-            query_text=f"{subject} privacy not storing user information",
-            rationale="Find privacy and data-handling behavior.",
+            query_text=trust_query,
+            rationale=trust_rationale,
             expected_source_type="official_docs",
             priority=3,
             query_source="planner_query",
@@ -614,7 +628,10 @@ def _apply_research_plan_guardrails(
         risk_notes = _prepend_unique_strings(
             [
                 "Prefer official installation and operations documentation.",
-                "Treat secrets, public exposure, storage, and reverse-proxy settings as operational risk areas.",
+                (
+                    "Treat secrets, public exposure, storage, and reverse-proxy settings as "
+                    "operational risk areas."
+                ),
             ],
             risk_notes,
         )

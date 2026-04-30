@@ -18,6 +18,9 @@ _CJK_CHAR_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 _TERMINAL_SENTENCE_PATTERN = re.compile(r"[.!。！]$")
 _REFERENCE_MARKER_PATTERN = re.compile(r"^(?:\[\d+\]|\d+\.|\([a-z]\))\s+", re.IGNORECASE)
 _AUTHOR_REFERENCE_PATTERN = re.compile(r"^[A-Z][A-Za-z' -]+,\s+[A-Z](?:\.|\w+)")
+_LEADING_DASH_FRAGMENT_PATTERN = re.compile(
+    r"^[^.!?。！？]{1,120}[\u2014\u2013-]\s+" r"(?=[A-Z][A-Za-z0-9_.-]{1,40}\s+(?:is|are)\b)"
+)
 _MEANINGLESS_CLAIMS = frozenset({"c", "data", "none", "null", "undefined"})
 _LOW_VALUE_QUERY_TOKENS = {
     "a",
@@ -70,9 +73,42 @@ _DEFINITION_PATTERNS = (
     " are an ",
     " is the ",
     " are the ",
+    "是一个",
+    "是一种",
+    "是一个低级",
+    "是一个低级别",
+    "是一个框架",
+    "是一个低级编排框架",
+    "是一个低级别的编排框架",
 )
 _MECHANISM_TERMS = (
     "aggregat",
+    "branching",
+    "cycles",
+    "conditional edge",
+    "conditional route",
+    "cyclical graph",
+    "directed graph",
+    "edge",
+    "edges",
+    "execution path",
+    "graph-based",
+    "graph based",
+    "graph architecture",
+    "node",
+    "nodes",
+    "orchestrat",
+    "route",
+    "routes",
+    "routing",
+    "state graph",
+    "state management",
+    "state transition",
+    "stateful graph",
+    "stateful workflow",
+    "stategraph",
+    "workflow",
+    "workflows",
     "mixes your quer",
     "mixing your quer",
     "results",
@@ -82,12 +118,35 @@ _MECHANISM_TERMS = (
     "send queries",
     "upstream engines",
     "other platforms",
+    "分支",
+    "图状态",
+    "工作流",
+    "有状态工作流",
+    "有状态图",
+    "状态图",
+    "状态转换",
+    "节点",
+    "边",
+    "路由",
+    "执行路径",
+    "编排",
 )
 _PRIVACY_TERMS = (
     "identify users",
+    "audit",
+    "auditable",
+    "compliance",
+    "governance",
+    "human oversight",
+    "human-in-the-loop",
+    "human in the loop",
+    "inspect and modify",
     "little to no information",
+    "monitor deployments",
     "private data",
     "privacy",
+    "security",
+    "sensitive data",
     "not storing",
     "without storing",
     "stores no",
@@ -99,16 +158,57 @@ _PRIVACY_TERMS = (
     "third-party",
     "user data",
     "search data",
+    "人机协作",
+    "人工审核",
+    "安全",
+    "审计",
+    "治理",
+    "隐私",
 )
 _FEATURE_TERMS = (
+    "api",
+    "apis",
+    "checkpoint",
+    "checkpointing",
+    "checkpoints",
+    "debug",
+    "debugging",
+    "deployment",
+    "durable execution",
+    "human-in-the-loop",
+    "human in the loop",
+    "integration",
+    "integrations",
+    "langsmith",
+    "limitation",
+    "limitations",
+    "long-running",
+    "memory",
+    "observability",
     "opensearch",
     "over 70 different search engines",
+    "persistence",
+    "persistent",
+    "scalable",
+    "streaming",
     "supports",
+    "stateful",
     "default search engine",
     "browser's search bar",
     "browser search bar",
     "categories",
     "engines",
+    "人机协作",
+    "内存",
+    "可观察性",
+    "持久化",
+    "持久执行",
+    "检查点",
+    "流式传输",
+    "调试",
+    "部署",
+    "集成",
+    "限制",
 )
 _DEPLOYMENT_TERMS = (
     "container",
@@ -311,6 +411,7 @@ class ClaimCandidateScore:
 
 def draft_claim_statement(excerpt: str) -> str:
     normalized = _normalize_quotes(_normalize_whitespace(excerpt))
+    normalized = _strip_leading_dash_fragment(normalized)
     if not normalized:
         raise ValueError("claim statement must not be empty")
     return normalized
@@ -757,6 +858,13 @@ def _normalize_quotes(value: str) -> str:
         normalized = re.sub(r'"([^",]{1,80}),\s+"', r'"\1", "', normalized)
         normalized = re.sub(r'"([^"]{1,80}),"', r'"\1",', normalized)
     return normalized
+
+
+def _strip_leading_dash_fragment(value: str) -> str:
+    match = _LEADING_DASH_FRAGMENT_PATTERN.match(value)
+    if match is None:
+        return value
+    return value[match.end() :].strip()
 
 
 def _has_unbalanced_quotes(value: str) -> bool:

@@ -215,6 +215,7 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 
 Compatibility contract:
 
+- `fetch_succeeded` and `fetch_failed` are cumulative over initial acquisition plus any `RESEARCHING_MORE` gap-round acquisition payloads; per-round details remain available in `gap_rounds`
 - legacy tasks that predate source-yield, evidence-yield, slot-coverage, or verification summaries still return stable empty values when another observability field is present
 - list fields default to `[]`: `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, and `slot_coverage_summary`
 - object fields default to `{}`: `evidence_yield_summary` and `verification_summary`
@@ -1207,6 +1208,7 @@ Command contract:
   - `query_answer_score`
   - `source_quality_score`
 - for definition/mechanism questions such as `What is X and how does it work?`, the draft selector prefers definition, mechanism, privacy/design-goal, and feature claims, and penalizes setup instructions, contribution/community text, slogans, references, and navigation material
+- for technical library/framework questions, mechanism and feature matching includes graph/state/nodes/edges/workflow/orchestration/routing, durable execution, streaming, memory, checkpointing, human-in-the-loop, integrations, APIs, and limitations
 - persisted draft claims store the scoring metadata in `claim.notes`, including `claim_category`, `claim_quality_score`, `query_answer_score`, `claim_selection_score`, and `rejected_reason` when available
 - if strict filters produce no claims, drafting may run a narrow deterministic `fallback_relaxed` pass over explanatory definition, mechanism, privacy, or feature sentences only; fallback still rejects slogans, calls-to-action, community/contribution text, redirect stubs, navigation, references, and setup-only instructions unless the query asks for them
 - fallback-created claims record `draft_mode = "fallback_relaxed"`, `fallback_reason = "strict_filters_produced_no_claims"`, and `original_rejected_reason` in `claim.notes`
@@ -1408,7 +1410,8 @@ Execution contract:
   - evidence-yield summaries and slot-coverage summaries that link answer slots to candidate evidence, accepted evidence, strong/weak support, unsupported claims, and contributing source counts
   - verification summaries that identify the deterministic lexical verifier method and distinguish strong support from weak lexical support
   - supplemental acquisition trigger reason, attempted sources, skipped sources, and bounded retry status
-  - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates, max-round terminal reasons, and per-round `RESEARCHING_MORE` results
+  - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, LangGraph owned-source fallback queries for LangChain docs/reference/GitHub when relevant, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates or low-value results, max-round terminal reasons, and per-round `RESEARCHING_MORE` results
+  - technical concept source selection diagnostics: generic title-only tutorial pages remain `generic_article`, localized mirrors such as `github.langchain.ac.cn`, `langgraph.com.cn`, and `langchain-doc.cn` remain `secondary_reference`, third-party GitHub tutorials do not receive upstream repository priority, off-subject official-looking docs can be downranked with `off_subject_source_downranked_for_query`, and job/freelance/listing URLs stay low quality for overview queries
   - claim-drafting failure diagnostics when a no-claims failure remains after supplemental acquisition, including why supplemental acquisition triggered, top rejected candidates, unattempted high-quality sources, why about/Wikipedia was not attempted, per-source answer yield, and an operator `next_action`
   - warnings when fewer than two sources fetch successfully; this does not block completion when at least one source succeeds
 

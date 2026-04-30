@@ -417,6 +417,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     selected_sources: list[dict[str, Any]] = []
     fetch_succeeded: int | None = None
     fetch_failed: int | None = None
+    fetch_succeeded_total = 0
+    fetch_failed_total = 0
+    saw_fetch_counters = False
     attempted_sources: list[dict[str, Any]] = []
     unattempted_sources: list[dict[str, Any]] = []
     failed_sources: list[dict[str, Any]] = []
@@ -551,9 +554,11 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 acquisition_payload.get("failed"),
             )
             if isinstance(succeeded, int):
-                fetch_succeeded = succeeded
+                fetch_succeeded_total += succeeded
+                saw_fetch_counters = True
             if isinstance(failed, int):
-                fetch_failed = failed
+                fetch_failed_total += failed
+                saw_fetch_counters = True
             selected_sources_from_search = (
                 _object_list(acquisition_payload.get("selected_sources_from_search"))
                 or selected_sources_from_search
@@ -624,9 +629,11 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 )
                 failed = acquisition.get("fetch_failed", acquisition.get("failed"))
                 if isinstance(succeeded, int):
-                    fetch_succeeded = succeeded
+                    fetch_succeeded_total += succeeded
+                    saw_fetch_counters = True
                 if isinstance(failed, int):
-                    fetch_failed = failed
+                    fetch_failed_total += failed
+                    saw_fetch_counters = True
                 attempted_sources = (
                     _object_list(acquisition.get("attempted_sources")) or attempted_sources
                 )
@@ -708,6 +715,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             gap_analysis = result
 
     deduped_warnings = list(dict.fromkeys(warnings + runtime_warnings))
+    if saw_fetch_counters:
+        fetch_succeeded = fetch_succeeded_total
+        fetch_failed = fetch_failed_total
     source_yield_rows = source_yield_summary or answer_yield
     selected_sources = _sources_with_yield(selected_sources, source_yield_rows)
     attempted_sources = _sources_with_yield(attempted_sources, source_yield_rows)

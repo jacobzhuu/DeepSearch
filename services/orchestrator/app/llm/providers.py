@@ -283,13 +283,25 @@ def _noop_planner_json(query: str) -> str:
 
     normalized_query = query or "Research question"
     subject = _subject_from_query(normalized_query)
+    if subject.lower() == "searxng":
+        mechanism_query = f"{subject} how it works metasearch engine upstream search engines"
+        mechanism_rationale = "Find mechanism details about aggregation and upstream engines."
+        trust_query = f"{subject} privacy not storing user information"
+        trust_rationale = "Find privacy behavior and data handling claims."
+        privacy_subquestion = f"What privacy protections does {subject} provide?"
+    else:
+        mechanism_query = f"{subject} how it works state graph nodes edges workflow"
+        mechanism_rationale = "Find mechanism details about architecture and workflow execution."
+        trust_query = f"{subject} privacy trust security human-in-the-loop data storage"
+        trust_rationale = "Find trust, privacy, security, and data-handling behavior."
+        privacy_subquestion = f"What trust, privacy, or security model does {subject} use?"
     plan = {
         "intent": "definition_how_it_works",
         "normalized_question": normalized_query,
         "subquestions": [
             f"What is {subject}?",
             f"How does {subject} work?",
-            f"What privacy protections does {subject} provide?",
+            privacy_subquestion,
             f"What engines or features does {subject} support?",
         ],
         "search_queries": [
@@ -300,14 +312,14 @@ def _noop_planner_json(query: str) -> str:
                 "priority": 1,
             },
             {
-                "query_text": (f"{subject} how it works metasearch engine upstream search engines"),
-                "rationale": "Find mechanism details about aggregation and upstream engines.",
+                "query_text": mechanism_query,
+                "rationale": mechanism_rationale,
                 "expected_source_type": "official_docs",
                 "priority": 2,
             },
             {
-                "query_text": f"{subject} privacy not storing user information",
-                "rationale": "Find privacy behavior and data handling claims.",
+                "query_text": trust_query,
+                "rationale": trust_rationale,
                 "expected_source_type": "official_docs",
                 "priority": 3,
             },

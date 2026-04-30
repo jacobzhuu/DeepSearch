@@ -22,6 +22,7 @@ from services.orchestrator.app.parsing import (
     chunk_text,
     extract_parsed_content,
 )
+from services.orchestrator.app.research_quality import classify_source_intent
 from services.orchestrator.app.services.acquisition import FETCH_STATUS_SUCCEEDED
 from services.orchestrator.app.services.research_tasks import (
     PHASE2_ACTIVE_STATUS,
@@ -335,10 +336,23 @@ class ParsingService:
             candidate_url.canonical_url, fetch_attempt.trace_json
         )
         document_domain = _domain_from_url(document_url) or candidate_url.domain
+        source_intent = classify_source_intent(
+            canonical_url=document_url,
+            domain=document_domain,
+            title=parsed_content.title or candidate_url.title,
+            query=task.query,
+            known_path_candidate=bool(
+                (candidate_url.metadata_json or {}).get("known_path_candidate")
+            ),
+        )
         source_quality = assess_source_quality(
             canonical_url=document_url,
             domain=document_domain,
-            parsed_metadata=parsed_content.metadata,
+            parsed_metadata={
+                **parsed_content.metadata,
+                "source_category": source_intent.source_category,
+                "source_intent": source_intent.source_intent,
+            },
         )
         source_document = self.source_document_repository.get_for_task_url(
             task_id,

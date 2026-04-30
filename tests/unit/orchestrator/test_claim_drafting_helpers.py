@@ -15,6 +15,7 @@ from services.orchestrator.app.claims import (
     select_supporting_span,
     validate_citation_span,
 )
+from services.orchestrator.app.research_quality import answer_slot_coverage
 
 
 def test_select_supporting_span_prefers_informative_matching_sentence() -> None:
@@ -241,6 +242,86 @@ def test_answer_role_classifies_official_about_style_sentences() -> None:
         assert score.answer_role == category
         assert score.answer_relevant is True
         assert is_answer_relevant_score(score, query=query)
+
+
+def test_technical_framework_sentences_cover_mechanism_features_and_trust() -> None:
+    query = "What is LangGraph and how does it work?"
+    expected = [
+        (
+            (
+                "LangGraph uses graph-based architectures to model relationships between "
+                "components of an AI agent workflow."
+            ),
+            "mechanism",
+        ),
+        (
+            "Edges determine which node should run next based on the current state.",
+            "mechanism",
+        ),
+        (
+            (
+                "LangGraph provides durable execution, streaming, memory, checkpointing, "
+                "and integrations for long-running agents."
+            ),
+            "feature",
+        ),
+        (
+            "Human-in-the-loop lets developers inspect and modify agent state at any point.",
+            "privacy",
+        ),
+    ]
+
+    for sentence, category in expected:
+        score = score_claim_statement(statement=sentence, query=query)
+        assert is_claimable_statement(sentence, query=query)
+        assert score.rejected_reason is None
+        assert score.claim_category == category
+        assert score.answer_role == category
+        assert score.answer_relevant is True
+        assert is_answer_relevant_score(score, query=query)
+
+
+def test_langgraph_cjk_framework_claims_cover_definition_and_mechanism_slots() -> None:
+    query = "What is LangGraph and how does it work?"
+    expected = [
+        (
+            "LangGraph是一个低级编排框架和运行时，用于构建、管理和部署长时间运行的有状态代理。",
+            "definition",
+        ),
+        (
+            "LangGraph为任何长时间运行的有状态工作流或代理提供低级支持基础设施。",
+            "mechanism",
+        ),
+        (
+            "LangGraph专注于对代理编排重要的底层功能：持久执行、流式传输、人机协作等。",
+            "privacy",
+        ),
+    ]
+    categories: set[str] = set()
+
+    for sentence, category in expected:
+        score = score_claim_statement(statement=sentence, query=query)
+        assert score.rejected_reason is None
+        assert score.claim_category == category
+        assert score.answer_relevant is True
+        assert is_answer_relevant_score(score, query=query)
+        categories.add(score.claim_category)
+
+    coverage = answer_slot_coverage(query, categories)
+    required_coverage = {
+        row["slot_id"]: row["covered"] for row in coverage if row["slot_id"] in categories
+    }
+    assert required_coverage["definition"] is True
+    assert required_coverage["mechanism"] is True
+
+
+def test_draft_claim_statement_strips_leading_dash_fragment_before_definition() -> None:
+    statement = draft_claim_statement(
+        "Morgan, and more— LangGraph is a low-level orchestration framework and runtime "
+        "for building, managing, and deploying long-running, stateful agents."
+    )
+
+    assert statement.startswith("LangGraph is a low-level orchestration framework")
 
 
 def test_answer_role_rejects_navigation_project_meta_and_documentation_pointers() -> None:

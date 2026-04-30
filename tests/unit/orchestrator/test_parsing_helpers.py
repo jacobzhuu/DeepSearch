@@ -5,6 +5,7 @@ import pytest
 from services.orchestrator.app.parsing import (
     UnsupportedMimeTypeError,
     assess_chunk_quality,
+    assess_source_quality,
     chunk_text,
     extract_parsed_content,
 )
@@ -271,6 +272,34 @@ def test_chunk_text_splits_single_long_paragraph() -> None:
 
     assert len(chunks) == 3
     assert all(len(chunk.text) <= 40 for chunk in chunks)
+
+
+def test_source_quality_treats_reference_docs_as_official_docs() -> None:
+    quality = assess_source_quality(
+        canonical_url="https://reference.langchain.com/python/langgraph",
+        domain="reference.langchain.com",
+    )
+
+    assert quality.score == 0.95
+    assert quality.reason == "official_docs"
+
+
+def test_source_quality_uses_selection_category_for_mirrors_and_official_github() -> None:
+    mirror_quality = assess_source_quality(
+        canonical_url="https://langgraph.com.cn/",
+        domain="langgraph.com.cn",
+        parsed_metadata={"source_category": "secondary_reference"},
+    )
+    github_quality = assess_source_quality(
+        canonical_url="https://github.com/langchain-ai/langgraph",
+        domain="github.com",
+        parsed_metadata={"source_category": "github_readme_or_repo"},
+    )
+
+    assert mirror_quality.score == 0.55
+    assert mirror_quality.reason == "secondary_reference"
+    assert github_quality.score == 0.72
+    assert github_quality.reason == "official_github_repository"
 
 
 def test_chunk_quality_marks_redirect_navigation_and_reference_chunks_ineligible() -> None:

@@ -187,6 +187,19 @@ def test_searxng_query_plan_contains_definition_mechanism_privacy() -> None:
     assert "privacy" in combined.lower()
 
 
+def test_non_searxng_technical_plan_uses_generic_framework_mechanism_terms() -> None:
+    plan = _planner(NoopLLMProvider()).plan(
+        task_id=uuid4(),
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+
+    combined = " ".join(item.query_text for item in plan.search_queries)
+    assert "how it works state graph nodes edges workflow" in combined
+    assert "metasearch engine" not in combined
+    assert "human-in-the-loop" in combined
+
+
 def test_definition_query_overrides_wikipedia_avoid_domain_and_keeps_reference_sources() -> None:
     plan = _planner(
         StaticLLMProvider(

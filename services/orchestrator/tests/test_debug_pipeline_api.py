@@ -212,6 +212,27 @@ class GapFailingAfterInitialSearchProvider:
         )
 
 
+class MainSearchUnresponsiveProvider:
+    name = "searxng"
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def search(self, request: SearchRequest) -> SearchResponse:
+        self.queries.append(request.query_text)
+        raise SearchProviderError(
+            reason="searxng_empty_results_with_unresponsive_engines",
+            message=(
+                "SearXNG returned no results and reported unresponsive engines: "
+                "brave, duckduckgo."
+            ),
+            status_code=200,
+            content_type="application/json",
+            body_preview=None,
+            unresponsive_engines=["brave", "duckduckgo"],
+        )
+
+
 class FakeHttpAcquisitionClient:
     def fetch(self, url: str) -> HttpFetchResult:
         body = f"""
@@ -1142,11 +1163,13 @@ def test_pipeline_planner_mode_attempts_langgraph_owned_sources_before_generic_a
         assert "LangGraph github langchain-ai langgraph" in final_queries
 
         attempted_urls = [source["canonical_url"] for source in observability["attempted_sources"]]
-        assert attempted_urls[:3] == [
+        official_guardrail_urls = [
             "https://docs.langchain.com/oss/python/langgraph/overview",
-            "https://www.langchain.com/langgraph",
+            "https://docs.langchain.com/oss/javascript/langgraph/overview",
             "https://reference.langchain.com/python/langgraph/",
+            "https://github.com/langchain-ai/langgraph",
         ]
+        assert all(url in attempted_urls for url in official_guardrail_urls)
         generic_urls = [
             url for url in attempted_urls if "blockchain.news" in url or "wfcoding.com" in url
         ]
@@ -1208,6 +1231,129 @@ def test_gap_search_provider_failure_continues_to_reporting_with_existing_eviden
         assert gap_result["search"]["reason"] == "searxng_empty_results_with_unresponsive_engines"
         assert gap_result["existing_evidence"]["usable_evidence"] is True
         assert gap_result["continuing_with_existing_evidence"] is True
+    finally:
+        client_generator.close()
+
+
+def test_main_search_unresponsive_uses_langgraph_known_path_fallback_and_continues(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_PROVIDER", "noop")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "true")
+    monkeypatch.setenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", "5")
+    get_settings.cache_clear()
+
+    search_provider = MainSearchUnresponsiveProvider()
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(
+        session_factory,
+        tmp_path,
+        index_backend,
+        search_provider=search_provider,
+        http_client=LangGraphExplanatoryHttpAcquisitionClient(),
+    )
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is LangGraph and how does it work?"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+
+        assert pipeline_response.status_code == 200
+        payload = pipeline_response.json()
+        assert payload["completed"] is True
+        assert payload["status"] == "COMPLETED"
+        assert len(search_provider.queries) == 1
+
+        observability = detail_response.json()["progress"]["observability"]
+        assert observability["planner_enabled"] is True
+        assert observability["known_path_fallback"]["applied"] is True
+        assert observability["known_path_fallback"]["candidate_count"] == 6
+        assert (
+            observability["search_queries"][0]["known_path_fallback"]["provider_error_reason"]
+            == "searxng_empty_results_with_unresponsive_engines"
+        )
+
+        attempted_sources = observability["attempted_sources"]
+        attempted_urls = [source["canonical_url"] for source in attempted_sources]
+        assert "https://docs.langchain.com/oss/python/langgraph/overview" in attempted_urls
+        assert "https://reference.langchain.com/python/langgraph/" in attempted_urls
+        assert "https://github.com/langchain-ai/langgraph" in attempted_urls
+        assert all(
+            source.get("candidate_source") == "known_path_fallback" for source in attempted_sources
+        )
+        assert all(
+            source.get("fallback_reason") == "searxng_empty_results_with_unresponsive_engines"
+            for source in attempted_sources
+        )
+        assert all(
+            source.get("original_search_provider") == "searxng" for source in attempted_sources
+        )
+
+        searching_events = [
+            event
+            for event in events_response.json()["events"]
+            if event["event_type"] == "debug.pipeline.stage_completed"
+            and event["payload"].get("stage") == "SEARCHING"
+        ]
+        assert searching_events
+        search_result = searching_events[-1]["payload"]["result"]
+        assert search_result["known_path_fallback"]["applied"] is True
+        assert search_result["known_path_fallback"]["candidate_count"] == 6
+    finally:
+        client_generator.close()
+        monkeypatch.delenv("LLM_ENABLED", raising=False)
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_ENABLED", raising=False)
+        monkeypatch.delenv("RESEARCH_PLANNER_MAX_SEARCH_QUERIES", raising=False)
+        get_settings.cache_clear()
+
+
+def test_main_search_unresponsive_unknown_entity_still_fails_with_diagnostics(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    search_provider = MainSearchUnresponsiveProvider()
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(
+        session_factory,
+        tmp_path,
+        index_backend,
+        search_provider=search_provider,
+        http_client=LangGraphExplanatoryHttpAcquisitionClient(),
+    )
+    client = next(client_generator)
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "What is UnknownFramework and how does it work?"},
+        )
+        task_id = create_response.json()["task_id"]
+
+        pipeline_response = client.post(f"/api/v1/research/tasks/{task_id}/debug/run-real-pipeline")
+
+        assert pipeline_response.status_code == 200
+        payload = pipeline_response.json()
+        assert payload["completed"] is False
+        assert payload["status"] == "FAILED"
+        assert payload["failure"]["stage"] == "SEARCHING"
+        assert payload["failure"]["reason"] == "searxng_empty_results_with_unresponsive_engines"
+        details = payload["failure"]["details"]
+        assert details["known_path_fallback_applied"] is False
+        assert details["known_path_fallback_candidate_count"] == 0
+        assert details["query_count_attempted"] == 1
+        assert details["empty_query_count"] == 1
+        assert details["provider_error_type"] == "SearchProviderError"
     finally:
         client_generator.close()
 

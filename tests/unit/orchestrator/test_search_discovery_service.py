@@ -14,6 +14,7 @@ from packages.db.repositories import (
 from services.orchestrator.app.planning import PlannedSearchQuery
 from services.orchestrator.app.search import (
     SearchProvider,
+    SearchProviderError,
     SearchRequest,
     SearchResponse,
     SearchResultItem,
@@ -53,6 +54,29 @@ class StaticSearchProvider:
             result_count=len(results),
             results=results,
             metadata=self.metadata or {"request_query": request.query_text},
+        )
+
+
+@dataclass
+class FailingSearchProvider:
+    reason: str = "searxng_empty_results_with_unresponsive_engines"
+    name: str = "searxng"
+
+    def __post_init__(self) -> None:
+        self.requests: list[SearchRequest] = []
+
+    def search(self, request: SearchRequest) -> SearchResponse:
+        self.requests.append(request)
+        raise SearchProviderError(
+            reason=self.reason,
+            message=(
+                "SearXNG returned no results and reported unresponsive engines: "
+                "brave, duckduckgo."
+            ),
+            status_code=200,
+            content_type="application/json",
+            body_preview=None,
+            unresponsive_engines=["brave", "duckduckgo"],
         )
 
 
@@ -321,3 +345,131 @@ def test_discover_candidates_uses_deduped_planner_queries(db_session: Session) -
     assert persisted_queries[0].raw_response_json["expansion_metadata"]["query_source"] == (
         "guardrail_query"
     )
+
+
+def test_discover_candidates_injects_langgraph_known_path_fallback_on_unresponsive_search(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    provider = FailingSearchProvider()
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(
+        task.id,
+        planned_search_queries=[
+            PlannedSearchQuery(
+                query_text="LangGraph site:docs.langchain.com how it works",
+                rationale="owned docs",
+                expected_source_type="official_docs",
+                priority=1,
+            )
+        ],
+    )
+    persisted_queries = SearchQueryRepository(db_session).list_for_task(task.id)
+    persisted_candidates = CandidateUrlRepository(db_session).list_for_task(task.id)
+    canonical_urls = [candidate.canonical_url for candidate in persisted_candidates]
+
+    assert len(provider.requests) == 1
+    assert result.search_queries[0].candidates_added == 6
+    assert canonical_urls == [
+        "https://docs.langchain.com/oss/python/langgraph/overview",
+        "https://docs.langchain.com/oss/javascript/langgraph/overview",
+        "https://reference.langchain.com/python/langgraph/",
+        "https://reference.langchain.com/python/langgraph/graph/state",
+        "https://www.langchain.com/langgraph",
+        "https://github.com/langchain-ai/langgraph",
+    ]
+    assert all(
+        candidate.metadata_json["candidate_source"] == "known_path_fallback"
+        for candidate in persisted_candidates
+    )
+    assert all(
+        candidate.metadata_json["fallback_reason"]
+        == "searxng_empty_results_with_unresponsive_engines"
+        for candidate in persisted_candidates
+    )
+    assert all(
+        candidate.metadata_json["original_search_provider"] == "searxng"
+        for candidate in persisted_candidates
+    )
+
+    fallback_payload = persisted_queries[0].raw_response_json["known_path_fallback"]
+    assert fallback_payload["known_path_fallback_applied"] is True
+    assert fallback_payload["known_path_fallback_candidate_count"] == 6
+    assert fallback_payload["known_path_fallback_duplicates_skipped"] == 0
+    assert fallback_payload["query_count_attempted"] == 1
+    assert fallback_payload["empty_query_count"] == 1
+    assert fallback_payload["provider_error_type"] == "SearchProviderError"
+    assert fallback_payload["failed_queries"][0]["query_text"] == (
+        "LangGraph site:docs.langchain.com how it works"
+    )
+
+
+def test_discover_candidates_unknown_entity_still_fails_on_unresponsive_search(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is UnknownFramework and how does it work?",
+        constraints={},
+    )
+    provider = FailingSearchProvider()
+    service = _create_search_service(db_session, provider=provider)
+
+    with pytest.raises(SearchProviderError) as error_info:
+        service.discover_candidates(task.id)
+
+    details = error_info.value.details
+    assert details["known_path_fallback_applied"] is False
+    assert details["known_path_fallback_candidate_count"] == 0
+    assert details["query_count_attempted"] == 1
+    assert details["empty_query_count"] == 1
+    assert details["provider_error_reason"] == "searxng_empty_results_with_unresponsive_engines"
+    assert details["failed_queries"][0]["query_text"] == (
+        "What is UnknownFramework and how does it work?"
+    )
+
+
+def test_discover_candidates_dedupes_langgraph_known_path_guardrails_from_provider_results(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    provider = StaticSearchProvider(
+        responses={
+            "What is LangGraph and how does it work?": (
+                SearchResultItem(
+                    url="https://docs.langchain.com/oss/python/langgraph/overview",
+                    title="LangGraph overview - Docs by LangChain",
+                    snippet="Official docs",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            )
+        }
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(task.id, include_default_expansions=False)
+    canonical_urls = [
+        candidate.canonical_url
+        for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
+    ]
+
+    assert canonical_urls.count("https://docs.langchain.com/oss/python/langgraph/overview") == 1
+    assert "https://github.com/langchain-ai/langgraph" in canonical_urls
+    assert len(canonical_urls) == 6
+    assert result.search_queries[0].duplicates_skipped == 1
+    fallback_candidates = [
+        candidate
+        for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
+        if candidate.metadata_json.get("candidate_source") == "known_path_guardrail"
+    ]
+    assert len(fallback_candidates) == 5

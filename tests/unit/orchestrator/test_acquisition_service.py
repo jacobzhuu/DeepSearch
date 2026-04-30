@@ -550,11 +550,10 @@ def test_acquisition_service_prioritizes_langgraph_official_sources_before_tutor
 
     service.acquire_candidates(task.id, candidate_url_ids=None, limit=5)
 
-    assert requested_urls[:3] == [
-        docs_candidate.canonical_url,
-        reference_candidate.canonical_url,
-        github_candidate.canonical_url,
-    ]
+    assert requested_urls[0] == docs_candidate.canonical_url
+    assert {reference_candidate.canonical_url, github_candidate.canonical_url}.issubset(
+        set(requested_urls[:3])
+    )
     assert low_value_candidate.canonical_url not in requested_urls
     tutorial_metadata = fetch_priority_metadata(tutorial_candidate, query=task.query)
     official_github_metadata = fetch_priority_metadata(github_candidate, query=task.query)

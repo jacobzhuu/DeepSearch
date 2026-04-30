@@ -604,26 +604,31 @@ class DebugRealPipelineRunner:
             raise DebugPipelinePreconditionError("search produced no candidate URLs")
         search_queries = []
         search_result_count = 0
+        known_path_fallbacks: list[dict[str, Any]] = []
         for item in result.search_queries:
             raw_payload = item.search_query.raw_response_json or {}
             result_count = raw_payload.get("result_count", 0)
             if not isinstance(result_count, int):
                 result_count = 0
             search_result_count += result_count
-            search_queries.append(
-                {
-                    "search_query_id": str(item.search_query.id),
-                    "query_text": item.search_query.query_text,
-                    "provider": item.search_query.provider,
-                    "result_count": result_count,
-                    "candidates_added": item.candidates_added,
-                    "duplicates_skipped": item.duplicates_skipped,
-                    "filtered_out": item.filtered_out,
-                    "unresponsive_engines": raw_payload.get("response_metadata", {}).get(
-                        "unresponsive_engines", []
-                    ),
-                }
-            )
+            search_query_payload = {
+                "search_query_id": str(item.search_query.id),
+                "query_text": item.search_query.query_text,
+                "provider": item.search_query.provider,
+                "result_count": result_count,
+                "candidates_added": item.candidates_added,
+                "duplicates_skipped": item.duplicates_skipped,
+                "filtered_out": item.filtered_out,
+                "unresponsive_engines": raw_payload.get("response_metadata", {}).get(
+                    "unresponsive_engines", []
+                ),
+            }
+            known_path_fallback = raw_payload.get("known_path_fallback")
+            if isinstance(known_path_fallback, dict):
+                safe_fallback = _json_safe(known_path_fallback)
+                search_query_payload["known_path_fallback"] = safe_fallback
+                known_path_fallbacks.append(safe_fallback)
+            search_queries.append(search_query_payload)
         return {
             "search_queries": search_queries,
             "search_query_count": len(result.search_queries),
@@ -663,6 +668,7 @@ class DebugRealPipelineRunner:
             ],
             "duplicates_skipped": result.duplicates_skipped,
             "filtered_out": result.filtered_out,
+            "known_path_fallback": _known_path_fallback_summary(known_path_fallbacks),
         }
 
     def _run_planner_if_configured(self, task_id: UUID) -> None:
@@ -756,8 +762,9 @@ class DebugRealPipelineRunner:
             target_successful_snapshots = max(
                 target_successful_snapshots,
                 self.min_answer_sources,
+                6,
             )
-            fetch_limit = max(fetch_limit, 4)
+            fetch_limit = max(fetch_limit, 6)
         result = self.acquisition_service.acquire_candidates(
             task_id,
             candidate_url_ids=None,
@@ -1431,7 +1438,10 @@ def _run_revision_no(run: ResearchRun) -> int | None:
 
 
 def _candidate_url_summary(candidate_url: Any, *, query: str | None = None) -> dict[str, Any]:
-    return {
+    metadata = candidate_url.metadata_json or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    summary = {
         "candidate_url_id": str(candidate_url.id),
         "canonical_url": candidate_url.canonical_url,
         "domain": candidate_url.domain,
@@ -1439,6 +1449,39 @@ def _candidate_url_summary(candidate_url: Any, *, query: str | None = None) -> d
         "rank": candidate_url.rank,
         **fetch_priority_metadata(candidate_url, query=query),
     }
+    for key in (
+        "candidate_source",
+        "fallback_reason",
+        "original_search_provider",
+        "known_path_candidate",
+        "source_selection_reason",
+    ):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        summary[key] = value
+    return summary
+
+
+def _known_path_fallback_summary(fallbacks: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_count = 0
+    duplicates_skipped = 0
+    filtered_out = 0
+    for fallback in fallbacks:
+        candidate_count += _safe_int(fallback.get("known_path_fallback_candidate_count"))
+        duplicates_skipped += _safe_int(fallback.get("known_path_fallback_duplicates_skipped"))
+        filtered_out += _safe_int(fallback.get("known_path_fallback_filtered_out"))
+    return {
+        "applied": bool(fallbacks),
+        "candidate_count": candidate_count,
+        "duplicates_skipped": duplicates_skipped,
+        "filtered_out": filtered_out,
+        "fallbacks": fallbacks,
+    }
+
+
+def _safe_int(value: Any) -> int:
+    return value if isinstance(value, int) else 0
 
 
 def _fetch_entry_summary(entry: Any, *, query: str | None = None) -> dict[str, Any]:

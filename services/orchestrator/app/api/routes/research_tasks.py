@@ -437,6 +437,8 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     intent_classification: str | None = None
     extracted_entity: str | None = None
     search_result_count: int | None = None
+    search_queries: list[dict[str, Any]] = []
+    known_path_fallback: dict[str, Any] | None = None
     selected_sources_from_search: list[dict[str, Any]] = []
     selected_sources: list[dict[str, Any]] = []
     fetch_succeeded: int | None = None
@@ -557,6 +559,10 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             value = result.get("search_result_count")
             if isinstance(value, int):
                 search_result_count = value
+            search_queries = _object_list(result.get("search_queries")) or search_queries
+            fallback = result.get("known_path_fallback")
+            if isinstance(fallback, dict):
+                known_path_fallback = fallback
             selected_sources = _object_list(result.get("selected_sources"))
             raw_planner_queries = (
                 _object_list(result.get("raw_planner_queries")) or raw_planner_queries
@@ -655,6 +661,10 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 value = search.get("search_result_count")
                 if isinstance(value, int):
                     search_result_count = value
+                search_queries = _object_list(search.get("search_queries")) or search_queries
+                fallback = search.get("known_path_fallback")
+                if isinstance(fallback, dict):
+                    known_path_fallback = fallback
                 selected_sources = _object_list(search.get("selected_sources")) or selected_sources
             acquisition = result.get("acquisition")
             if isinstance(acquisition, dict):
@@ -791,6 +801,8 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and not raw_planner_queries
         and not final_search_queries
         and search_result_count is None
+        and not search_queries
+        and known_path_fallback is None
         and not selected_sources_from_search
         and not selected_sources
         and fetch_succeeded is None
@@ -834,6 +846,8 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         intent_classification=intent_classification,
         extracted_entity=extracted_entity,
         search_result_count=search_result_count,
+        search_queries=search_queries,
+        known_path_fallback=known_path_fallback,
         selected_sources_from_search=selected_sources_from_search,
         selected_sources=selected_sources,
         fetch_succeeded=fetch_succeeded,

@@ -120,6 +120,10 @@ def classify_source_intent(
         and _is_docs_home(canonical_url=canonical_url, domain=domain, title=title)
     ):
         score = 5
+    if _is_langgraph_upstream_repo(canonical_url=canonical_url, domain=domain, title=title):
+        score = min(score, 9)
+    if _is_langgraph_product_page(canonical_url=canonical_url, domain=domain, title=title):
+        score = max(score, 13)
     reason = _fetch_priority_reason(score)
     selected_reason = _selected_reason_for_source_category(category, score)
     return SourceIntentClassification(
@@ -288,6 +292,38 @@ def _is_docs_home(*, canonical_url: str, domain: str | None, title: str | None) 
     )
 
 
+def _is_langgraph_product_page(
+    *,
+    canonical_url: str,
+    domain: str | None,
+    title: str | None,
+) -> bool:
+    normalized_domain = (domain or "").strip().lower().removeprefix("www.")
+    path = urlsplit(canonical_url or "").path.strip().lower().rstrip("/")
+    normalized_title = (title or "").strip().lower()
+    return (
+        normalized_domain == "langchain.com"
+        and path == "/langgraph"
+        and "langgraph" in normalized_title
+    )
+
+
+def _is_langgraph_upstream_repo(
+    *,
+    canonical_url: str,
+    domain: str | None,
+    title: str | None,
+) -> bool:
+    normalized_domain = (domain or "").strip().lower().removeprefix("www.")
+    path = urlsplit(canonical_url or "").path.strip().lower().rstrip("/")
+    normalized_title = (title or "").strip().lower()
+    return (
+        normalized_domain == "github.com"
+        and path == "/langchain-ai/langgraph"
+        and "langgraph" in normalized_title
+    )
+
+
 def _fetch_priority_reason(score: int) -> str:
     if score == 0:
         return "official_docs"
@@ -299,6 +335,8 @@ def _fetch_priority_reason(score: int) -> str:
         return "official_docs_reference"
     if score == 10:
         return "project_homepage"
+    if score == 9:
+        return "github_repository_landing_page"
     if score == 20:
         return "wikipedia_or_generic_article"
     if score == _SECONDARY_REFERENCE_PRIORITY_SCORE:

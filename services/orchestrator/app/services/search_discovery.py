@@ -19,6 +19,7 @@ from services.orchestrator.app.search import (
     ExpandedQuery,
     QueryExpansionStrategy,
     SearchProvider,
+    SearchProviderError,
     SearchRequest,
     canonicalize_url,
     is_domain_allowed,
@@ -52,6 +53,14 @@ class SearchDiscoveryResult:
     run: ResearchRun
     search_queries: list[PersistedSearchQuery]
     candidate_urls: list[CandidateUrl]
+    duplicates_skipped: int
+    filtered_out: int
+
+
+@dataclass(frozen=True)
+class _KnownPathAddResult:
+    candidates: list[CandidateUrl]
+    added: int
     duplicates_skipped: int
     filtered_out: int
 
@@ -115,19 +124,111 @@ class SearchDiscoveryService:
             default_limit=self.max_results_per_query * len(expanded_queries),
         )
 
-        for expanded_query in expanded_queries:
+        for query_index, expanded_query in enumerate(expanded_queries, start=1):
             if remaining_slots <= 0:
                 break
 
             request_limit = min(self.max_results_per_query, remaining_slots)
-            provider_response = self.search_provider.search(
-                SearchRequest(
-                    query_text=expanded_query.query_text,
-                    language=_resolve_language(constraints),
-                    limit=request_limit,
-                    source_engines=_resolve_source_engines(constraints),
+            try:
+                provider_response = self.search_provider.search(
+                    SearchRequest(
+                        query_text=expanded_query.query_text,
+                        language=_resolve_language(constraints),
+                        limit=request_limit,
+                        source_engines=_resolve_source_engines(constraints),
+                    )
                 )
-            )
+            except SearchProviderError as error:
+                fallback_candidates = (
+                    _known_path_candidates_for_query(
+                        query=task.query,
+                        provider_results=(),
+                        constraints=constraints,
+                    )
+                    if _can_use_known_path_fallback(
+                        error=error,
+                        include_default_expansions=include_default_expansions,
+                    )
+                    else []
+                )
+                if not fallback_candidates:
+                    error.details = _search_provider_failure_diagnostics(
+                        expanded_queries=expanded_queries,
+                        failed_query=expanded_query,
+                        query_count_attempted=query_index,
+                        error=error,
+                        fallback_applied=False,
+                        fallback_candidate_count=0,
+                    )
+                    raise
+
+                search_query = self.search_query_repository.add(
+                    SearchQuery(
+                        task_id=task.id,
+                        run_id=run.id,
+                        query_text=expanded_query.query_text,
+                        provider=getattr(self.search_provider, "name", "unknown"),
+                        round_no=run.round_no,
+                        issued_at=datetime.now(UTC),
+                        raw_response_json={
+                            "task_revision_no": task.revision_no,
+                            "expansion_kind": expanded_query.expansion_kind,
+                            "expansion_metadata": expanded_query.metadata,
+                            "source_engines": [],
+                            "response_metadata": {
+                                "provider_error": error.to_payload(),
+                                "unresponsive_engines": list(error.unresponsive_engines),
+                            },
+                            "result_count": 0,
+                            "known_path_fallback": _search_provider_failure_diagnostics(
+                                expanded_queries=expanded_queries,
+                                failed_query=expanded_query,
+                                query_count_attempted=query_index,
+                                error=error,
+                                fallback_applied=True,
+                                fallback_candidate_count=0,
+                            ),
+                        },
+                    )
+                )
+                known_path_result = _add_known_path_candidates(
+                    task=task,
+                    search_query=search_query,
+                    known_path_candidates=fallback_candidates,
+                    existing_candidates=existing_candidates,
+                    candidate_url_repository=self.candidate_url_repository,
+                    provider=getattr(self.search_provider, "name", "unknown"),
+                    query_text=expanded_query.query_text,
+                    expansion_kind=expanded_query.expansion_kind,
+                    expansion_metadata=expanded_query.metadata,
+                    candidate_source="known_path_fallback",
+                    fallback_reason=error.reason,
+                )
+                remaining_slots -= known_path_result.added
+                fallback_payload = dict(search_query.raw_response_json["known_path_fallback"])
+                fallback_payload["known_path_fallback_candidate_count"] = known_path_result.added
+                fallback_payload["known_path_fallback_duplicates_skipped"] = (
+                    known_path_result.duplicates_skipped
+                )
+                fallback_payload["known_path_fallback_filtered_out"] = (
+                    known_path_result.filtered_out
+                )
+                search_query.raw_response_json = {
+                    **search_query.raw_response_json,
+                    "known_path_fallback": fallback_payload,
+                }
+                duplicates_skipped += known_path_result.duplicates_skipped
+                filtered_out += known_path_result.filtered_out
+                discovered_candidates.extend(known_path_result.candidates)
+                persisted_queries.append(
+                    PersistedSearchQuery(
+                        search_query=search_query,
+                        candidates_added=known_path_result.added,
+                        duplicates_skipped=known_path_result.duplicates_skipped,
+                        filtered_out=known_path_result.filtered_out,
+                    )
+                )
+                break
 
             search_query = self.search_query_repository.add(
                 SearchQuery(
@@ -201,56 +302,23 @@ class SearchDiscoveryService:
                 provider_results=provider_response.results,
                 constraints=constraints,
             )
-            for known_path in known_path_candidates:
-                known_path_url = known_path.get("url")
-                known_path_title = known_path.get("title")
-                known_path_rank = known_path.get("rank")
-                if not isinstance(known_path_url, str) or not isinstance(
-                    known_path_title,
-                    str,
-                ):
-                    filtered_for_query += 1
-                    continue
-                canonical = canonicalize_url(known_path_url)
-                if canonical is None:
-                    filtered_for_query += 1
-                    continue
-                if not isinstance(known_path_rank, int):
-                    filtered_for_query += 1
-                    continue
-                if canonical.canonical_url in existing_candidates:
-                    duplicates_for_query += 1
-                    continue
-                candidate = self.candidate_url_repository.add(
-                    CandidateUrl(
-                        task_id=task.id,
-                        search_query_id=search_query.id,
-                        original_url=canonical.original_url,
-                        canonical_url=canonical.canonical_url,
-                        domain=canonical.domain,
-                        title=known_path_title,
-                        rank=known_path_rank,
-                        selected=False,
-                        metadata_json={
-                            "provider": provider_response.provider,
-                            "source_engine": "deterministic_known_path",
-                            "snippet": known_path["snippet"],
-                            "result_metadata": {
-                                "known_path_candidate": True,
-                                "known_path_reason": known_path["reason"],
-                            },
-                            "task_revision_no": task.revision_no,
-                            "expansion_kind": expanded_query.expansion_kind,
-                            "expansion_metadata": expanded_query.metadata,
-                            "query_text": expanded_query.query_text,
-                            "known_path_candidate": True,
-                            "source_selection_reason": known_path["reason"],
-                        },
-                    )
-                )
-                discovered_candidates.append(candidate)
-                existing_candidates.add(canonical.canonical_url)
-                added_for_query += 1
+            known_path_result = _add_known_path_candidates(
+                task=task,
+                search_query=search_query,
+                known_path_candidates=known_path_candidates,
+                existing_candidates=existing_candidates,
+                candidate_url_repository=self.candidate_url_repository,
+                provider=provider_response.provider,
+                query_text=expanded_query.query_text,
+                expansion_kind=expanded_query.expansion_kind,
+                expansion_metadata=expanded_query.metadata,
+                candidate_source="known_path_guardrail",
+                fallback_reason=None,
+            )
+            added_for_query += known_path_result.added
+            duplicates_for_query += known_path_result.duplicates_skipped
+            filtered_for_query += known_path_result.filtered_out
+            discovered_candidates.extend(known_path_result.candidates)
 
             duplicates_skipped += duplicates_for_query
             filtered_out += filtered_for_query
@@ -476,24 +544,38 @@ def _known_path_candidates_for_query(
                     "reason": "known_path_candidate: owned LangGraph docs overview",
                 },
                 {
+                    "url": "https://docs.langchain.com/oss/javascript/langgraph/overview",
+                    "title": "LangGraph overview - JavaScript Docs by LangChain",
+                    "snippet": "Deterministic owned LangGraph JavaScript documentation candidate.",
+                    "rank": 10012,
+                    "reason": "known_path_candidate: owned LangGraph JavaScript docs overview",
+                },
+                {
                     "url": "https://reference.langchain.com/python/langgraph/",
                     "title": "langgraph - LangChain Reference Docs",
                     "snippet": "Deterministic owned LangGraph reference candidate.",
-                    "rank": 10012,
+                    "rank": 10013,
                     "reason": "known_path_candidate: owned LangGraph reference docs",
+                },
+                {
+                    "url": "https://reference.langchain.com/python/langgraph/graph/state",
+                    "title": "langgraph.graph.state - LangChain Reference Docs",
+                    "snippet": "Deterministic owned LangGraph state graph reference candidate.",
+                    "rank": 10014,
+                    "reason": "known_path_candidate: owned LangGraph state graph reference",
                 },
                 {
                     "url": "https://www.langchain.com/langgraph",
                     "title": "LangGraph - LangChain",
                     "snippet": "Deterministic official LangGraph product page candidate.",
-                    "rank": 10013,
+                    "rank": 10015,
                     "reason": "known_path_candidate: official LangGraph product page",
                 },
                 {
                     "url": "https://github.com/langchain-ai/langgraph",
                     "title": "langchain-ai/langgraph",
                     "snippet": "Deterministic upstream LangGraph repository candidate.",
-                    "rank": 10014,
+                    "rank": 10016,
                     "reason": "known_path_candidate: upstream LangGraph repository",
                 },
             ]
@@ -516,6 +598,135 @@ def _known_path_candidates_for_query(
             continue
         filtered.append(candidate)
     return filtered
+
+
+def _add_known_path_candidates(
+    *,
+    task: ResearchTask,
+    search_query: SearchQuery,
+    known_path_candidates: list[dict[str, object]],
+    existing_candidates: set[str],
+    candidate_url_repository: CandidateUrlRepository,
+    provider: str,
+    query_text: str,
+    expansion_kind: str,
+    expansion_metadata: dict[str, Any],
+    candidate_source: str,
+    fallback_reason: str | None,
+) -> _KnownPathAddResult:
+    added_candidates: list[CandidateUrl] = []
+    duplicates_skipped = 0
+    filtered_out = 0
+    for known_path in known_path_candidates:
+        canonical = canonicalize_url(str(known_path.get("url", "")))
+        if canonical is None:
+            filtered_out += 1
+            continue
+        if canonical.canonical_url in existing_candidates:
+            duplicates_skipped += 1
+            continue
+
+        result_metadata: dict[str, object] = {
+            "known_path_candidate": True,
+            "known_path_reason": str(known_path.get("reason") or ""),
+            "candidate_source": candidate_source,
+            "original_search_provider": provider,
+        }
+        if fallback_reason is not None:
+            result_metadata["fallback_reason"] = fallback_reason
+
+        metadata_json: dict[str, object] = {
+            "provider": provider,
+            "source_engine": "deterministic_known_path",
+            "snippet": known_path.get("snippet"),
+            "result_metadata": result_metadata,
+            "task_revision_no": task.revision_no,
+            "expansion_kind": expansion_kind,
+            "expansion_metadata": expansion_metadata,
+            "query_text": query_text,
+            "known_path_candidate": True,
+            "candidate_source": candidate_source,
+            "original_search_provider": provider,
+            "source_selection_reason": known_path.get("reason"),
+        }
+        if fallback_reason is not None:
+            metadata_json["fallback_reason"] = fallback_reason
+
+        candidate = candidate_url_repository.add(
+            CandidateUrl(
+                task_id=task.id,
+                search_query_id=search_query.id,
+                original_url=canonical.original_url,
+                canonical_url=canonical.canonical_url,
+                domain=canonical.domain,
+                title=str(known_path.get("title") or "") or None,
+                rank=_coerce_candidate_rank(known_path.get("rank")),
+                selected=False,
+                metadata_json=metadata_json,
+            )
+        )
+        added_candidates.append(candidate)
+        existing_candidates.add(canonical.canonical_url)
+
+    return _KnownPathAddResult(
+        candidates=added_candidates,
+        added=len(added_candidates),
+        duplicates_skipped=duplicates_skipped,
+        filtered_out=filtered_out,
+    )
+
+
+def _coerce_candidate_rank(value: object) -> int:
+    return value if isinstance(value, int) and value >= 0 else 99999
+
+
+def _can_use_known_path_fallback(
+    *,
+    error: SearchProviderError,
+    include_default_expansions: bool,
+) -> bool:
+    return (
+        include_default_expansions
+        and error.reason == "searxng_empty_results_with_unresponsive_engines"
+    )
+
+
+def _search_provider_failure_diagnostics(
+    *,
+    expanded_queries: list[ExpandedQuery],
+    failed_query: ExpandedQuery,
+    query_count_attempted: int,
+    error: SearchProviderError,
+    fallback_applied: bool,
+    fallback_candidate_count: int,
+) -> dict[str, object]:
+    failed_query_payload = {
+        "query_text": _safe_query_preview(failed_query.query_text),
+        "expansion_kind": failed_query.expansion_kind,
+        "expansion_metadata": failed_query.metadata,
+    }
+    empty_query_count = (
+        1 if error.reason == "searxng_empty_results_with_unresponsive_engines" else 0
+    )
+    return {
+        "query_count_planned": len(expanded_queries),
+        "query_count_attempted": query_count_attempted,
+        "empty_query_count": empty_query_count,
+        "provider_error_type": type(error).__name__,
+        "provider_error_reason": error.reason,
+        "known_path_fallback_applied": fallback_applied,
+        "known_path_fallback_candidate_count": fallback_candidate_count,
+        "failed_queries": [failed_query_payload],
+        "first_failed_queries": [failed_query_payload["query_text"]],
+        "provider_error": error.to_payload(),
+    }
+
+
+def _safe_query_preview(query_text: str, *, limit: int = 200) -> str:
+    normalized = " ".join(query_text.strip().split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: limit - 3]}..."
 
 
 def _provider_results_include_searxng_official(provider_results: tuple[Any, ...]) -> bool:

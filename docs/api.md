@@ -213,6 +213,8 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 - planner status/source fields: `planner_status`, `planner_mode`, and `plan_source`, where planner failures use deterministic fallback instead of blocking the task
 - planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`; for LangGraph overview planner-LLM runs, deterministic owned-source domain corrections are also visible under `research_plan.source_preferences.secondary_preferred_domains` and `research_plan.source_preferences.planner_domain_corrections`
 - `search_result_count`
+- `search_queries`, including provider, per-query result counts, candidate counts, unresponsive engines, and known-path fallback diagnostics when main search recovered from a provider outage
+- `known_path_fallback`, summarizing whether deterministic known-path candidates were injected, how many were added, duplicates/filtered counts, and the provider error classification that triggered the fallback
 - `selected_sources`, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` metadata when applicable
 - `fetch_succeeded`
 - `fetch_failed`
@@ -1420,6 +1422,7 @@ Execution contract:
 - when planner is enabled inside the pipeline, emits `research_plan.created`; when planner fails, emits `research_plan.failed` and continues with the original query
 - `pipeline.stage_completed` and `pipeline.failed` payloads include operator observability details for search, acquisition, parsing, claim drafting, and supplemental acquisition:
   - planner intent, subquestion count, search-query count, raw/final planner query lists, downweighted planner queries, preferred/avoided domains, intent classification, extracted entity, and planner guardrail warnings when a plan exists
+  - main-search known-path fallback metadata when SearXNG reports empty results with unresponsive engines for a known technical project; fallback candidates include `candidate_source`, `fallback_reason`, and `original_search_provider`
   - search result count and selected candidate source summaries, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` when source-selection guardrails classify official about/home/reference, Wikipedia, GitHub, admin architecture, installation, API/developer, forum/social/video, generic, or low-quality pages
   - fetch success/failure counts
   - failed fetch URL summaries with HTTP status, error code, and error reason

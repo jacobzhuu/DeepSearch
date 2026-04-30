@@ -113,6 +113,8 @@ class ResearchTaskObservabilityResponse(BaseModel):
     intent_classification: str | None = None
     extracted_entity: str | None = None
     search_result_count: int | None = None
+    search_queries: list[dict[str, Any]] = Field(default_factory=list)
+    known_path_fallback: dict[str, Any] | None = None
     selected_sources_from_search: list[dict[str, Any]] = Field(default_factory=list)
     selected_sources: list[dict[str, Any]] = Field(default_factory=list)
     fetch_succeeded: int | None = None

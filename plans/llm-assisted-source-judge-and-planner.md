@@ -1,0 +1,467 @@
+# LLM-Assisted Planner and Source Judge
+
+## 1. Objective
+
+Add an optional LLM-assisted quality layer that improves research planning, source-quality judgment, gap diagnosis, and final prose quality while preserving deterministic grounding and auditability.
+
+The feature will be implemented incrementally. The first implementation must be planner-only. Later milestones add a source judge in shadow mode, then active reranking, then a gap reasoner, then the existing grounded report writer path as the final optional LLM surface.
+
+## 2. Why this exists
+
+The deterministic no-LLM pipeline now works for real-search technical concept queries and has explicit ownership/ranking safeguards. The next quality ceiling is not basic claim generation; it is better task decomposition, better recognition of source intent, better explanations for missing answer slots, and better final wording.
+
+LLM assistance is useful for those areas, but it is also risky:
+
+- an LLM can over-trust mirrors, reposts, and third-party tutorials
+- an LLM can invent official ownership or authority
+- an LLM can produce unsupported claims if allowed into the claim path
+- an LLM can make runs less reproducible if raw prompts, outputs, and guardrail decisions are not persisted
+
+This plan treats the LLM as an advisory component. The deterministic pipeline remains the source of truth for source ownership, blocklists, fetching, parsing, evidence binding, verification, and report item grounding.
+
+## 3. Scope
+
+### In scope
+
+- Define the architecture for four optional LLM components:
+  - planner enhancement
+  - source judge
+  - gap reasoner
+  - grounded report writer
+- Define source judge input/output schemas, labels, confidence fields, rationale, guardrails, score-combination rules, and audit metadata.
+- Define a rollout path from planner-only to shadow judging to active reranking.
+- Define tests for official docs vs mirrors, upstream GitHub vs third-party repos, low-value page filtering, schema validation, and provider fallback.
+- Update operator-facing architecture and runbook docs for the planned LLM-assisted quality layer.
+
+### Out of scope
+
+- No implementation of the source judge, gap reasoner, or new report writer behavior in this turn.
+- No `.env` edits and no LLM enablement in this turn.
+- No Redis, Celery, worker architecture changes, browser fetching, PDF parsing, Tika, or new production dependencies.
+- No claim drafting or claim verification by LLM.
+- No database migration in the planning turn. Later implementation may choose task-event/checkpoint JSON first and only add schema after the audit shape is proven.
+
+## 4. Constraints
+
+- `research_task` remains the primary product object.
+- `/run` remains async and worker-driven.
+- LLM usage must be opt-in and disabled by default.
+- LLM output must be parsed through strict Pydantic schemas or equivalent structured validation.
+- LLM planner output is a suggestion. Deterministic planner guardrails still preserve required queries and downrank unsafe suggestions.
+- LLM source judge output is advisory unless a later milestone explicitly enables active reranking.
+- The LLM cannot mark a source official without deterministic ownership evidence.
+- The deterministic blocklist and low-value domain rules always win.
+- The LLM cannot directly create persisted claims.
+- The LLM cannot directly set `verification_status = supported`.
+- Final report output must remain grounded in fetched chunks, persisted claims, `claim_evidence`, and `citation_span` rows.
+- Raw secrets, API keys, and private runtime configuration must never be included in prompts, task events, or diagnostics.
+- All LLM calls must have bounded input size, bounded output tokens, sanitized errors, and provider-unavailable fallback.
+
+## 5. Relevant files and systems
+
+- `services/orchestrator/app/settings.py`
+- `services/orchestrator/app/llm/`
+- `services/orchestrator/app/planning/`
+- `services/orchestrator/app/research_quality/source_intent.py`
+- `services/orchestrator/app/research_quality/gap_analyzer.py`
+- `services/orchestrator/app/services/search_discovery.py`
+- `services/orchestrator/app/services/acquisition.py`
+- `services/orchestrator/app/services/debug_pipeline.py`
+- `services/orchestrator/app/services/pipeline_runtime.py`
+- `services/orchestrator/app/reporting/grounded_llm.py`
+- `services/orchestrator/app/api/routes/research_tasks.py`
+- `packages/db/models/ledger.py`
+- `task_event.payload_json`
+- `research_run.checkpoint_json`
+- `CandidateUrl.metadata_json`
+- `ReportArtifact.manifest_json`
+- `docs/architecture.md`
+- `docs/runbook.md`
+- `docs/api.md` in the later implementation milestone if API observability fields change
+
+## 6. Milestones
+
+### Milestone 1
+- intent: use the existing optional planner path as the first LLM-assisted surface.
+- code changes:
+  - keep `RESEARCH_PLANNER_ENABLED` gated by `LLM_ENABLED`
+  - tighten planner schema validation and prompt/output audit metadata if gaps remain
+  - keep deterministic query guardrails as the final planner authority
+  - persist prompt version, provider/model summary, raw parsed planner output, guardrail rewrites, and sanitized failure reason in task events
+- validation:
+  - planner unavailable falls back to deterministic/original query path
+  - planner cannot remove original query or required official/reference searches
+  - no LLM claims are created
+
+### Milestone 2
+- intent: introduce the LLM source judge in shadow mode only.
+- code changes:
+  - add a source-judge service that evaluates `CandidateUrl` rows after deterministic classification
+  - validate output against the source judge schema
+  - persist shadow results to candidate metadata and task events without changing fetch order
+  - expose shadow diagnostics in task detail observability
+- validation:
+  - source selection order is unchanged when shadow mode is enabled
+  - malformed LLM output is recorded and ignored
+  - provider timeout/unavailable is recorded and ignored
+
+### Milestone 3
+- intent: allow active source reranking behind a separate flag.
+- code changes:
+  - add `LLM_SOURCE_JUDGE_ACTIVE=false` by default
+  - combine deterministic priority with bounded LLM quality adjustment
+  - forbid LLM promotion through deterministic guardrails
+  - record pre-LLM and post-LLM ranking, including why each change was allowed or blocked
+- validation:
+  - LangGraph official docs and owned GitHub outrank mirrors and third-party repos
+  - `freelancer.hk` and job-search URLs remain blocked/downranked even if LLM gives a high score
+  - active mode can only reorder among sources that pass deterministic eligibility
+
+### Milestone 4
+- intent: add an LLM gap reasoner as a diagnostic and query-suggestion helper.
+- code changes:
+  - feed only slot summaries, source-yield diagnostics, selected/unattempted source summaries, and rejected evidence summaries to the LLM
+  - validate structured output containing gap explanations and suggested query intents
+  - deterministic gap analyzer still decides whether a gap round runs and enforces max rounds/limits
+  - targeted query generation remains bounded and deduped
+- validation:
+  - LLM gap reasoner cannot create claims
+  - LLM gap reasoner cannot bypass max rounds or fetch limits
+  - provider failure leaves deterministic gap behavior unchanged
+
+### Milestone 5
+- intent: retain and harden the grounded LLM report writer as the only report-prose LLM surface.
+- code changes:
+  - keep deterministic Markdown as fallback and default
+  - ensure the report writer receives only verified claim/evidence/citation-span bundles
+  - require every LLM report item to cite valid claim/evidence/citation ids
+  - persist report-writer prompt/output metadata in `ReportArtifact.manifest_json`
+- validation:
+  - invalid ids are dropped
+  - invalid JSON falls back to deterministic Markdown
+  - unsupported/draft claims do not become settled report facts
+
+### Milestone 6
+- intent: operator docs, diagnostics, and benchmark validation.
+- code changes:
+  - update `docs/api.md`, `docs/architecture.md`, and `docs/runbook.md` when implementation changes task-detail observability or settings
+  - extend benchmark output with source-judge shadow/active summaries
+  - add runbook rollback and troubleshooting steps
+- validation:
+  - benchmark LangGraph task still passes with no LLM
+  - planner-only LLM mode passes with source judge disabled
+  - source judge shadow mode produces audit output without changing selected sources
+
+## 7. Implementation log
+
+- 2026-04-30 / planning:
+  - changes: created this ExecPlan and updated architecture/runbook docs only.
+  - rationale: the next work spans planner, search discovery, acquisition ranking, gap behavior, reporting, settings, observability, and tests; implementation needs a staged plan before code changes.
+  - validation: documentation-only checks pending.
+  - next: review plan, then implement Milestone 1 only.
+
+## 8. Validation
+
+Planning-turn validation:
+
+- `git diff --check` should pass.
+- No runtime settings are changed.
+- No `.env` or secret files are edited.
+
+Implementation validation for later milestones:
+
+- `python3 -m pytest tests/unit/orchestrator/test_research_planner.py -q`
+- `python3 -m pytest tests/unit/orchestrator/test_research_quality.py tests/unit/orchestrator/test_acquisition_service.py -q`
+- `python3 -m pytest tests/unit/orchestrator/test_llm_source_judge.py -q`
+- `python3 -m pytest services/orchestrator/tests/test_debug_pipeline_api.py -q`
+- `python3 -m ruff check <touched files>`
+- `python3 -m black --check <touched files>`
+- `git diff --check`
+- no-LLM regression:
+  - `python3 scripts/benchmark_queries.py --run --base-url http://127.0.0.1:8000 --query-id 3 --wait-seconds 420 --output /tmp/deepsearch-langgraph-no-llm-regression.json`
+- planner-only smoke:
+  - enable planner in shell environment only, not `.env`
+  - confirm source judge remains disabled
+  - confirm claims and reports remain evidence-backed
+
+## 9. Risks and unknowns
+
+- LLM source judgment can be persuasive but wrong, especially around unofficial mirrors and third-party repositories.
+- Provider behavior can vary over time; strict schema validation and stored prompt/output metadata are required for audit.
+- Active reranking can reduce reproducibility if score-combination rules are not deterministic and versioned.
+- Persisting all raw LLM prompts and responses in task events may increase task-event size; implementation may need compact raw output hashes plus stored diagnostic artifacts if payloads grow too large.
+- Source ownership evidence needs a curated project registry. LLM inference must not replace it.
+- Gap reasoner suggestions can overfit to missing slots and propose broad searches. Deterministic query caps and dedupe must remain final.
+
+## 10. Rollback / recovery
+
+- Roll back by disabling feature flags first:
+  - `RESEARCH_PLANNER_ENABLED=false`
+  - future `LLM_SOURCE_JUDGE_ENABLED=false`
+  - future `LLM_SOURCE_JUDGE_ACTIVE=false`
+  - future `LLM_GAP_REASONER_ENABLED=false`
+  - `LLM_REPORT_WRITER_ENABLED=false`
+- If source judge active mode causes bad ranking, set it back to shadow mode and keep persisted diagnostics for analysis.
+- If provider errors are noisy, disable `LLM_ENABLED` or the narrower component flag.
+- If a schema migration is later added for source-judge audit tables, ship it in a separate milestone with explicit downgrade/backfill notes. This planning turn adds no migration.
+- Existing tasks must remain readable because LLM metadata is additive and defaults to missing/empty values in observability.
+
+## 11. Deferred work
+
+- Dedicated source-judge audit table after JSON task-event/candidate metadata proves insufficient.
+- Model-specific prompt tuning.
+- Human review UI for source-judge disagreements.
+- Cross-run source reputation cache.
+- Embedding or hybrid retrieval reranking.
+- Browser/PDF/Tika support.
+
+## Architecture Summary
+
+The LLM-assisted quality layer sits beside the deterministic pipeline. It does not replace any ledger object or workflow stage.
+
+Planner:
+
+- input: task query, constraints, current deterministic planner context
+- output: bounded subquestions and search queries
+- final authority: deterministic planner guardrails
+- persistence: `research_plan.created` / `research_plan.failed` task events
+
+Source judge:
+
+- input: candidate URL metadata plus deterministic source-intent classification and ownership evidence
+- output: structured advisory label, topicality, authority, confidence, rationale, and suggested bounded ranking adjustment
+- final authority: deterministic source-intent guardrails, ownership registry, blocklist, and acquisition limits
+- persistence: candidate metadata plus task-event source-judge summaries
+
+Gap reasoner:
+
+- input: slot coverage, source yield, rejected evidence summaries, failed/unattempted source summaries
+- output: structured gap explanation and suggested query intents
+- final authority: deterministic gap analyzer, max rounds, fetch limits, dedupe, and low-value filters
+- persistence: gap-analysis task events
+
+Grounded report writer:
+
+- input: verified claims, claim evidence, citation spans, source summaries
+- output: structured report items referencing valid ids
+- final authority: report bundle validator and deterministic Markdown fallback
+- persistence: `report_artifact.manifest_json`
+
+## Source Judge Proposed Schemas
+
+### Input schema
+
+```json
+{
+  "schema_version": "llm_source_judge_input_v1",
+  "task": {
+    "task_id": "uuid",
+    "query": "What is LangGraph and how does it work?",
+    "intent": "definition_how_it_works",
+    "subject_terms": ["langgraph"],
+    "answer_slots": [
+      {
+        "slot_id": "definition",
+        "label": "What it is",
+        "required": true
+      }
+    ]
+  },
+  "candidate": {
+    "candidate_url_id": "uuid",
+    "canonical_url": "https://docs.langchain.com/oss/python/langgraph/overview",
+    "domain": "docs.langchain.com",
+    "title": "LangGraph overview - Docs by LangChain",
+    "snippet": "Search result snippet text, bounded.",
+    "rank": 1,
+    "search_query_text": "LangGraph official documentation",
+    "known_path_candidate": false
+  },
+  "deterministic": {
+    "source_category": "official_about",
+    "fetch_priority_score": 0,
+    "source_quality_score": 0.95,
+    "downrank_reason": null,
+    "blocked": false,
+    "low_value_signals": [],
+    "ownership": {
+      "owned_domain_match": true,
+      "owned_github_repo_match": false,
+      "secondary_domain_match": false,
+      "project_profile": "langgraph",
+      "evidence": ["domain_suffix:langchain.com"]
+    }
+  },
+  "policy": {
+    "allowed_labels": [
+      "official_owned",
+      "official_reference",
+      "upstream_repository",
+      "secondary_reference",
+      "generic_explainer",
+      "tutorial_or_blog",
+      "community_forum",
+      "social_video",
+      "job_or_listing",
+      "seo_repost_or_scrape",
+      "off_topic",
+      "blocked_low_value",
+      "unknown"
+    ],
+    "official_requires_deterministic_ownership": true,
+    "blocklist_wins": true
+  }
+}
+```
+
+### Output schema
+
+```json
+{
+  "schema_version": "llm_source_judge_output_v1",
+  "candidate_url_id": "uuid",
+  "label": "official_reference",
+  "topicality_score": 0.0,
+  "authority_score": 0.0,
+  "usefulness_score": 0.0,
+  "risk_score": 0.0,
+  "confidence": 0.0,
+  "officialness_confidence": 0.0,
+  "suggested_quality_score": 0.0,
+  "suggested_priority_delta": 0,
+  "should_fetch": true,
+  "rationale": "One or two sentences explaining the judgment from the provided metadata only.",
+  "evidence_refs": [
+    "domain",
+    "title",
+    "snippet",
+    "deterministic_ownership"
+  ],
+  "concerns": [
+    "none"
+  ]
+}
+```
+
+Validation rules:
+
+- `schema_version` must match exactly.
+- `candidate_url_id` must match the input candidate.
+- `label` must be one allowed label.
+- scores must be floats in `[0.0, 1.0]`.
+- `suggested_priority_delta` must be an integer in `[-10, 10]`.
+- `rationale` is required and capped, for example 500 characters.
+- `evidence_refs` may only name fields present in the input.
+- extra fields are rejected.
+- invalid output is ignored and recorded as `llm_source_judge_invalid_output`.
+
+### Allowed labels
+
+- `official_owned`: deterministic ownership evidence says the domain or repo is owned by the queried project.
+- `official_reference`: deterministic ownership evidence says this is owned reference/docs material.
+- `upstream_repository`: deterministic ownership evidence says this is the upstream project repo.
+- `secondary_reference`: useful but not official-owned, including localized mirrors.
+- `generic_explainer`: topical generic article from a normal publisher.
+- `tutorial_or_blog`: topical tutorial, blog, or walkthrough.
+- `community_forum`: Reddit, forum, Q&A, community discussion.
+- `social_video`: video/social result.
+- `job_or_listing`: job board, freelance, hiring, directory, or listing page.
+- `seo_repost_or_scrape`: obvious repost, scraped docs, SEO aggregation, or download farm.
+- `off_topic`: does not answer the task subject.
+- `blocked_low_value`: deterministic low-value/blocklist category or policy-blocked source.
+- `unknown`: insufficient metadata.
+
+### Score combination
+
+The deterministic source score remains primary. Active source judging can only apply a bounded adjustment after guardrails.
+
+Suggested algorithm:
+
+```text
+if deterministic.blocked or deterministic.source_category == "low_quality_or_blocked":
+    final_priority = max(deterministic_priority, 99)
+    final_quality = min(deterministic_quality, 0.10)
+    decision = "deterministic_blocklist_wins"
+elif output.label in official labels and deterministic ownership evidence is missing:
+    ignore official label
+    final_priority = deterministic_priority
+    final_quality = deterministic_quality
+    decision = "llm_official_claim_rejected_no_ownership"
+elif source_judge_active:
+    allowed_delta = clamp(output.suggested_priority_delta, -10, 10)
+    if deterministic_priority <= 12:
+        allowed_delta = min(allowed_delta, 0)
+    final_priority = clamp_priority(deterministic_priority + allowed_delta)
+    final_quality = clamp(
+        (deterministic_quality * 0.75) + (output.suggested_quality_score * 0.25)
+    )
+    decision = "llm_adjustment_applied"
+else:
+    final_priority = deterministic_priority
+    final_quality = deterministic_quality
+    decision = "shadow_only"
+```
+
+Additional guardrails:
+
+- LLM cannot move `secondary_reference` above owned official docs/reference/GitHub.
+- LLM cannot move third-party GitHub tutorial repos into `github_readme_or_repo`.
+- LLM cannot move job/freelance/listing pages into the fetch set for overview queries.
+- LLM cannot increase a source above deterministic official-owned candidates.
+- LLM cannot override SSRF, MIME, fetch, parse, or acquisition policy.
+
+### Audit metadata
+
+Persist enough data to reproduce or review the judgment:
+
+- `llm_source_judge_enabled`
+- `llm_source_judge_mode`: `shadow` or `active`
+- `llm_source_judge_schema_version`
+- `llm_source_judge_prompt_version`
+- provider name and model name, without API key
+- input hash and bounded input snapshot
+- raw output hash and parsed output
+- validation status and validation errors
+- deterministic pre-judge category, priority, quality, and guardrail reasons
+- post-judge priority, quality, and decision reason
+- whether an LLM suggestion was applied or blocked
+- sanitized provider error if unavailable
+
+Initial persistence target:
+
+- `CandidateUrl.metadata_json["llm_source_judge"]` for per-candidate details
+- `task_event.payload_json.result["source_judge_summary"]` for stage-level summaries
+- `research_run.checkpoint_json["last_source_judge_summary"]` for resume diagnostics
+
+Only add a relational audit table later if JSON payload size or query needs justify it.
+
+## Rollout Checklist
+
+- [ ] Milestone 1: planner-only LLM mode, deterministic guardrails final.
+- [ ] Milestone 2: source judge shadow mode, no ranking changes.
+- [ ] Milestone 3: source judge active reranking behind a separate flag.
+- [ ] Milestone 4: LLM gap reasoner, deterministic gap analyzer final.
+- [ ] Milestone 5: grounded report writer hardening, deterministic Markdown fallback.
+- [ ] Milestone 6: docs, benchmark output, runbook troubleshooting, rollback checks.
+
+## Test Plan
+
+- LangGraph official docs vs mirrors:
+  - `docs.langchain.com`, `reference.langchain.com`, and `langchain.com/langgraph` remain owned/high value.
+  - `github.langchain.ac.cn`, `langgraph.com.cn`, and `langchain-doc.cn` remain `secondary_reference`.
+- Official GitHub repo vs third-party tutorial repos:
+  - `github.com/langchain-ai/langgraph` is upstream.
+  - `github.com/datawhalechina/easy-langent`, `github.com/aneasystone/weekly-practice`, and similar repos are not upstream.
+- Job/freelance filtering:
+  - `freelancer.hk` and `/job-search/` URLs stay low value even if LLM output says useful.
+- Source judge schema validation:
+  - invalid labels, extra fields, missing rationale, out-of-range scores, and mismatched candidate ids are rejected.
+- Provider fallback:
+  - timeout, invalid JSON, and provider errors leave deterministic ranking unchanged.
+- Shadow mode:
+  - selected/attempted source order is byte-for-byte equivalent to no-source-judge mode, except for additive diagnostics.
+- Active mode:
+  - active reranking only reorders deterministic-eligible candidates and records all changes.
+- Report writer:
+  - invalid claim/evidence/citation ids are dropped.
+  - unsupported claims never appear as settled facts.

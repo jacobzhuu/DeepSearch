@@ -55,7 +55,7 @@ The current v1 path supports:
 - OpenClaw
 - HTML export
 - PDF export
-- LLM-authored planner / gap analyzer
+- LLM source judge, active LLM reranking, and LLM gap reasoner implementation
 - complex verifier logic
 - complex retrieval optimization
 - distributed worker leases or external queue infrastructure
@@ -191,6 +191,16 @@ Source selection prioritizes official about/reference pages over admin architect
 installation, API, or developer pages unless the user explicitly asks about those topics.
 
 The planner never writes claims. Claim drafting, evidence binding, and verification remain deterministic and source-backed. Markdown report synthesis is deterministic by default; when `LLM_REPORT_WRITER_ENABLED=true`, the grounded report writer may write report prose but receives only verified claims, claim-evidence ids, and citation-span excerpts. Rendered LLM items are dropped unless their claim/evidence/citation ids validate against the prepared report bundle, and failures fall back to deterministic Markdown.
+
+Planned LLM-assisted source-quality work is tracked in `plans/llm-assisted-source-judge-and-planner.md`. The rollout order is:
+
+1. LLM planner only, with deterministic guardrails final.
+2. LLM source judge in shadow mode, adding diagnostics but no ranking changes.
+3. LLM source judge active reranking behind a separate flag, with bounded score adjustments.
+4. LLM gap reasoner, with deterministic max rounds, dedupe, and fetch limits final.
+5. Grounded report writer hardening, with deterministic Markdown fallback.
+
+The planned source judge is not enabled by any current environment variable. When implemented, it must receive only bounded candidate URL metadata, search snippets, deterministic source-intent results, low-value signals, and ownership evidence. It must return strict structured JSON with an allowed label, confidence scores, a required rationale, and a bounded priority adjustment. It cannot mark a source official unless deterministic ownership evidence already supports that conclusion. It cannot override job/freelance/listing filters, blocklists, SSRF/acquisition policy, or official-owned source priority. In shadow mode, task output must be identical to the deterministic run except for additive diagnostics.
 
 Noop planner validation:
 

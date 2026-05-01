@@ -8,6 +8,7 @@ from typing import Any
 
 CLAIM_TYPE_FACT = "fact"
 CLAIM_VERIFICATION_STATUS_DRAFT = "draft"
+CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT = "candidate_support"
 CLAIM_EVIDENCE_RELATION_SUPPORT = "support"
 
 _SENTENCE_PATTERN = re.compile(r"[^\n.!?。！？]+(?:[.!?。！？]+)?", re.MULTILINE)
@@ -472,7 +473,7 @@ def classify_query_intent(query: str | None) -> QueryIntent:
         and "how" in query_tokens
         and ("work" in query_tokens or "works" in query_tokens)
     ):
-        expected = ("definition", "mechanism", "privacy", "feature")
+        expected: tuple[str, ...] = ("definition", "mechanism", "privacy", "feature")
         if deployment_relevant:
             expected = (*expected, "deployment/self_hosting")
         return QueryIntent(

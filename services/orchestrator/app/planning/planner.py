@@ -571,6 +571,7 @@ def research_plan_from_serialized_payload(payload: dict[str, Any]) -> ResearchPl
     source_preferences = payload.get("source_preferences")
     if not isinstance(source_preferences, dict):
         source_preferences = {}
+    planner_diagnostics = payload.get("planner_diagnostics")
     return ResearchPlan(
         intent=intent,
         normalized_question=normalized_question,
@@ -591,9 +592,7 @@ def research_plan_from_serialized_payload(payload: dict[str, Any]) -> ResearchPl
         intent_classification=_optional_string(payload.get("intent_classification")),
         extracted_entity=_optional_string(payload.get("extracted_entity")),
         planner_diagnostics=(
-            dict(payload.get("planner_diagnostics"))
-            if isinstance(payload.get("planner_diagnostics"), dict)
-            else {}
+            dict(planner_diagnostics) if isinstance(planner_diagnostics, dict) else {}
         ),
     )
 
@@ -1697,9 +1696,8 @@ def _planned_search_queries(value: Any) -> list[PlannedSearchQuery]:
                 default="general_web",
             )
             query_source = _string_value(item.get("query_source"), default="planner_query")
-            priority = item.get("priority")
-            if not isinstance(priority, int):
-                priority = index
+            priority_value = item.get("priority")
+            priority = priority_value if isinstance(priority_value, int) else index
         else:
             continue
         if isinstance(item, str):

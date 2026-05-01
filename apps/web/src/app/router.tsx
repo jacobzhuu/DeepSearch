@@ -1,5 +1,6 @@
 import { createBrowserRouter, Navigate } from 'react-router-dom';
 import { NewTaskPage } from '../pages/tasks/NewTaskPage';
+import { TaskListPage } from '../pages/tasks/TaskListPage';
 import { TaskDetailPage } from '../pages/tasks/TaskDetailPage';
 import { TaskSourcesPage } from '../pages/tasks/TaskSourcesPage';
 import { TaskClaimsPage } from '../pages/tasks/TaskClaimsPage';
@@ -8,7 +9,11 @@ import { TaskReportPage } from '../pages/tasks/TaskReportPage';
 export const router = createBrowserRouter([
   {
     path: '/',
-    element: <Navigate to="/tasks/new" replace />,
+    element: <Navigate to="/tasks" replace />,
+  },
+  {
+    path: '/tasks',
+    element: <TaskListPage />,
   },
   {
     path: '/tasks/new',

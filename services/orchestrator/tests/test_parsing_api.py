@@ -166,12 +166,15 @@ def test_parsing_endpoints_create_and_list_sources(
         source_document = source_documents_response.json()["source_documents"][0]
         assert source_document["content_snapshot_id"] == content_snapshot_id
         assert source_document["title"] == "API Title"
+        assert isinstance(source_document["final_source_score"], float)
+        assert source_document["quality"]["freshness_state"] == "unknown"
 
         assert source_chunks_response.status_code == 200
         source_chunk = source_chunks_response.json()["source_chunks"][0]
         assert source_chunk["content_snapshot_id"] == content_snapshot_id
         assert "Alpha." in source_chunk["text"]
         assert source_chunk["metadata"]["strategy"] == "paragraph_window_v1"
+        assert "information_density_score" in source_chunk["metadata"]
     finally:
         client_generator.close()
 
@@ -206,8 +209,8 @@ def test_parsing_endpoint_skips_unsupported_mime_type(
         task_id, content_snapshot_id = _seed_snapshot(
             session,
             snapshot_root=tmp_path,
-            mime_type="application/pdf",
-            content=b"%PDF-1.7",
+            mime_type="application/octet-stream",
+            content=b"binary",
         )
 
     client_generator = _build_client(session_factory, tmp_path)

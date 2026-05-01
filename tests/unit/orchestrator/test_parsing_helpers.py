@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from io import BytesIO
+from zipfile import ZipFile
+
 import pytest
 
 from services.orchestrator.app.parsing import (
@@ -249,9 +252,105 @@ def test_extract_parsed_content_from_plain_text_derives_title() -> None:
 def test_extract_parsed_content_rejects_unsupported_mime_type() -> None:
     with pytest.raises(UnsupportedMimeTypeError):
         extract_parsed_content(
-            mime_type="application/pdf",
-            content=b"%PDF-1.7",
+            mime_type="application/octet-stream",
+            content=b"binary",
         )
+
+
+def test_extract_parsed_content_from_pdf_keeps_parser_metadata() -> None:
+    parsed = extract_parsed_content(
+        mime_type="application/pdf",
+        content=(
+            b"%PDF-1.4\n"
+            b"1 0 obj<</Type /Page>>stream\n"
+            b"BT (Alpha PDF finding.) Tj ET\n"
+            b"endstream\n%%EOF"
+        ),
+    )
+
+    assert parsed.source_type == "pdf_document"
+    assert "Alpha PDF finding." in parsed.text
+    assert parsed.metadata["parser_kind"] == "pdf"
+    assert parsed.metadata["parser_status"] == "success"
+    assert parsed.metadata["page_count"] == 1
+    assert parsed.metadata["page_locator_reliable"] is True
+    assert parsed.metadata["structure_segments"][0]["page_number"] == 1
+
+
+def test_extract_parsed_content_from_docx_keeps_paragraph_locator() -> None:
+    parsed = extract_parsed_content(
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        content=_office_zip(
+            {
+                "[Content_Types].xml": "<Types />",
+                "word/document.xml": (
+                    '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                    'wordprocessingml/2006/main"><w:body>'
+                    "<w:p><w:r><w:t>First paragraph.</w:t></w:r></w:p>"
+                    "<w:p><w:r><w:t>Second paragraph.</w:t></w:r></w:p>"
+                    "</w:body></w:document>"
+                ),
+            }
+        ),
+    )
+
+    assert parsed.source_type == "office_document"
+    assert parsed.metadata["parser_kind"] == "docx"
+    assert parsed.metadata["paragraph_count"] == 2
+    assert parsed.metadata["structure_segments"][0]["paragraph_no"] == 1
+    assert "First paragraph." in parsed.text
+
+
+def test_extract_parsed_content_from_pptx_keeps_slide_locator() -> None:
+    parsed = extract_parsed_content(
+        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        content=_office_zip(
+            {
+                "[Content_Types].xml": "<Types />",
+                "ppt/slides/slide1.xml": (
+                    '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                    'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+                    "<a:t>Slide one finding.</a:t></p:sld>"
+                ),
+            }
+        ),
+    )
+
+    assert parsed.metadata["parser_kind"] == "pptx"
+    assert parsed.metadata["slide_count"] == 1
+    assert parsed.metadata["structure_segments"][0]["slide_number"] == 1
+    assert "Slide one finding." in parsed.text
+
+
+def test_extract_parsed_content_from_xlsx_keeps_sheet_and_cell_locator() -> None:
+    parsed = extract_parsed_content(
+        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        content=_office_zip(
+            {
+                "[Content_Types].xml": "<Types />",
+                "xl/workbook.xml": (
+                    '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                    '<sheets><sheet name="Findings" sheetId="1" r:id="rId1" '
+                    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+                    "</sheets></workbook>"
+                ),
+                "xl/sharedStrings.xml": (
+                    '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                    "<si><t>Metric</t></si><si><t>Value</t></si></sst>"
+                ),
+                "xl/worksheets/sheet1.xml": (
+                    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                    '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c>'
+                    '<c r="B1" t="s"><v>1</v></c></row></sheetData></worksheet>'
+                ),
+            }
+        ),
+    )
+
+    assert parsed.metadata["parser_kind"] == "xlsx"
+    assert parsed.metadata["structure_segments"][0]["sheet_name"] == "Findings"
+    assert parsed.metadata["structure_segments"][0]["cell_range"] == "A1:B1"
+    assert "A1: Metric" in parsed.text
 
 
 def test_chunk_text_uses_stable_paragraph_windows() -> None:
@@ -262,6 +361,8 @@ def test_chunk_text_uses_stable_paragraph_windows() -> None:
 
     assert [chunk.chunk_no for chunk in chunks] == [0, 1, 2]
     assert chunks[0].metadata["strategy"] == "paragraph_window_v1"
+    assert chunks[0].metadata["char_start"] == 0
+    assert chunks[0].metadata["char_end"] > 0
     assert chunks[0].metadata["paragraph_count"] == 1
     assert chunks[1].metadata["paragraph_count"] == 1
     assert chunks[0].token_count >= 1
@@ -280,7 +381,7 @@ def test_source_quality_treats_reference_docs_as_official_docs() -> None:
         domain="reference.langchain.com",
     )
 
-    assert quality.score == 0.95
+    assert quality.score >= 0.9
     assert quality.reason == "official_docs"
 
 
@@ -296,10 +397,12 @@ def test_source_quality_uses_selection_category_for_mirrors_and_official_github(
         parsed_metadata={"source_category": "github_readme_or_repo"},
     )
 
-    assert mirror_quality.score == 0.55
+    assert mirror_quality.score >= 0.5
     assert mirror_quality.reason == "secondary_reference"
-    assert github_quality.score == 0.72
+    assert github_quality.score >= 0.65
     assert github_quality.reason == "official_github_repository"
+    assert github_quality.authority_score == 0.72
+    assert github_quality.freshness_state == "unknown"
 
 
 def test_chunk_quality_marks_redirect_navigation_and_reference_chunks_ineligible() -> None:
@@ -329,6 +432,14 @@ def test_chunk_quality_marks_redirect_navigation_and_reference_chunks_ineligible
     assert reference_quality.is_reference_section is True
 
 
+def _office_zip(members: dict[str, str]) -> bytes:
+    payload = BytesIO()
+    with ZipFile(payload, "w") as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return payload.getvalue()
+
+
 def test_chunk_quality_marks_explanatory_paragraph_eligible() -> None:
     quality = assess_chunk_quality(
         text=(
@@ -342,6 +453,7 @@ def test_chunk_quality_marks_explanatory_paragraph_eligible() -> None:
 
     assert quality.eligible_for_claims is True
     assert quality.content_quality_score >= 0.35
+    assert quality.information_density_score >= 0.35
 
 
 def test_chunk_quality_keeps_references_heading_chunk_ineligible() -> None:

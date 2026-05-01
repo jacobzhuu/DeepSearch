@@ -132,7 +132,7 @@ def test_search_discovery_endpoints_persist_queries_and_candidates(client: TestC
     assert candidate_urls_response.status_code == 200
     assert [item["canonical_url"] for item in candidate_urls_response.json()["candidate_urls"]] == [
         "https://example.com/report?id=1",
-        "https://example.com/appendix/",
+        "https://example.com/appendix",
     ]
     assert (
         candidate_urls_response.json()["candidate_urls"][0]["metadata"]["source_engine"] == "google"

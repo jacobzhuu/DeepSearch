@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import UUID
 
 from sqlalchemy.orm import Session
 
@@ -87,7 +88,7 @@ def test_answer_yield_metrics_separate_answer_relevant_from_sentence_count(
 def _add_source_document(
     db_session: Session,
     *,
-    task_id,
+    task_id: UUID,
     canonical_url: str,
     domain: str,
     title: str,

@@ -27,6 +27,7 @@ export interface ResearchTaskProgress {
     search_result_count: number | null;
     selected_sources_from_search: Array<Record<string, any>>;
     selected_sources: Array<Record<string, any>>;
+    source_judgments?: Array<Record<string, any>>;
     fetch_succeeded: number | null;
     fetch_failed: number | null;
     attempted_sources: Array<Record<string, any>>;
@@ -62,6 +63,31 @@ export interface ResearchTask {
   started_at: string | null;
   ended_at: string | null;
   progress?: ResearchTaskProgress;
+}
+
+export interface ResearchTaskListItem {
+  task_id: string;
+  query: string;
+  status: ResearchTask['status'];
+  revision_no: number;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  ended_at: string | null;
+  events_total: number;
+  latest_event_at: string | null;
+}
+
+export interface ResearchTaskListResponse {
+  tasks: ResearchTaskListItem[];
+  count: number;
+}
+
+export interface TaskMutationResponse {
+  task_id: string;
+  status: ResearchTask['status'];
+  revision_no: number;
+  updated_at: string;
 }
 
 export interface TaskEvent {
@@ -119,13 +145,13 @@ export interface ResearchPlanResponse {
   task_id: string;
   status: ResearchTask['status'];
   revision_no: number;
-  updated_at: string;
-  planner_status: string;
-  planner_mode: string;
-  plan_source: string;
-  research_plan: Record<string, any>;
-  running_mode: string;
-  dependencies: Record<string, any>;
+  updated_at?: string;
+  planner_status?: string | null;
+  planner_mode?: string | null;
+  plan_source?: string | null;
+  research_plan: Record<string, any> | null;
+  running_mode?: string;
+  dependencies?: Record<string, any>;
   warnings: string[];
 }
 
@@ -144,12 +170,21 @@ export interface CandidateUrl {
 export interface SourceDocument {
   source_document_id: string;
   content_snapshot_id: string | null;
+  content_hash?: string | null;
   canonical_url: string;
   domain: string;
   title: string | null;
   source_type: string;
   published_at: string | null;
   fetched_at: string;
+  authority_score?: number | null;
+  freshness_score?: number | null;
+  originality_score?: number | null;
+  consistency_score?: number | null;
+  safety_score?: number | null;
+  final_source_score?: number | null;
+  quality?: Record<string, any>;
+  parser_metadata?: Record<string, any>;
 }
 
 export interface SourceDocumentListResponse {
@@ -177,8 +212,9 @@ export interface Claim {
   statement: string;
   claim_type: string;
   confidence: number | null;
-  verification_status: 'draft' | 'supported' | 'mixed' | 'unsupported';
+  verification_status: 'draft' | 'supported' | 'mixed' | 'unsupported' | 'contradicted';
   support_evidence_count: number;
+  weak_support_evidence_count?: number;
   contradict_evidence_count: number;
   rationale: string | null;
   notes: Record<string, any>;
@@ -198,6 +234,13 @@ export interface ClaimEvidence {
   statement: string;
   relation_type: string;
   score: number | null;
+  relation_detail?: string | null;
+  support_level?: string | null;
+  verifier_method?: string | null;
+  reasons?: string[];
+  citation_precision?: string | null;
+  citation_precision_reason?: string | null;
+  quality?: Record<string, any>;
   start_offset: number;
   end_offset: number;
   excerpt: string;

@@ -5,7 +5,7 @@ import { LoadingState } from '../../components/common/LoadingState';
 import { ErrorState } from '../../components/common/ErrorState';
 import { RuntimeModeBanner } from '../../components/common/RuntimeModeBanner';
 import { PipelineCounts, PipelineFailure, PipelineRunResponse, ResearchTask, TaskEvent } from '../../features/tasks/types';
-import { useCreateTask, useRunTask, useTask, useTaskEvents } from '../../features/tasks/hooks';
+import { useCreateTask, useRunTask, useTask, useTaskAction, useTaskEvents } from '../../features/tasks/hooks';
 
 export const TaskDetailPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
@@ -14,6 +14,7 @@ export const TaskDetailPage: React.FC = () => {
   const { task, isLoading, error, refetch } = useTask(taskId);
   const { eventsData, refetch: refetchEvents } = useTaskEvents(taskId);
   const { runTask, isRunning, result: runResult, error: runError } = useRunTask();
+  const { mutateTask, isMutating, error: actionError } = useTaskAction();
   const { createTask, isCreating, error: createError } = useCreateTask();
   const initialPipelineResult = (location.state as { pipelineResult?: PipelineRunResponse } | null)?.pipelineResult || null;
   const pipelineResult = runResult || initialPipelineResult;
@@ -52,20 +53,31 @@ export const TaskDetailPage: React.FC = () => {
     });
   };
 
+  const handleTaskAction = async (action: 'pause' | 'resume' | 'cancel') => {
+    if (!taskId) return;
+    const result = await mutateTask(taskId, action);
+    if (!result) return;
+    await refetch();
+    await refetchEvents();
+  };
+
   if (isLoading) return <PageLayout title="任务详情"><LoadingState /></PageLayout>;
   
   if (error) return (
     <PageLayout title="任务详情">
       <ErrorState error={error} onRetry={refetch} />
-      <Link to="/tasks/new">返回主页</Link>
+      <Link to="/tasks">返回任务列表</Link>
     </PageLayout>
   );
 
   if (!task) return <PageLayout title="任务详情"><p>未找到任务。</p></PageLayout>;
 
   const canRun = task.status === 'PLANNED';
+  const canPause = task.status === 'PLANNED' || activeTaskStatuses.has(task.status);
+  const canResume = task.status === 'PAUSED';
+  const canCancel = task.status === 'PLANNED' || task.status === 'PAUSED' || activeTaskStatuses.has(task.status);
   const canCreateReplacement = task.status === 'FAILED';
-  const actionBusy = isRunning || isCreating;
+  const actionBusy = isRunning || isCreating || isMutating;
   const actionNote = canRun
     ? null
     : canCreateReplacement
@@ -88,7 +100,7 @@ export const TaskDetailPage: React.FC = () => {
       title="任务详情"
       actions={
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', alignItems: 'flex-end' }}>
-          <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <span style={{ padding: '0.25rem 0.75rem', backgroundColor: '#eee', borderRadius: '1rem', fontSize: '0.875rem', fontWeight: 'bold' }}>
               {task.status}
             </span>
@@ -99,6 +111,27 @@ export const TaskDetailPage: React.FC = () => {
               style={{ ...buttonStyle, border: 0, opacity: primaryActionDisabled ? 0.65 : 1, cursor: primaryActionDisabled ? 'not-allowed' : 'pointer' }}
             >
               {primaryActionLabel}
+            </button>
+            <button
+              onClick={() => void handleTaskAction('pause')}
+              disabled={actionBusy || !canPause}
+              style={taskControlButtonStyle(actionBusy || !canPause)}
+            >
+              Pause
+            </button>
+            <button
+              onClick={() => void handleTaskAction('resume')}
+              disabled={actionBusy || !canResume}
+              style={taskControlButtonStyle(actionBusy || !canResume)}
+            >
+              Resume
+            </button>
+            <button
+              onClick={() => void handleTaskAction('cancel')}
+              disabled={actionBusy || !canCancel}
+              style={taskControlButtonStyle(actionBusy || !canCancel, true)}
+            >
+              Cancel
             </button>
           </div>
           {actionNote && (
@@ -112,6 +145,7 @@ export const TaskDetailPage: React.FC = () => {
       <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
         <ErrorState error={createError} />
         <ErrorState error={runError} />
+        <ErrorState error={actionError} />
         <RuntimeModeBanner
           runningMode={pipelineResult?.running_mode || observability?.running_mode}
           dependencies={pipelineResult?.dependencies || observability?.dependencies || null}
@@ -243,6 +277,7 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
   if (!observability) return null;
 
   const selectedSources = Array.isArray(observability.selected_sources) ? observability.selected_sources : [];
+  const sourceJudgments = asObjectArray(observability.source_judgments);
   const attemptedSources = Array.isArray(observability.attempted_sources) ? observability.attempted_sources : [];
   const unattemptedSources = Array.isArray(observability.unattempted_sources) ? observability.unattempted_sources : [];
   const failedSources = Array.isArray(observability.failed_sources) ? observability.failed_sources : [];
@@ -394,6 +429,21 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
         </div>
       )}
       <SourceSelectionTable rows={sourceRows} />
+      {sourceJudgments.length > 0 && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <strong>LLM 来源审阅 (shadow)</strong>
+          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
+            {sourceJudgments.slice(0, 5).map((item: any) => (
+              <li key={`${item.canonical_url}-${item.fallback_status}`}>
+                <span style={{ wordBreak: 'break-all' }}>{item.canonical_url}</span>
+                <span style={{ color: '#64748b' }}>
+                  {' '} / {item.output_judgment?.label || 'uncertain'} / fallback {item.fallback_status}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <SourceYieldSummaryPanel rows={sourceYieldSummary} />
       <DroppedSourcesPanel rows={droppedSources} />
       <AnswerSlotCoveragePanel rows={answerSlots} />
@@ -883,6 +933,17 @@ const buttonStyle = {
   borderRadius: '4px',
   fontWeight: 'bold',
 };
+
+const taskControlButtonStyle = (disabled: boolean, danger = false): React.CSSProperties => ({
+  padding: '0.45rem 0.75rem',
+  border: `1px solid ${danger ? '#b91c1c' : '#d1d5db'}`,
+  backgroundColor: danger ? '#fff5f5' : '#fff',
+  color: danger ? '#991b1b' : '#111827',
+  borderRadius: '4px',
+  fontWeight: 700,
+  opacity: disabled ? 0.45 : 1,
+  cursor: disabled ? 'not-allowed' : 'pointer',
+});
 
 const tableStyle: React.CSSProperties = {
   width: '100%',

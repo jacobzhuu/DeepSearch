@@ -96,6 +96,18 @@ class ResearchPlanMutationResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ResearchPlanResponse(BaseModel):
+    task_id: UUID
+    status: str
+    revision_no: int
+    research_plan: dict[str, Any] | None
+    planner_status: str | None = None
+    planner_mode: str | None = None
+    plan_source: str | None = None
+    created_at: datetime | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ResearchTaskObservabilityResponse(BaseModel):
     running_mode: str | None = None
     dependencies: dict[str, Any] | None = None
@@ -117,6 +129,7 @@ class ResearchTaskObservabilityResponse(BaseModel):
     known_path_fallback: dict[str, Any] | None = None
     selected_sources_from_search: list[dict[str, Any]] = Field(default_factory=list)
     selected_sources: list[dict[str, Any]] = Field(default_factory=list)
+    source_judgments: list[dict[str, Any]] = Field(default_factory=list)
     fetch_succeeded: int | None = None
     fetch_failed: int | None = None
     attempted_sources: list[dict[str, Any]] = Field(default_factory=list)
@@ -158,6 +171,24 @@ class ResearchTaskDetailResponse(BaseModel):
     started_at: datetime | None
     ended_at: datetime | None
     progress: ResearchTaskProgressResponse
+
+
+class ResearchTaskListItemResponse(BaseModel):
+    task_id: UUID
+    query: str
+    status: str
+    revision_no: int
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None
+    ended_at: datetime | None
+    events_total: int
+    latest_event_at: datetime | None
+
+
+class ResearchTaskListResponse(BaseModel):
+    tasks: list[ResearchTaskListItemResponse]
+    count: int
 
 
 class TaskEventResponse(BaseModel):

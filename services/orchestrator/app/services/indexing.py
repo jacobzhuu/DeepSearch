@@ -11,6 +11,7 @@ from services.orchestrator.app.indexing import (
     ChunkIndexBackend,
     ChunkIndexDocument,
     IndexedChunkPage,
+    rerank_indexed_chunks,
 )
 from services.orchestrator.app.services.research_tasks import (
     PHASE2_ACTIVE_STATUS,
@@ -128,11 +129,15 @@ class IndexingService:
         normalized_query = query.strip()
         if not normalized_query:
             raise RetrievalQueryError()
-        return self.index_backend.retrieve_chunks(
+        page = self.index_backend.retrieve_chunks(
             task_id=task_id,
             query=normalized_query,
             offset=offset,
             limit=self._normalize_retrieval_limit(limit),
+        )
+        return IndexedChunkPage(
+            total=page.total,
+            hits=rerank_indexed_chunks(page.hits, query=normalized_query),
         )
 
     def _select_chunks(

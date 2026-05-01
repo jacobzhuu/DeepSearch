@@ -34,18 +34,24 @@ They are convenience packaging only. They are not the current primary operator p
 The current v1 path supports:
 
 - task creation, mutation, event stream, and revision tracking
+- task list API and web task list page for recent `research_task` records
 - worker-executed search discovery with canonicalized candidate URLs
 - worker-executed HTTP acquisition with fetch jobs, attempts, and stored snapshots
 - worker-executed parsing for `text/html` and `text/plain`
 - task-scoped chunk indexing and retrieval through OpenSearch
-- support-only claim drafting with citation span binding, query-aware deterministic claim scoring, and answer-focused top-K selection
-- minimal claim verification with `support` and `contradict` evidence
+- candidate claim drafting with citation span binding, query-aware deterministic claim scoring, and answer-focused top-K selection
+- deterministic claim verification with `support`, `weak_support`, and `contradict` evidence and `supported` / `unsupported` / `mixed` / `contradicted` statuses
 - Markdown report synthesis backed by persisted report artifacts, with low-quality/off-query claim filtering and low answer-coverage warnings
 - report language selection from task constraints; the web workspace sends `zh-CN` by default
 - optional grounded LLM report writing that receives only verified claim/evidence/citation-span bundles and falls back to deterministic Markdown on invalid output or provider failure
+- PDF, DOCX, PPTX, and XLSX text extraction through the same source/chunk/index/evidence/report path as HTML/plain text, with parser metadata and locator fallbacks exposed in APIs
+- deterministic retrieval/rerank diagnostics in retrieved chunk metadata
+- optional shadow LLM source judging; disabled by default and never used for final ranking in this MVP
 - shared deterministic source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, slot-coverage, and gap-analysis contracts for source selection, diagnostics, verification, and report coverage
+- deterministic source/chunk quality scoring for prioritization and diagnostics, including authority, relevance, crawlability, information density, safety, and explicit unknown freshness
 - task-event and task-detail observability for planner guardrails, final search queries, search-query diagnostics, known-path fallback injection, source selection, answer slots, source yield, evidence yield, slot coverage, gap rounds, answer yield, answer coverage, verifier strong/weak support counts, supplemental acquisition, fetch success/failure counts, failed fetch reasons, parse decisions, and actionable failure diagnostics
 - pre-run research planning from the web workspace: create a `research_task`, generate a bounded plan, optionally edit its JSON, then confirm and queue the worker pipeline
+- status-aware web controls for Run, Pause, Resume, and Cancel; pause/cancel are observed by the worker at pipeline stage boundaries
 - visible runtime-mode warnings when `SEARCH_PROVIDER=smoke`, `INDEX_BACKEND=local`, or no LLM planner is active
 - report page HTML rendering plus Raw Markdown, Copy Markdown, and Download `.md` controls
 - JSON logs and basic metrics
@@ -102,6 +108,15 @@ The current v1 path supports:
 | `RESEARCH_WORKER_BATCH_SIZE` | Queued tasks processed per worker poll | `1` |
 | `ACQUISITION_USER_AGENT` | Acquisition user agent | `deepresearch-orchestrator/0.1` |
 
+Parser support in this MVP:
+
+- supported: `text/html`, `text/plain`, `application/pdf`, DOCX, PPTX, XLSX OpenXML MIME types
+- unsupported MIME types are skipped with an auditable parse decision
+- Office macros, scripts, external resources, and embedded objects are not executed
+- PDF page numbers are best-effort; unreliable cases record a locator fallback reason
+- browser-rendered fetch and recursive attachment crawling are deferred until a stronger sandbox and
+  parent/child source model are added
+
 ### Object storage
 
 | Variable | Purpose | Default |
@@ -148,11 +163,11 @@ Development-only note:
 
 Claim drafting is deterministic and no-LLM. For definition/mechanism queries such as `What is SearXNG and how does it work?`, the selector now assigns an `answer_role` and prefers definition, mechanism, privacy/design-goal, feature, and low-priority deployment/self-hosting sentences. It rejects contribution calls-to-action, community logistics, documentation pointers, promotional slogans, lowercase fragments, setup/getting-started instructions, diagram/config fragments, and broken-link residue such as `listed at .` before claim persistence. Scoring metadata is stored in `claim.notes_json` and regenerated reports use that metadata to exclude low-quality, setup, unsupported-category, or off-query supported claims from the report body.
 
-Evidence-quality metadata is a code-level contract, not a new table. Claim notes and task/report diagnostics may include `evidence_candidate_id`, `slot_ids`, `source_intent`, citation span ids, claim evidence ids, source-yield rows, evidence-yield summaries, and slot-coverage summaries. Dropped-source reasons use this taxonomy: `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`.
+Evidence-quality metadata is a code-level contract, not a new table. Source/chunk APIs expose source quality fields from existing `source_document` score columns plus chunk metadata. Claim notes and task/report diagnostics may include `evidence_candidate_id`, `slot_ids`, `source_intent`, citation span ids, claim evidence ids, source-yield rows, evidence-yield summaries, verification evidence rank scores, citation precision, chunk/span/content reuse diagnostics, and slot-coverage summaries. Dropped-source reasons use this taxonomy: `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`.
 
 Backward compatibility note: old tasks and report artifacts may not have the newer diagnostics payloads. The API and benchmark script normalize missing `source_yield_summary`, `dropped_sources`, and `slot_coverage_summary` to `[]`, and missing `evidence_yield_summary` or `verification_summary` to `{}` whenever an observability payload exists. Older claim notes without `evidence_candidate_id` remain reportable through their persisted citation spans.
 
-Verification is deterministic lexical verification, not full entailment. It persists only the existing `supported`, `mixed`, and `unsupported` statuses, but records strong support, weak support, contradiction, shallow-overlap, numeric/date mismatch, and scope-mismatch details in `claim.notes_json["verification"]`. Reports keep weak lexical support out of the main answer sections.
+Verification is deterministic lexical verification, not full entailment. Drafting persists `candidate_support` evidence; verification persists only selected `support`, `weak_support`, and `contradict` relations after ranking by lexical match, source quality, chunk quality, information density, retrieval score, and source/content diversity. The verifier now prefers sentence spans and short adjacent-sentence spans over coarse chunk fallbacks, and applies a small batch-local reuse penalty when a chunk/span/content identity has already been used by earlier claims. Strong support without contradiction becomes `supported`; strong support plus contradiction becomes `mixed`; contradiction without strong support becomes `contradicted`; weak-only evidence remains `unsupported`. The verifier records strong support, weak support, contradiction, shallow-overlap, numeric/date mismatch, scope-mismatch, citation precision, reuse penalties/counts, and dropped/selected evidence counts in `claim.notes_json["verification"]`. Reports keep weak lexical support out of the main answer sections.
 
 If strict claim filters produce no claims, the service runs a narrow deterministic fallback over explanatory definition, mechanism, privacy, or feature sentences only. It does not promote short slogans such as `Search without being tracked.`, contribution/community text, navigation, references, redirect stubs, or setup-only instructions unless the query explicitly asks for that material. Fallback claims are marked in `claim.notes_json` with `draft_mode = "fallback_relaxed"`, `fallback_reason`, and `original_rejected_reason`.
 
@@ -174,6 +189,9 @@ For technical library/framework overview queries such as `What is LangGraph and 
 | `LLM_MAX_OUTPUT_TOKENS` | Planner response token cap | `1200` |
 | `LLM_REPORT_WRITER_ENABLED` | Enable grounded LLM report writer for final Markdown synthesis | `false` |
 | `LLM_REPORT_MAX_OUTPUT_TOKENS` | Grounded report-writer response token cap | `2400` |
+| `LLM_SOURCE_JUDGE_ENABLED` | Enable shadow source-judge diagnostics | `false` |
+| `LLM_SOURCE_JUDGE_ACTIVE_RERANK` | Reserved active rerank flag; remains disabled in this MVP | `false` |
+| `LLM_SOURCE_JUDGE_MAX_CANDIDATES` | Max source candidates judged per search stage | `5` |
 | `RESEARCH_PLANNER_ENABLED` | Run planner before search when `LLM_ENABLED=true` | `false` |
 | `RESEARCH_PLANNER_MAX_SUBQUESTIONS` | Planner subquestion cap | `5` |
 | `RESEARCH_PLANNER_MAX_SEARCH_QUERIES` | Planner search-query cap | `8` |
@@ -210,7 +228,7 @@ Planned LLM-assisted source-quality work is tracked in `plans/llm-assisted-sourc
 4. LLM gap reasoner, with deterministic max rounds, dedupe, and fetch limits final.
 5. Grounded report writer hardening, with deterministic Markdown fallback.
 
-The planned source judge is not enabled by any current environment variable. When implemented, it must receive only bounded candidate URL metadata, search snippets, deterministic source-intent results, low-value signals, and ownership evidence. It must return strict structured JSON with an allowed label, confidence scores, a required rationale, and a bounded priority adjustment. It cannot mark a source official unless deterministic ownership evidence already supports that conclusion. It cannot override job/freelance/listing filters, blocklists, SSRF/acquisition policy, or official-owned source priority. In shadow mode, task output must be identical to the deterministic run except for additive diagnostics.
+The source judge is now available in shadow mode through `LLM_SOURCE_JUDGE_ENABLED=true`. It receives only bounded candidate URL metadata, search snippets, deterministic source-intent results, low-value signals, and ownership evidence. It returns strict structured JSON with an allowed label, confidence, reasons, and a bounded priority adjustment. It cannot mark a source official unless deterministic ownership evidence already supports that conclusion. It cannot override job/freelance/listing filters, blocklists, SSRF/acquisition policy, MIME policy, or official-owned source priority. In this MVP it records additive diagnostics only and always sets `used_in_final_ranking=false`.
 
 Noop planner validation:
 
@@ -274,7 +292,23 @@ python scripts/smoke_deepseek_planner.py
 ```
 
 The script reads `.env`, calls only the planner/provider layer, and does not create a task or
-run the full pipeline. It prints provider, model, intent, subquestions, search queries, and
+run the full pipeline.
+
+Phase benchmark commands:
+
+```bash
+python3 scripts/phase2_multiformat_benchmark.py \
+  --base-url http://127.0.0.1:8000 \
+  --wait-seconds 420 \
+  --json-output /tmp/deepsearch-phase2-benchmark.json \
+  --markdown-output /tmp/deepsearch-phase2-benchmark.md
+
+python3 scripts/phase3_intelligence_benchmark.py \
+  --base-url http://127.0.0.1:8000 \
+  --wait-seconds 420 \
+  --json-output /tmp/deepsearch-phase3-benchmark.json \
+  --markdown-output /tmp/deepsearch-phase3-benchmark.md
+```
 warnings. It never prints `LLM_API_KEY`. Missing `LLM_API_KEY` exits with code `2`; sanitized
 provider/planner failures exit with code `1`.
 
@@ -362,10 +396,11 @@ python scripts/smoke_planner_pipeline.py \
 The helper reads `.env`, creates a task, queues `POST /api/v1/research/tasks/<task_id>/run`,
 and polls task status/events until the worker completes or fails. It prints task id, status,
 running mode, planner status, final search queries, attempted sources, source documents,
-chunk count, claims by category, report preview, and failure details. It never prints API
-keys. Exit code `0` means the pipeline completed with at least three claims and a report;
-`1` means the pipeline failed or produced an insufficient report; `2` means the service,
-worker, or configuration is unavailable.
+chunk count, claims by category, report artifact id/version, report preview, and failure
+details. It never prints API keys. Exit code `0` means the worker-completed pipeline produced
+at least one `source_document`, one `source_chunk`, one claim, and a readable Markdown
+`report_artifact`; `1` means the pipeline failed or produced an insufficient ledger; `2`
+means the service, worker, or configuration is unavailable.
 
 Generalization benchmark query list:
 
@@ -398,6 +433,27 @@ python scripts/benchmark_queries.py --json --limit 2
 python scripts/benchmark_queries.py --json --query-id 3
 python scripts/benchmark_queries.py --run --limit 2 --wait-seconds 420 --output /tmp/deepsearch-benchmark.json
 ```
+
+Evidence quality benchmark:
+
+```bash
+python scripts/evidence_quality_benchmark.py \
+  --base-url http://127.0.0.1:8000 \
+  --wait-seconds 420 \
+  --json-output /tmp/deepsearch-evidence-benchmark.json \
+  --markdown-output /tmp/deepsearch-evidence-benchmark.md
+```
+
+This benchmark runs 3-5 real research questions through `/run` and reads only persisted API
+outputs. It reports source count, chunk count, claim count, supported/unsupported/mixed/
+contradicted distribution, average source quality, verified evidence per claim, verified
+citation-span precision, duplicate source rate, verified evidence content duplicate rate,
+all-evidence duplicate rate, chunk/span reuse counts, top reused chunks/spans, per-query duplicate
+content rate, per-claim evidence diversity diagnostics, and whether a report artifact exists.
+Draft `candidate_support` rows remain visible in the all-evidence diagnostics, but precision and
+primary duplicate metrics are computed on verifier-created `support` / `weak_support` /
+`contradict` evidence. It does not hardcode expected answers and should be treated as a
+quality-exposure harness rather than a pass/fail golden-answer test.
 
 Before trusting the default `http://127.0.0.1:8000` service, check that it is the current
 working-tree process:
@@ -580,7 +636,61 @@ VITE_API_BASE_URL=http://SERVER_IP:8000 npm run dev:remote
 
 Then open `http://SERVER_IP:5173` on the Mac.
 
-### 10. Smoke test
+### 10. Real-dependency worker smoke
+
+Use this path when PostgreSQL, MinIO, OpenSearch, SearXNG, orchestrator, worker, and web are all available.
+
+1. Configure `.env` or the shell:
+
+```bash
+DATABASE_URL=postgresql+psycopg://deepsearch:deepsearch@127.0.0.1:5432/deepsearch
+SNAPSHOT_STORAGE_BACKEND=minio
+MINIO_ENDPOINT=127.0.0.1:9000
+MINIO_ACCESS_KEY=<access-key>
+MINIO_SECRET_KEY=<secret-key>
+SNAPSHOT_STORAGE_BUCKET=snapshots
+REPORT_STORAGE_BUCKET=reports
+SEARCH_PROVIDER=searxng
+SEARXNG_BASE_URL=http://127.0.0.1:8080
+INDEX_BACKEND=opensearch
+OPENSEARCH_BASE_URL=http://127.0.0.1:9200
+OPENSEARCH_INDEX_NAME=source-chunks-v1
+```
+
+2. Initialize durable dependencies:
+
+```bash
+cd /share/zhuzy/projects/DeepSearch
+./scripts/migrate.sh
+python scripts/init_buckets.py
+python scripts/init_index.py
+```
+
+3. Start orchestrator, worker, and web in separate shells:
+
+```bash
+PYTHONPATH=. python3 -m uvicorn services.orchestrator.app.main:app --host 127.0.0.1 --port 8000
+PYTHONPATH=. python3 scripts/research_worker.py
+cd apps/web && VITE_API_BASE_URL=http://127.0.0.1:8000 npm run dev -- --host 127.0.0.1
+```
+
+4. Run the worker-path smoke:
+
+```bash
+python3 scripts/smoke_planner_pipeline.py \
+  --query "What is SearXNG and how does it work?" \
+  --base-url http://127.0.0.1:8000
+```
+
+The smoke script creates a task, calls `/run`, waits for the host-local worker, checks
+`source_documents`, `source_chunks`, `claims`, and the report artifact, then prints the task id
+for frontend inspection at `http://127.0.0.1:5173/tasks/<task_id>`.
+
+This closeout added the script/runbook alignment and unit coverage for the code path. A live
+PostgreSQL + MinIO + OpenSearch + SearXNG stack still has to be started by the operator before
+this real-dependency smoke can be truthfully marked as passed.
+
+### 11. Synchronous API-chain smoke
 
 If you have a reachable SearXNG-compatible endpoint:
 
@@ -596,7 +706,7 @@ export SEARXNG_BASE_URL=http://127.0.0.1:18080
 python3 scripts/smoke_test.py --base-url http://127.0.0.1:8000
 ```
 
-### 11. Development-only real pipeline debug run
+### 12. Development-only real pipeline debug run
 
 For a host-local development smoke that drives one existing task through the real synchronous service chain without a worker:
 
@@ -616,7 +726,7 @@ Required live dependencies:
 
 On failure the response includes `stage`, `reason`, `exception`, `message`, `next_action`, and counts of any intermediate ledger rows already produced. The product `/run` endpoint only queues work; worker failures are visible later on the task detail/events APIs.
 
-### 12. Worker-triggered full run
+### 13. Worker-triggered full run
 
 The frontend now calls the product run endpoint to enqueue work:
 
@@ -626,12 +736,13 @@ POST /api/v1/research/tasks/<task_id>/run
 
 From the web UI:
 
-1. open `/tasks/new`
+1. open `/tasks` to inspect existing tasks, or `/tasks/new` to create a new task
 2. enter a research query
-3. click `Create And Run DeepSearch`
+3. generate/review the pre-run plan, then confirm it to queue `/run`
 4. the UI navigates to task detail and polls progress/events while the worker runs
-5. on completion the report page is available
-6. on failure the task detail page shows `stage`, `reason`, `message`, `next_action`, stage events, and intermediate counts
+5. task detail exposes Run, Pause, Resume, and Cancel according to the current status
+6. on completion the report page is available
+7. on failure the task detail page shows `stage`, `reason`, `message`, `next_action`, stage events, and intermediate counts
 
 Real-search mode requires:
 
@@ -837,7 +948,7 @@ At minimum, that route would still need:
 
 ### Smoke test fails at parse
 
-- only `text/html` and `text/plain` are supported
+- supported MIME types are `text/html`, `text/plain`, `application/pdf`, DOCX, PPTX, and XLSX OpenXML documents
 - inspect task events or `GET /api/v1/research/tasks/<task_id>` for `progress.observability.parse_decisions`
 - parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, `parser_error`, `extractor_strategy_used`, `fallback_used`, `removed_boilerplate_count`, `extracted_text_length`, `text_cleanup_applied`, `dropped_broken_link_fragments`, and `preserved_link_text_count`
 - for Wikipedia/MediaWiki pages, expected extraction is article-body text from `main`, `article`, `#content`, `#bodyContent`, `#mw-content-text`, or `.mw-parser-output`, with paragraph fallback from `.mw-parser-output p`, `#mw-content-text p`, or readable body paragraphs if strict extraction would otherwise be empty
@@ -864,3 +975,17 @@ At minimum, that route would still need:
   - `GET /indexed-chunks`
   - `GET /claims`
   - `GET /claim-evidence`
+
+### Pause or cancel appears to be ignored while the worker is running
+
+- expected behavior is stage-boundary control: `/pause` or `/cancel` records the requested
+  status immediately, and the worker must stop before starting the next pipeline stage
+- if a task briefly returns `PAUSED` but then advances to the next runtime status such as
+  `ACQUIRING`, restart the backend and worker from the current checkout; older worker code may
+  have cached the task row and missed the external control update
+- inspect `GET /api/v1/research/tasks/<task_id>/events`; a correct stage-boundary pause has
+  `task.paused` after a `pipeline.stage_started` event and no later
+  `pipeline.stage_started` event until `/resume`
+- after `/resume`, the task returns to `QUEUED` and the worker may continue from the latest
+  checkpoint; `/cancel` from `QUEUED` or an active runtime status should leave the task in
+  `CANCELLED`

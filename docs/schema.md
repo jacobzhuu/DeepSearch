@@ -20,14 +20,16 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 
 ## Phase 11 schema note
 
-- Phase 11 adds no new relational fields, tables, or indexes
+- P1 evidence credibility adds no new relational fields, tables, or indexes
 - Research Planner v1 stores its output in existing `task_event.payload_json` rows with event types `research_plan.created` and `research_plan.failed`; no `research_plan` table or migration exists
 - pre-run planner confirmation also uses `research_plan.created` with `stage = "PLANNING"` while leaving `research_task.status = PLANNED`; the latest matching plan event for the current `revision_no` is reused by the worker pipeline instead of creating a hidden duplicate plan
 - product run queueing uses existing `research_task.status = QUEUED`; the host-local worker writes runtime progress to existing `task_event` rows and `research_run.checkpoint_json`
+- task listing is an API/query-layer addition over existing `research_task` and `task_event` rows; it adds no relational schema
 - planner guardrail, source-selection, answer-slot coverage, source-yield, evidence-yield, dropped-source, verifier-detail, supplemental-acquisition, gap-analysis, and failure-diagnostic fields are stored in existing `task_event.payload_json`, `search_query.raw_response_json`, `candidate_url.metadata_json`, `claim.notes_json`, `research_run.checkpoint_json`, `report_artifact.manifest_json`, and API observability payloads; gap supplemental query metadata such as `query_source = "gap_analyzer"`, `gap_round_no`, and `slot_ids` stays in existing search metadata; no new planner, source-quality, answer-slot, evidence-candidate, gap-analyzer, worker-queue, or acquisition-retry table exists
 - query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `answer_role`, `answer_relevant`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`
 - claim drafting now also stores code-contract lineage fields in `claim.notes_json`, including `slot_ids`, `source_document_id`, `source_chunk_id`, `citation_span_id`, `claim_evidence_id`, `source_intent`, `evidence_candidate_id`, `evidence_quality_score`, `evidence_salience_score`, `evidence_rejection_reasons`, and a serialized `evidence_candidate` payload
-- verification stores deterministic lexical verifier metadata in `claim.notes_json["verification"]`, including `verifier_method`, strong and weak support counts, contradiction counts, insufficient-evidence count, relation details, shallow-overlap flags, numeric/date mismatch flags, and scope-mismatch flags
+- source quality uses existing `source_document` score columns and `source_chunk.metadata_json`; current metadata records final source score, authority, relevance, crawlability, information density, safety, explicit `freshness_state`, chunk content quality, query relevance, boilerplate score, and quality reasons
+- verification stores deterministic lexical verifier metadata in `claim.notes_json["verification"]`, including `verifier_method`, strong and weak support counts, contradiction counts, insufficient-evidence count, selected/dropped evidence counts, evidence rank scores, relation details, citation precision, shallow-overlap flags, numeric/date mismatch flags, and scope-mismatch flags
 - report language and optional grounded LLM writer provenance are stored in existing `report_artifact.manifest_json` keys: `report_language`, `report_writer.mode`, `report_writer.status`, and sanitized provider/model/usage/error metadata when the LLM writer is attempted
 - host-local operational closeout, optional compose wiring, init scripts, and smoke validation all reuse the existing Phase 10 schema as-is
 - `services/orchestrator/app/research_quality/` provides the current code-level source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, slot-coverage, and gap-analysis contracts; these are not relational schema entities yet
@@ -41,6 +43,23 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - persisted planner / gap analyzer entities
   - richer verifier workflows
   - advanced retrieval optimization
+
+## P2/P3 no-migration note
+
+The P2/P3 multiformat and intelligence MVP adds no new Alembic revision. PDF, DOCX, PPTX, XLSX,
+MIME policy, parser status, parser warnings, page/slide/sheet/cell locators, retrieval/rerank
+diagnostics, research-plan readback, gap/refinement diagnostics, and shadow LLM source-judge
+results are stored in existing JSON seams:
+
+- `source_chunk.metadata_json` for parser metadata, format locators, MIME policy, source quality,
+  chunk quality, and retrieval diagnostics
+- `task_event.payload_json` for research-plan, search, gap, source-judge, and pipeline observability
+- `report_artifact.manifest_json` for report writer and evidence-quality summaries
+
+Unsupported MIME types, empty documents, parser errors, and unreliable PDF page localization remain
+auditable through parse decision payloads and chunk metadata rather than a new parse-history table.
+A future beta may add `research_plan`, `parse_attempt`, `attachment_relation`, or source-judge tables
+if these JSON contracts become too large for operator review.
 
 ## Current schema shape
 
@@ -56,6 +75,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `content_snapshot` stores the traceable content object reference per fetch attempt
 - source and citation ledger:
   - `source_document` stores per-task canonical source records, a minimal `content_snapshot` provenance link, and source scoring fields
+- current source scoring is deterministic heuristic scoring: URL/source-intent, authority, relevance, crawlability, information density, safety, and unknown/known freshness signals populate the existing source score columns, API quality payloads, diagnostics, and `final_source_score`; there is still no independent learned source-quality model
   - `source_chunk` stores chunked source text
   - `citation_span` stores excerpt-level traceability within a chunk
 - claim and report ledger:
@@ -84,7 +104,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 
 ## Phase 2 task-event usage
 
-- Phase 2 still creates tasks in `PLANNED`; pause/cancel remain stable lifecycle commands
+- Phase 2 still creates tasks in `PLANNED`; pause/cancel remain stable lifecycle commands and can now target active runtime statuses as stage-boundary controls
 - the product runner now uses these runtime-facing statuses:
   - `QUEUED`
   - `RUNNING`
@@ -115,6 +135,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `changes`
 - `POST /api/v1/research/tasks/{task_id}/run` only transitions `PLANNED -> QUEUED`; the worker owns `QUEUED -> RUNNING -> stage statuses -> COMPLETED/FAILED`
 - `resume` transitions `PAUSED -> QUEUED`, preserving the existing checkpoint and letting the worker continue at a stage boundary
+- `pause` and `cancel` from active runtime statuses are recorded immediately in `research_task.status`, but the worker observes them between pipeline stages rather than as a distributed interrupt
 
 ## Phase 3 search-discovery usage
 
@@ -227,9 +248,9 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 - current draft claims are deliberately minimal:
   - `claim_type` currently uses the stable singleton set `fact`
   - `verification_status` currently uses the stable draft-only value `draft`
-- current claim evidence is deliberately minimal:
-  - `relation_type` currently uses the stable singleton set `support`
-  - contradiction or mixed evidence handling is deferred to the verifier phase
+- current draft claim evidence is deliberately candidate-only:
+  - `relation_type` uses `candidate_support` before verification
+  - verifier-created evidence later uses `support`, `weak_support`, or `contradict`
 - citation binding is now explicitly validated at service level before persistence:
   - `start_offset >= 0`
   - `end_offset > start_offset`
@@ -247,7 +268,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - normalize that span into a claim statement
   - create or reuse the exact-statement task claim
   - create or reuse the exact-offset citation span
-  - create or reuse `claim_evidence(claim_id, citation_span_id, support)`
+  - create or reuse `claim_evidence(claim_id, citation_span_id, candidate_support)`
 - no-claims drafting diagnostics are carried in service return payloads and `pipeline.failed.details`, not stored in new database tables
 - repeated Phase 7 draft calls are guarded by exact statement reuse plus existing citation and claim-evidence uniqueness boundaries
 - broader answer-level near-duplicate suppression is deterministic and service-level only; diagnostics report `near_duplicate_claims_removed`, while exact duplicate statements can still reuse the same claim and add additional citation evidence
@@ -259,13 +280,18 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `draft`
   - `supported`
   - `mixed`
+  - `contradicted`
   - `unsupported`
 - Phase 8 verification expands the stable service-level claim evidence relation set to:
+  - `candidate_support`
   - `support`
+  - `weak_support`
   - `contradict`
 - verification remains ledger-first and reuses the current seams:
   - retrieve task-scoped candidate chunks by `claim.statement`
-  - select one best sentence-like span per candidate chunk
+  - select one best sentence-like span per candidate chunk, with a short adjacent-sentence span when one sentence alone does not carry the claim support
+  - rank candidate evidence by lexical relation strength, source quality, chunk quality, information density, retrieval score, source/content diversity, and small cross-claim reuse penalties
+  - keep a small selected evidence set instead of persisting every weakly related chunk; strong support and contradiction selection are intentionally conservative at one primary evidence item each
   - validate the exact offsets and excerpt against `source_chunk.text`
   - create or reuse the exact-offset `citation_span`
   - create or reuse `claim_evidence(claim_id, citation_span_id, relation_type)`
@@ -273,12 +299,20 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   - `method`
   - `verification_query`
   - `support_evidence_count`
+  - `weak_support_evidence_count`
   - `contradict_evidence_count`
+  - `candidate_evidence_count`
+  - `selected_evidence_count`
+  - `dropped_evidence_count`
+  - `evidence_relations`
+  - `evidence_diversity`
   - `rationale`
+- relation rows in `evidence_relations` may include `diversity_adjusted_score`, `reuse_penalty`, `chunk_reuse_count_before`, `span_reuse_count_before`, `content_reuse_count_before`, `chunk_text_hash`, and `span_text_hash`; these are metadata-only diagnostics and do not require a migration
 - the current verification resolution is deliberately minimal:
-  - `supported` when support evidence exists and contradict evidence does not
-  - `mixed` when both support and contradict evidence exist
-  - `unsupported` otherwise
+  - `supported` when strong support evidence exists and contradict evidence does not
+  - `mixed` when strong support and contradict evidence both exist, or weak support conflicts with contradiction
+  - `contradicted` when contradiction evidence exists without strong support
+  - `unsupported` when no strong support or contradiction evidence exists; weak-only evidence is not promoted to support
 - repeated Phase 8 verification calls are guarded only by exact citation-span reuse plus the existing `claim_evidence(claim_id, citation_span_id, relation_type)` uniqueness boundary; richer semantic deduplication is deferred
 - no Phase 8 migration was added; the current stable verification and relation enums are enforced by service and API contracts rather than database check constraints
 
@@ -294,7 +328,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 - the current report content is evidence-first and deterministic by default:
   - the deterministic renderer localizes report headings and template text from `constraints.report_language` or `constraints.language`
   - supported claims appear as settled conclusions
-  - mixed and unsupported claims are rendered only with explicit status labels and uncertainty sections
+  - mixed, contradicted, and unsupported claims are rendered only with explicit status labels and uncertainty sections
   - no new claims, verification decisions, or retrieval operations are introduced during report generation
   - low-quality or off-query supported claims are filtered using persisted or recomputed claim-quality and query-answer scores before they can appear in the Executive Summary, Answer sections, Evidence Table, or claim evidence mapping
   - definition/mechanism reports also apply an answer-category gate so supported `other`, setup, community, slogan, reference, or navigation claims do not appear as conclusions by status alone

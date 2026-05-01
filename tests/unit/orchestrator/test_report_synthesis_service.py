@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -14,6 +15,7 @@ from packages.db.models import (
     CitationSpan,
     Claim,
     ClaimEvidence,
+    ReportArtifact,
     ResearchTask,
     SourceChunk,
     SourceDocument,
@@ -46,6 +48,11 @@ class FakeReportLLMProvider:
             raw_response_id="fake-response",
             finish_reason="stop",
         )
+
+
+def _manifest(artifact: ReportArtifact) -> dict[str, Any]:
+    assert artifact.manifest_json is not None
+    return artifact.manifest_json
 
 
 def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
@@ -81,12 +88,14 @@ def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
     assert len(artifacts) == 1
     assert first_result.supported_claims == 1
     assert first_result.mixed_claims == 1
+    assert first_result.contradicted_claims == 0
     assert first_result.unsupported_claims == 1
     assert first_result.artifact.content_hash == _markdown_hash(first_result.markdown)
     assert first_result.artifact.manifest_json is not None
     assert first_result.artifact.manifest_json["manifest_version"] == 1
     assert first_result.artifact.manifest_json["claim_counts"]["supported"] == 1
     assert first_result.artifact.manifest_json["claim_counts"]["mixed"] == 1
+    assert first_result.artifact.manifest_json["claim_counts"]["contradicted"] == 0
     assert first_result.artifact.manifest_json["claim_counts"]["unsupported"] == 1
     assert "slot_coverage_summary" in first_result.artifact.manifest_json
     assert "source_yield_summary" in first_result.artifact.manifest_json
@@ -160,8 +169,9 @@ def test_report_synthesis_service_can_use_grounded_llm_writer(
     assert str(claim.id) in result.markdown
     assert str(evidence.id) in result.markdown
     assert "Appendix: Claim Evidence Mapping" in result.markdown
-    assert result.artifact.manifest_json["report_writer"]["mode"] == "llm_grounded"
-    assert result.artifact.manifest_json["report_writer"]["status"] == "used"
+    manifest = _manifest(result.artifact)
+    assert manifest["report_writer"]["mode"] == "llm_grounded"
+    assert manifest["report_writer"]["status"] == "used"
 
 
 def test_report_synthesis_service_falls_back_when_llm_ids_are_not_grounded(
@@ -203,7 +213,7 @@ def test_report_synthesis_service_falls_back_when_llm_ids_are_not_grounded(
     assert "This unsupported LLM-only sentence must not be rendered." not in result.markdown
     assert "## Executive Summary" in result.markdown
     assert (
-        result.artifact.manifest_json["report_writer"]["status"]
+        _manifest(result.artifact)["report_writer"]["status"]
         == "fallback_after_llm_validation_error"
     )
 
@@ -234,6 +244,7 @@ def test_get_latest_report_returns_stored_artifact_even_if_ledger_later_changes(
     assert latest_result.markdown == first_result.markdown
     assert latest_result.supported_claims == 0
     assert latest_result.mixed_claims == 0
+    assert latest_result.contradicted_claims == 0
     assert latest_result.unsupported_claims == 0
     assert latest_result.draft_claims == 0
 
@@ -317,7 +328,7 @@ def test_report_synthesis_accepts_legacy_claim_notes_without_lineage(
 
     assert result.supported_claims == 1
     assert chunk_text in result.markdown
-    manifest = result.artifact.manifest_json
+    manifest = _manifest(result.artifact)
     assert manifest["source_yield_summary"][0]["contribution_level"] == "medium"
     assert manifest["evidence_yield_summary"]["accepted_candidates"] == 1
     assert manifest["verification_summary"]["strong_supported_claim_count"] == 1

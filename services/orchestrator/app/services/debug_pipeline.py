@@ -39,6 +39,7 @@ from services.orchestrator.app.planning import (
     research_plan_from_serialized_payload,
 )
 from services.orchestrator.app.research_quality import (
+    SourceJudgeService,
     SourceYieldSummary,
     analyze_required_slot_gaps,
     answer_slot_coverage,
@@ -190,6 +191,7 @@ class DebugRealPipelineRunner:
         claims_service: ClaimDraftingService,
         reporting_service: ReportSynthesisService,
         planner_service: ResearchPlannerService | None = None,
+        source_judge_service: SourceJudgeService | None = None,
         dependencies: dict[str, Any],
         fetch_limit: int = 3,
         parse_limit: int = 3,
@@ -211,6 +213,7 @@ class DebugRealPipelineRunner:
         self.claims_service = claims_service
         self.reporting_service = reporting_service
         self.planner_service = planner_service
+        self.source_judge_service = source_judge_service
         self.research_plan: ResearchPlan | None = None
         self.dependencies = dependencies
         self.fetch_limit = fetch_limit
@@ -444,7 +447,7 @@ class DebugRealPipelineRunner:
             search_result,
             limit=self.max_supplemental_sources,
         )
-        warnings: list[str] = []
+        round_warnings: list[str] = []
         fallback_sources: list[dict[str, Any]] = []
         skipped_fallback_sources: list[dict[str, Any]] = []
         if not selected_candidate_ids:
@@ -464,20 +467,20 @@ class DebugRealPipelineRunner:
                 for candidate in fallback_candidates
             ]
             if not selected_candidate_ids:
-                warnings.append("Gap round produced no new or unattempted candidate URLs.")
+                round_warnings.append("Gap round produced no new or unattempted candidate URLs.")
                 return {
                     "gap_analysis": gap_analysis,
                     "search": search_result,
                     "fallback_sources": fallback_sources,
                     "skipped_gap_search_sources": skipped_gap_search_sources,
                     "skipped_fallback_sources": skipped_fallback_sources,
-                    "warnings": warnings,
+                    "warnings": round_warnings,
                     "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
                 }
-            warnings.append(
-                "Gap round search added no high-value URLs; attempting existing unattempted "
-                "high-value candidates."
-            )
+                round_warnings.append(
+                    "Gap round search added no high-value URLs; attempting existing unattempted "
+                    "high-value candidates."
+                )
 
         acquisition = self.acquisition_service.acquire_candidates(
             task_id,
@@ -490,7 +493,7 @@ class DebugRealPipelineRunner:
             entry.content_snapshot.id for entry in acquisition.entries if entry.content_snapshot
         ]
         if not snapshot_ids:
-            warnings.append("Gap round fetched no successful content snapshots.")
+            round_warnings.append("Gap round fetched no successful content snapshots.")
             return {
                 "gap_analysis": gap_analysis,
                 "search": search_result,
@@ -498,7 +501,7 @@ class DebugRealPipelineRunner:
                 "fallback_sources": fallback_sources,
                 "skipped_gap_search_sources": skipped_gap_search_sources,
                 "skipped_fallback_sources": skipped_fallback_sources,
-                "warnings": warnings,
+                "warnings": round_warnings,
                 "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
             }
 
@@ -522,7 +525,7 @@ class DebugRealPipelineRunner:
             "parse_decisions": parse_decisions,
         }
         if not source_chunk_ids:
-            warnings.append("Gap round parsed no source chunks.")
+            round_warnings.append("Gap round parsed no source chunks.")
             return {
                 "gap_analysis": gap_analysis,
                 "search": search_result,
@@ -531,7 +534,7 @@ class DebugRealPipelineRunner:
                 "fallback_sources": fallback_sources,
                 "skipped_gap_search_sources": skipped_gap_search_sources,
                 "skipped_fallback_sources": skipped_fallback_sources,
-                "warnings": warnings,
+                "warnings": round_warnings,
                 "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
             }
 
@@ -544,7 +547,7 @@ class DebugRealPipelineRunner:
         try:
             drafting_result = self._run_draft_claims(task_id)
         except DebugPipelinePreconditionError as error:
-            warnings.append(f"Gap round produced no new draft claims: {error}")
+            round_warnings.append(f"Gap round produced no new draft claims: {error}")
             drafting_result = {
                 "created_claims": 0,
                 "reused_claims": 0,
@@ -553,7 +556,7 @@ class DebugRealPipelineRunner:
         try:
             verification_result = self._run_verify_claims(task_id)
         except DebugPipelinePreconditionError as error:
-            warnings.append(f"Gap round found no draft claims to verify: {error}")
+            round_warnings.append(f"Gap round found no draft claims to verify: {error}")
             verification_result = {
                 "verified_claims": 0,
                 "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
@@ -566,7 +569,9 @@ class DebugRealPipelineRunner:
             if slot.get("required") is True and slot.get("status") in {"missing", "weak"}
         ]
         if remaining_required_gaps:
-            warnings.append("Required answer slots remain missing or weak after this gap round.")
+            round_warnings.append(
+                "Required answer slots remain missing or weak after this gap round."
+            )
         return {
             "gap_analysis": gap_analysis,
             "search": search_result,
@@ -580,7 +585,7 @@ class DebugRealPipelineRunner:
             "fallback_sources": fallback_sources,
             "skipped_gap_search_sources": skipped_gap_search_sources,
             "skipped_fallback_sources": skipped_fallback_sources,
-            "warnings": warnings,
+            "warnings": round_warnings,
             "query": task.query,
         }
 
@@ -629,6 +634,24 @@ class DebugRealPipelineRunner:
                 search_query_payload["known_path_fallback"] = safe_fallback
                 known_path_fallbacks.append(safe_fallback)
             search_queries.append(search_query_payload)
+        selected_sources = [
+            _candidate_url_summary(candidate_url, query=result.task.query)
+            for candidate_url in result.candidate_urls
+        ]
+        source_judgments = []
+        if self.source_judge_service is not None:
+            source_judgments = [
+                item.to_payload()
+                for item in self.source_judge_service.judge_candidates(
+                    result.candidate_urls,
+                    query=result.task.query,
+                )
+            ]
+            judgments_by_url = {item["canonical_url"]: item for item in source_judgments}
+            for selected_source in selected_sources:
+                canonical_url = selected_source.get("canonical_url")
+                if isinstance(canonical_url, str) and canonical_url in judgments_by_url:
+                    selected_source["source_judge"] = judgments_by_url[canonical_url]
         return {
             "search_queries": search_queries,
             "search_query_count": len(result.search_queries),
@@ -662,10 +685,8 @@ class DebugRealPipelineRunner:
                 self.research_plan.extracted_entity if self.research_plan is not None else None
             ),
             "candidate_urls_added": len(result.candidate_urls),
-            "selected_sources": [
-                _candidate_url_summary(candidate_url, query=result.task.query)
-                for candidate_url in result.candidate_urls
-            ],
+            "selected_sources": selected_sources,
+            "source_judgments": source_judgments,
             "duplicates_skipped": result.duplicates_skipped,
             "filtered_out": result.filtered_out,
             "known_path_fallback": _known_path_fallback_summary(known_path_fallbacks),
@@ -1060,6 +1081,7 @@ class DebugRealPipelineRunner:
             "llm_writer_status": result.llm_writer_status,
             "supported_claims": result.supported_claims,
             "mixed_claims": result.mixed_claims,
+            "contradicted_claims": result.contradicted_claims,
             "unsupported_claims": result.unsupported_claims,
             "draft_claims": result.draft_claims,
             "report_markdown_preview": result.markdown[:500],
@@ -1275,6 +1297,7 @@ class DebugRealPipelineRunner:
 
     def _ensure_task_can_continue(self, task_id: UUID) -> None:
         task = self._get_task(task_id)
+        self.session.refresh(task)
         if task.status in {STATUS_PAUSED, STATUS_CANCELLED}:
             raise DebugPipelineInterrupted(task_id, task.status)
 
@@ -1634,6 +1657,11 @@ def _build_source_quality_summary(session: Session, task_id: UUID) -> dict[str, 
         for source_document in source_documents
         if (source_document.final_source_score or 0.0) < 0.35
     ]
+    scored_sources = [
+        source_document.final_source_score
+        for source_document in source_documents
+        if source_document.final_source_score is not None
+    ]
     redirect_stub_sources = [
         source_chunk.source_document_id
         for source_chunk in source_chunks
@@ -1657,6 +1685,9 @@ def _build_source_quality_summary(session: Session, task_id: UUID) -> dict[str, 
 
     return {
         "source_count": len(source_documents),
+        "average_source_quality": (
+            round(sum(scored_sources) / len(scored_sources), 4) if scored_sources else None
+        ),
         "high_quality_source_count": len(high_quality_source_ids),
         "evidence_domain_count": len(evidence_domains),
         "high_quality_evidence_domain_count": len(high_quality_evidence_domains),

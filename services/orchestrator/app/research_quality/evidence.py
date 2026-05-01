@@ -88,6 +88,8 @@ class EvidenceCandidate:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> EvidenceCandidate:
+        metadata_value = payload.get("metadata")
+        metadata: dict[str, Any] = dict(metadata_value) if isinstance(metadata_value, dict) else {}
         return cls(
             evidence_candidate_id=_required_str(payload, "evidence_candidate_id"),
             source_document_id=_optional_str(payload.get("source_document_id")),
@@ -102,7 +104,7 @@ class EvidenceCandidate:
             quality_score=_float_value(payload.get("quality_score")),
             extraction_strategy=_optional_str(payload.get("extraction_strategy")),
             rejection_reasons=tuple(_string_list(payload.get("rejection_reasons"))),
-            metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+            metadata=metadata,
         )
 
 

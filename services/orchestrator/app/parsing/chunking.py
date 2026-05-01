@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 DEFAULT_MAX_CHARS_PER_CHUNK = 1_200
 
@@ -12,7 +13,7 @@ class ParsedChunk:
     chunk_no: int
     text: str
     token_count: int
-    metadata: dict[str, object] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def chunk_text(
@@ -49,9 +50,15 @@ def chunk_text(
         chunk_payloads.append(("\n\n".join(current_paragraphs), current_paragraph_count))
 
     chunks: list[ParsedChunk] = []
+    cursor = 0
     for chunk_no, (chunk_text_value, paragraph_count) in enumerate(chunk_payloads):
         char_count = len(chunk_text_value)
         token_count = max(1, math.ceil(char_count / 4))
+        start_offset = normalized_text.find(chunk_text_value, cursor)
+        if start_offset < 0:
+            start_offset = cursor
+        end_offset = start_offset + char_count
+        cursor = end_offset
         chunks.append(
             ParsedChunk(
                 chunk_no=chunk_no,
@@ -60,6 +67,8 @@ def chunk_text(
                 metadata={
                     "strategy": "paragraph_window_v1",
                     "char_count": char_count,
+                    "char_start": start_offset,
+                    "char_end": end_offset,
                     "paragraph_count": paragraph_count,
                     "approx_token_count": token_count,
                 },

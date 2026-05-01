@@ -44,6 +44,7 @@ class ClaimResponse(BaseModel):
     confidence: float | None
     verification_status: str
     support_evidence_count: int = 0
+    weak_support_evidence_count: int = 0
     contradict_evidence_count: int = 0
     rationale: str | None = None
     notes: dict[str, Any]
@@ -63,6 +64,13 @@ class ClaimEvidenceResponse(BaseModel):
     statement: str
     relation_type: str
     score: float | None
+    relation_detail: str | None = None
+    support_level: str | None = None
+    verifier_method: str | None = None
+    reasons: list[str] = Field(default_factory=list)
+    citation_precision: str | None = None
+    citation_precision_reason: str | None = None
+    quality: dict[str, Any] = Field(default_factory=dict)
     start_offset: int
     end_offset: int
     excerpt: str
@@ -81,6 +89,7 @@ class VerifiedClaimResponse(BaseModel):
     confidence: float | None
     verification_status: str
     support_evidence_count: int
+    weak_support_evidence_count: int
     contradict_evidence_count: int
     rationale: str
     notes: dict[str, Any]

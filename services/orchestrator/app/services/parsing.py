@@ -370,11 +370,11 @@ class ParsingService:
                     source_type=parsed_content.source_type,
                     published_at=None,
                     fetched_at=content_snapshot.fetched_at,
-                    authority_score=source_quality.score,
-                    freshness_score=None,
-                    originality_score=None,
-                    consistency_score=None,
-                    safety_score=None,
+                    authority_score=source_quality.authority_score,
+                    freshness_score=source_quality.freshness_score,
+                    originality_score=source_quality.information_density_score,
+                    consistency_score=source_quality.relevance_score,
+                    safety_score=source_quality.safety_score,
                     final_source_score=source_quality.score,
                 )
             )
@@ -387,12 +387,21 @@ class ParsingService:
             source_document.source_type = parsed_content.source_type
             source_document.fetched_at = content_snapshot.fetched_at
             source_document.domain = document_domain
-            source_document.authority_score = source_quality.score
+            source_document.authority_score = source_quality.authority_score
+            source_document.freshness_score = source_quality.freshness_score
+            source_document.originality_score = source_quality.information_density_score
+            source_document.consistency_score = source_quality.relevance_score
+            source_document.safety_score = source_quality.safety_score
             source_document.final_source_score = source_quality.score
 
         parsed_chunks = chunk_text(parsed_content.text)
         for parsed_chunk in parsed_chunks:
             metadata = dict(parsed_chunk.metadata)
+            locator_metadata = _structure_locator_metadata(
+                parsed_content.metadata,
+                start_offset=int(metadata.get("char_start") or 0),
+                end_offset=int(metadata.get("char_end") or 0),
+            )
             chunk_quality = assess_chunk_quality(
                 text=parsed_chunk.text,
                 query=task.query,
@@ -403,6 +412,19 @@ class ParsingService:
                 {
                     "content_snapshot_id": str(content_snapshot.id),
                     "mime_type": content_snapshot.mime_type,
+                    "content_type": parsed_content.metadata.get(
+                        "content_type",
+                        content_snapshot.mime_type,
+                    ),
+                    "source_format": parsed_content.metadata.get(
+                        "parser_kind",
+                        parsed_content.source_type,
+                    ),
+                    "parser_status": parsed_content.metadata.get("parser_status", "success"),
+                    "parser_kind": parsed_content.metadata.get("parser_kind"),
+                    "parser_warnings": parsed_content.metadata.get("parser_warnings", []),
+                    "parser_failure_reason": None,
+                    "mime_policy": parsed_content.metadata.get("mime_policy", {}),
                     "extractor": parsed_content.metadata.get("extractor"),
                     "extractor_strategy_used": parsed_content.metadata.get(
                         "extractor_strategy_used"
@@ -424,16 +446,31 @@ class ParsingService:
                     ),
                     "source_quality_score": source_quality.score,
                     "source_quality_reason": source_quality.reason,
+                    "source_quality_reasons": list(source_quality.reasons),
+                    "source_quality": {
+                        "final_score": source_quality.score,
+                        "authority_score": source_quality.authority_score,
+                        "relevance_score": source_quality.relevance_score,
+                        "crawlability_score": source_quality.crawlability_score,
+                        "information_density_score": source_quality.information_density_score,
+                        "freshness_score": source_quality.freshness_score,
+                        "freshness_state": source_quality.freshness_state,
+                        "safety_score": source_quality.safety_score,
+                        "reason": source_quality.reason,
+                        "reasons": list(source_quality.reasons),
+                    },
                     "content_quality": chunk_quality.content_quality,
                     "content_quality_score": chunk_quality.content_quality_score,
                     "query_relevance_score": chunk_quality.query_relevance_score,
                     "boilerplate_score": chunk_quality.boilerplate_score,
+                    "information_density_score": chunk_quality.information_density_score,
                     "eligible_for_claims": chunk_quality.eligible_for_claims,
                     "should_generate_claims": chunk_quality.eligible_for_claims,
                     "is_navigation_noise": chunk_quality.is_navigation_noise,
                     "is_reference_section": chunk_quality.is_reference_section,
                     "is_diagram_or_config_section": chunk_quality.is_diagram_or_config_section,
                     "quality_reasons": chunk_quality.reasons,
+                    **locator_metadata,
                 }
             )
             if parsed_content.metadata.get("reason") == "redirect_stub":
@@ -513,6 +550,27 @@ def parse_entry_diagnostic(entry: ParseLedgerEntry) -> dict[str, object]:
             entry.source_document,
             "content_quality_score",
         ),
+        "source_format": _first_chunk_metadata(entry.source_document, "source_format"),
+        "parser_status": _first_chunk_metadata(entry.source_document, "parser_status"),
+        "parser_kind": _first_chunk_metadata(entry.source_document, "parser_kind"),
+        "parser_warnings": _first_chunk_metadata(entry.source_document, "parser_warnings"),
+        "parser_failure_reason": _first_chunk_metadata(
+            entry.source_document,
+            "parser_failure_reason",
+        ),
+        "mime_policy": _first_chunk_metadata(entry.source_document, "mime_policy"),
+        "page_range": _first_chunk_metadata(entry.source_document, "page_range"),
+        "page_locator_reliable": _first_chunk_metadata(
+            entry.source_document,
+            "page_locator_reliable",
+        ),
+        "locator_fallback_reason": _first_chunk_metadata(
+            entry.source_document,
+            "locator_fallback_reason",
+        ),
+        "slide_range": _first_chunk_metadata(entry.source_document, "slide_range"),
+        "sheet_names": _first_chunk_metadata(entry.source_document, "sheet_names"),
+        "cell_ranges": _first_chunk_metadata(entry.source_document, "cell_ranges"),
         "extractor_strategy_used": _first_chunk_metadata(
             entry.source_document,
             "extractor_strategy_used",
@@ -576,3 +634,90 @@ def _first_chunk_metadata(
     if source_document is None or not source_document.chunks:
         return None
     return source_document.chunks[0].metadata_json.get(key)
+
+
+def _structure_locator_metadata(
+    parsed_metadata: dict[str, object],
+    *,
+    start_offset: int,
+    end_offset: int,
+) -> dict[str, object]:
+    raw_segments = parsed_metadata.get("structure_segments")
+    if not isinstance(raw_segments, list):
+        return {}
+
+    locators: list[dict[str, object]] = []
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            continue
+        segment_start = _int_or_none(raw_segment.get("start_offset"))
+        segment_end = _int_or_none(raw_segment.get("end_offset"))
+        if segment_start is None or segment_end is None:
+            continue
+        if segment_end < start_offset or segment_start > end_offset:
+            continue
+        locators.append(
+            {
+                key: value
+                for key, value in raw_segment.items()
+                if key not in {"start_offset", "end_offset"} and value is not None
+            }
+        )
+
+    if not locators:
+        return {}
+
+    page_numbers = sorted(
+        page_number
+        for locator in locators
+        if isinstance(page_number := locator.get("page_number"), int)
+    )
+    slide_numbers = sorted(
+        slide_number
+        for locator in locators
+        if isinstance(slide_number := locator.get("slide_number"), int)
+    )
+    sheet_names = [
+        str(locator["sheet_name"])
+        for locator in locators
+        if isinstance(locator.get("sheet_name"), str)
+    ]
+    cell_ranges = [
+        str(locator["cell_range"])
+        for locator in locators
+        if isinstance(locator.get("cell_range"), str)
+    ]
+    paragraph_numbers = sorted(
+        paragraph_no
+        for locator in locators
+        if isinstance(paragraph_no := locator.get("paragraph_no"), int)
+    )
+    fallback_reasons = [
+        str(locator["locator_fallback_reason"])
+        for locator in locators
+        if isinstance(locator.get("locator_fallback_reason"), str)
+    ]
+
+    metadata: dict[str, object] = {"format_locators": locators}
+    if page_numbers:
+        metadata["page_range"] = [page_numbers[0], page_numbers[-1]]
+        metadata["page_locator_reliable"] = True
+    elif any(locator.get("page_locator_reliable") is False for locator in locators):
+        metadata["page_locator_reliable"] = False
+    if slide_numbers:
+        metadata["slide_range"] = [slide_numbers[0], slide_numbers[-1]]
+    if sheet_names:
+        metadata["sheet_names"] = list(dict.fromkeys(sheet_names))
+    if cell_ranges:
+        metadata["cell_ranges"] = cell_ranges
+    if paragraph_numbers:
+        metadata["paragraph_range"] = [paragraph_numbers[0], paragraph_numbers[-1]]
+    if fallback_reasons:
+        metadata["locator_fallback_reason"] = fallback_reasons[0]
+    return metadata
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    return None

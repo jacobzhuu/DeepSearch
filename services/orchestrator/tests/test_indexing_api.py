@@ -127,6 +127,9 @@ def test_indexing_endpoints_index_list_and_retrieve(session_factory: sessionmake
         assert retrieval_response.status_code == 200
         assert retrieval_response.json()["total"] == 1
         assert retrieval_response.json()["hits"][0]["score"] == 1.0
+        diagnostics = retrieval_response.json()["hits"][0]["metadata"]["retrieval_diagnostics"]
+        assert diagnostics["method"] == "deterministic_lexical_quality_rerank_v1"
+        assert "rerank_score" in diagnostics["components"]
     finally:
         client_generator.close()
 

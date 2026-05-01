@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from services.orchestrator.app.acquisition.http_client import HttpAcquisitionClient, HttpFetchResult
@@ -9,9 +8,16 @@ from services.orchestrator.app.acquisition.http_client import HttpAcquisitionCli
 SMOKE_FIXTURE_HOST = "deepsearch-smoke.local"
 
 
-@dataclass(frozen=True)
 class SmokeAcquisitionClient(HttpAcquisitionClient):
     """Network-free acquisition client for explicitly configured development smoke runs."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            timeout_seconds=0.0,
+            max_redirects=0,
+            max_response_bytes=1_048_576,
+            user_agent="deepresearch-smoke-acquisition/0.1",
+        )
 
     def fetch(self, url: str) -> HttpFetchResult:
         parsed = urlsplit(url)

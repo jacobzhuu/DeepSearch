@@ -44,6 +44,7 @@ def test_report_endpoints_generate_and_return_latest_markdown(
         assert generate_response.json()["reused_existing"] is False
         assert generate_response.json()["supported_claims"] == 1
         assert generate_response.json()["mixed_claims"] == 1
+        assert generate_response.json()["contradicted_claims"] == 0
         assert generate_response.json()["unsupported_claims"] == 1
         assert "## Executive Summary" in generate_response.json()["markdown"]
         assert "[UNSUPPORTED]: The unsupported claim currently lacks support evidence." in (
@@ -58,6 +59,7 @@ def test_report_endpoints_generate_and_return_latest_markdown(
         assert get_response.json()["markdown"] == generate_response.json()["markdown"]
         assert "supported_claims" not in get_response.json()
         assert "mixed_claims" not in get_response.json()
+        assert "contradicted_claims" not in get_response.json()
         assert "unsupported_claims" not in get_response.json()
         assert "draft_claims" not in get_response.json()
     finally:

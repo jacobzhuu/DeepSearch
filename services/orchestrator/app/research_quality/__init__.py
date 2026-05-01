@@ -33,6 +33,11 @@ from services.orchestrator.app.research_quality.source_intent import (
     source_intent_metadata,
     source_intent_priority,
 )
+from services.orchestrator.app.research_quality.source_judge import (
+    SOURCE_JUDGE_PROMPT_VERSION,
+    SourceJudgeResult,
+    SourceJudgeService,
+)
 
 __all__ = [
     "AnswerSlot",
@@ -45,6 +50,9 @@ __all__ = [
     "QUALITY_DIAGNOSTIC_FIELDS",
     "SlotCoverageSummary",
     "SourceIntentClassification",
+    "SOURCE_JUDGE_PROMPT_VERSION",
+    "SourceJudgeResult",
+    "SourceJudgeService",
     "SourceYieldSummary",
     "SupplementalSearchQuery",
     "analyze_required_slot_gaps",

@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from packages.db.repositories import ResearchTaskRepository, TaskEventRepository
-from services.orchestrator.app.acquisition import HttpFetchResult
+from services.orchestrator.app.acquisition import HttpAcquisitionClient, HttpFetchResult
 from services.orchestrator.app.api.routes.acquisition import (
     get_http_acquisition_client,
     get_snapshot_object_store,
@@ -31,12 +31,21 @@ from services.orchestrator.app.search import (
     SearchResponse,
     SearchResultItem,
 )
-from services.orchestrator.app.settings import get_settings
+from services.orchestrator.app.services.debug_pipeline import (
+    DebugPipelineInterrupted,
+    collect_debug_pipeline_counts,
+)
+from services.orchestrator.app.services.pipeline_runtime import create_pipeline_runner
+from services.orchestrator.app.services.pipeline_worker import ResearchPipelineWorker
+from services.orchestrator.app.services.research_tasks import create_research_task_service
+from services.orchestrator.app.settings import Settings, get_settings
 from services.orchestrator.app.storage import FilesystemSnapshotObjectStore
 
 
 @pytest.fixture(autouse=True)
-def _disable_planner_for_baseline_pipeline_tests(monkeypatch: pytest.MonkeyPatch):
+def _disable_planner_for_baseline_pipeline_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[None, None, None]:
     monkeypatch.setenv("LLM_ENABLED", "false")
     monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "false")
     get_settings.cache_clear()
@@ -233,7 +242,15 @@ class MainSearchUnresponsiveProvider:
         )
 
 
-class FakeHttpAcquisitionClient:
+class FakeHttpAcquisitionClient(HttpAcquisitionClient):
+    def __init__(self) -> None:
+        super().__init__(
+            timeout_seconds=1.0,
+            max_redirects=0,
+            max_response_bytes=1_048_576,
+            user_agent="deepsearch-tests/1.0",
+        )
+
     def fetch(self, url: str) -> HttpFetchResult:
         body = f"""
         <html>
@@ -583,6 +600,118 @@ def test_pipeline_run_endpoint_queues_task_for_worker(
             session.commit()
     finally:
         client_generator.close()
+
+
+def test_run_endpoint_queue_is_consumed_by_host_local_worker(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    index_backend = InMemoryChunkIndexBackend()
+    client_generator = _build_client(session_factory, tmp_path, index_backend)
+    client = next(client_generator)
+    worker_object_store = FilesystemSnapshotObjectStore(
+        root_directory=str(tmp_path / "worker-objects")
+    )
+    worker_object_store.validate_configuration()
+    worker_settings = Settings(
+        search_provider="smoke",
+        index_backend="local",
+        snapshot_storage_backend="filesystem",
+        snapshot_storage_root=str(tmp_path / "worker-objects"),
+    )
+    try:
+        create_response = client.post(
+            "/api/v1/research/tasks",
+            json={"query": "Can the host-local worker finish the queued DeepSearch loop?"},
+        )
+        task_id = create_response.json()["task_id"]
+        queue_response = client.post(f"/api/v1/research/tasks/{task_id}/run")
+
+        worker = ResearchPipelineWorker(
+            session_factory=session_factory,
+            settings=worker_settings,
+            runner_factory=lambda session: create_pipeline_runner(
+                session,
+                settings=worker_settings,
+                search_provider=FakeSearchProvider(),
+                http_client=FakeHttpAcquisitionClient(),
+                snapshot_object_store=worker_object_store,
+                index_backend=index_backend,
+            ),
+        )
+        processed = worker.run_once()
+
+        detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+        events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
+        with session_factory() as session:
+            counts = collect_debug_pipeline_counts(session, UUID(task_id))
+
+        assert queue_response.status_code == 200
+        assert queue_response.json()["status"] == "QUEUED"
+        assert processed == 1
+        assert detail_response.status_code == 200
+        assert detail_response.json()["status"] == "COMPLETED"
+        assert counts.source_documents > 0
+        assert counts.source_chunks > 0
+        assert counts.claims > 0
+        assert counts.claim_evidence > 0
+        assert counts.report_artifacts > 0
+        event_types = [event["event_type"] for event in events_response.json()["events"]]
+        assert "pipeline.queued" in event_types
+        assert "pipeline.started" in event_types
+        assert "pipeline.completed" in event_types
+    finally:
+        client_generator.close()
+
+
+def test_pipeline_boundary_refreshes_external_pause_before_next_stage(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    index_backend = InMemoryChunkIndexBackend()
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    settings = Settings(
+        search_provider="smoke",
+        index_backend="local",
+        snapshot_storage_backend="filesystem",
+        snapshot_storage_root=str(tmp_path / "objects"),
+    )
+
+    with session_factory() as session:
+        service = create_research_task_service(session)
+        task = service.create_task(query="Pause should be observed between stages", constraints={})
+        ResearchTaskRepository(session).set_status(task, "SEARCHING", ended_at=None)
+        session.commit()
+        task_id = task.id
+
+    with session_factory() as runner_session:
+        runner = create_pipeline_runner(
+            runner_session,
+            settings=settings,
+            search_provider=FakeSearchProvider(),
+            http_client=FakeHttpAcquisitionClient(),
+            snapshot_object_store=object_store,
+            index_backend=index_backend,
+        )
+        cached_task = ResearchTaskRepository(runner_session).get(task_id)
+        assert cached_task is not None
+        assert cached_task.status == "SEARCHING"
+
+        with session_factory() as control_session:
+            control_task = ResearchTaskRepository(control_session).get(task_id)
+            assert control_task is not None
+            ResearchTaskRepository(control_session).set_status(
+                control_task,
+                "PAUSED",
+                ended_at=None,
+            )
+            control_session.commit()
+
+        with pytest.raises(DebugPipelineInterrupted) as interrupted:
+            runner._ensure_task_can_continue(task_id)
+
+        assert interrupted.value.status == "PAUSED"
 
 
 def test_task_detail_observability_defaults_for_legacy_pipeline_events(
@@ -968,7 +1097,7 @@ def test_pipeline_claim_drafting_failure_includes_candidate_diagnostics(
 def test_pipeline_planner_disabled_records_no_research_plan_event(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_ENABLED", "false")
     monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "false")
@@ -1001,7 +1130,7 @@ def test_pipeline_planner_disabled_records_no_research_plan_event(
 def test_pipeline_reuses_pre_run_research_plan_when_planner_disabled(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_ENABLED", "false")
     monkeypatch.setenv("RESEARCH_PLANNER_ENABLED", "false")
@@ -1055,7 +1184,7 @@ def test_pipeline_reuses_pre_run_research_plan_when_planner_disabled(
 def test_pipeline_noop_planner_records_plan_and_uses_planner_queries(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_ENABLED", "true")
     monkeypatch.setenv("LLM_PROVIDER", "noop")
@@ -1123,7 +1252,7 @@ def test_pipeline_noop_planner_records_plan_and_uses_planner_queries(
 def test_pipeline_planner_mode_attempts_langgraph_owned_sources_before_generic_articles(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_ENABLED", "true")
     monkeypatch.setenv("LLM_PROVIDER", "noop")
@@ -1166,7 +1295,7 @@ def test_pipeline_planner_mode_attempts_langgraph_owned_sources_before_generic_a
         official_guardrail_urls = [
             "https://docs.langchain.com/oss/python/langgraph/overview",
             "https://docs.langchain.com/oss/javascript/langgraph/overview",
-            "https://reference.langchain.com/python/langgraph/",
+            "https://reference.langchain.com/python/langgraph",
             "https://github.com/langchain-ai/langgraph",
         ]
         assert all(url in attempted_urls for url in official_guardrail_urls)
@@ -1238,7 +1367,7 @@ def test_gap_search_provider_failure_continues_to_reporting_with_existing_eviden
 def test_main_search_unresponsive_uses_langgraph_known_path_fallback_and_continues(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_ENABLED", "true")
     monkeypatch.setenv("LLM_PROVIDER", "noop")
@@ -1286,7 +1415,7 @@ def test_main_search_unresponsive_uses_langgraph_known_path_fallback_and_continu
         attempted_sources = observability["attempted_sources"]
         attempted_urls = [source["canonical_url"] for source in attempted_sources]
         assert "https://docs.langchain.com/oss/python/langgraph/overview" in attempted_urls
-        assert "https://reference.langchain.com/python/langgraph/" in attempted_urls
+        assert "https://reference.langchain.com/python/langgraph" in attempted_urls
         assert "https://github.com/langchain-ai/langgraph" in attempted_urls
         assert all(
             source.get("candidate_source") == "known_path_fallback" for source in attempted_sources
@@ -1361,7 +1490,7 @@ def test_main_search_unresponsive_unknown_entity_still_fails_with_diagnostics(
 def test_pipeline_llm_planner_failure_falls_back_to_deterministic_plan(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_ENABLED", "true")
     monkeypatch.setenv("LLM_PROVIDER", "openai-compatible")

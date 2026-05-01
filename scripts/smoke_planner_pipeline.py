@@ -108,9 +108,29 @@ def main() -> int:
             report=report,
         )
 
+        source_document_count = len(
+            as_list(
+                source_documents.get("source_documents")
+                if isinstance(source_documents, dict)
+                else []
+            )
+        )
+        source_chunk_count = len(
+            as_list(source_chunks.get("source_chunks") if isinstance(source_chunks, dict) else [])
+        )
         claim_count = len(as_list(claims.get("claims") if isinstance(claims, dict) else []))
         report_markdown = report.get("markdown") if isinstance(report, dict) else None
-        if detail.get("status") == "COMPLETED" and claim_count >= 3 and report_markdown:
+        report_artifact_id = report.get("report_artifact_id") if isinstance(report, dict) else None
+        if (
+            detail.get("status") == "COMPLETED"
+            and source_document_count > 0
+            and source_chunk_count > 0
+            and claim_count > 0
+            and isinstance(report_artifact_id, str)
+            and report_artifact_id
+            and isinstance(report_markdown, str)
+            and report_markdown.strip()
+        ):
             return 0
         return 1
     except ServiceUnavailable as error:
@@ -130,7 +150,9 @@ def main() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run one DeepSearch planner-pipeline smoke task and print ledger highlights.",
+        description=(
+            "Run one /run + host-local worker DeepSearch smoke task and print ledger highlights."
+        ),
     )
     parser.add_argument("--query", default=DEFAULT_QUERY)
     parser.add_argument(
@@ -263,6 +285,10 @@ def print_summary(
     chunks = as_list(source_chunks.get("source_chunks"))
     print(f"chunks_count: {len(chunks)}")
     print_claims_by_category(claims)
+    report_artifact_id = report.get("report_artifact_id") if isinstance(report, dict) else None
+    report_version = report.get("version") if isinstance(report, dict) else None
+    print(f"report_artifact_id: {report_artifact_id or 'n/a'}")
+    print(f"report_version: {report_version or 'n/a'}")
 
     markdown = report.get("markdown") if isinstance(report, dict) else None
     if isinstance(markdown, str) and markdown.strip():

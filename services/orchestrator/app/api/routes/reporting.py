@@ -91,6 +91,7 @@ def generate_task_report(
         llm_writer_status=result.llm_writer_status,
         supported_claims=result.supported_claims,
         mixed_claims=result.mixed_claims,
+        contradicted_claims=result.contradicted_claims,
         unsupported_claims=result.unsupported_claims,
         draft_claims=result.draft_claims,
         markdown=result.markdown,

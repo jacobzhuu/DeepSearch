@@ -70,6 +70,9 @@ def create_pipeline_runner(
     llm_report_provider = (
         create_llm_provider(settings) if llm_report_writer_configured(settings) else None
     )
+    llm_source_judge_provider = (
+        create_llm_provider(settings) if llm_source_judge_configured(settings) else None
+    )
     return DebugRealPipelineRunner(
         session,
         search_service=create_acquisition_search_service(
@@ -120,6 +123,10 @@ def create_pipeline_runner(
             llm_report_max_output_tokens=settings.llm_report_max_output_tokens,
         ),
         planner_service=create_research_planner_service(settings),
+        source_judge_service=create_source_judge_service(
+            settings,
+            provider=llm_source_judge_provider,
+        ),
         dependencies=dependencies,
         fetch_limit=settings.acquisition_max_candidates_per_request,
         parse_limit=3,
@@ -182,6 +189,10 @@ def pipeline_dependency_summary(settings: Settings) -> dict[str, Any]:
             settings.research_planner_enabled and settings.llm_enabled
         ),
         "llm_report_writer_enabled": llm_report_writer_configured(settings),
+        "llm_source_judge_enabled": llm_source_judge_configured(settings),
+        "llm_source_judge_active_rerank": bool(
+            settings.llm_source_judge_active_rerank and llm_source_judge_configured(settings)
+        ),
         "report_writer_mode": (
             "llm-grounded" if llm_report_writer_configured(settings) else "deterministic"
         ),
@@ -277,7 +288,11 @@ def uses_llm_api(settings: Settings) -> bool:
     return bool(
         settings.llm_enabled
         and settings.llm_provider.strip().lower() not in {"", "noop"}
-        and (settings.research_planner_enabled or settings.llm_report_writer_enabled)
+        and (
+            settings.research_planner_enabled
+            or settings.llm_report_writer_enabled
+            or settings.llm_source_judge_enabled
+        )
     )
 
 
@@ -286,6 +301,22 @@ def llm_report_writer_configured(settings: Settings) -> bool:
         settings.llm_enabled
         and settings.llm_report_writer_enabled
         and settings.llm_provider.strip().lower() not in {"", "noop"}
+    )
+
+
+def llm_source_judge_configured(settings: Settings) -> bool:
+    return bool(settings.llm_enabled and settings.llm_source_judge_enabled)
+
+
+def create_source_judge_service(settings: Settings, *, provider: Any) -> Any:
+    from services.orchestrator.app.research_quality import SourceJudgeService
+
+    return SourceJudgeService(
+        enabled=llm_source_judge_configured(settings),
+        active_rerank=False,
+        provider=provider,
+        model=settings.llm_model,
+        max_candidates=settings.llm_source_judge_max_candidates,
     )
 
 

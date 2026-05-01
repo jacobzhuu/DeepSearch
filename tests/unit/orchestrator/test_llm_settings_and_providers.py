@@ -16,8 +16,12 @@ from services.orchestrator.app.llm import (
 from services.orchestrator.app.settings import Settings
 
 
+def _settings(**values: object) -> Settings:
+    return Settings.model_validate(values)
+
+
 def test_llm_settings_default_to_no_llm_planner_disabled() -> None:
-    settings = Settings(_env_file=None)
+    settings = _settings()
 
     assert settings.llm_enabled is False
     assert settings.llm_provider == "noop"
@@ -25,7 +29,7 @@ def test_llm_settings_default_to_no_llm_planner_disabled() -> None:
 
 
 def test_llm_api_key_is_not_in_repr_or_safe_summary() -> None:
-    settings = Settings(_env_file=None, LLM_API_KEY="test-api-key")
+    settings = _settings(LLM_API_KEY="test-api-key")
 
     assert "test-api-key" not in repr(settings)
     assert "test-api-key" not in str(settings.llm_safe_summary())
@@ -51,9 +55,7 @@ def test_noop_llm_provider_returns_deterministic_planner_response() -> None:
 
 
 def test_unsupported_llm_provider_returns_structured_error() -> None:
-    provider = create_llm_provider(
-        Settings(_env_file=None, LLM_ENABLED=True, LLM_PROVIDER="unsupported-test")
-    )
+    provider = create_llm_provider(_settings(LLM_ENABLED=True, LLM_PROVIDER="unsupported-test"))
 
     with pytest.raises(LLMError) as exc_info:
         provider.generate(

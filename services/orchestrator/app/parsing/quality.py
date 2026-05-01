@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+", re.UNICODE)
@@ -116,6 +117,14 @@ _SOCIAL_VIDEO_FORUM_DOMAINS = (
 class SourceQuality:
     score: float
     reason: str
+    authority_score: float
+    relevance_score: float
+    crawlability_score: float
+    information_density_score: float
+    freshness_score: float | None
+    safety_score: float
+    freshness_state: str
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -123,6 +132,7 @@ class ChunkQuality:
     content_quality_score: float
     query_relevance_score: float
     boilerplate_score: float
+    information_density_score: float
     eligible_for_claims: bool
     is_navigation_noise: bool
     is_reference_section: bool
@@ -139,35 +149,103 @@ def assess_source_quality(
 ) -> SourceQuality:
     metadata = parsed_metadata or {}
     if metadata.get("reason") == "redirect_stub":
-        return SourceQuality(score=0.1, reason="redirect_stub")
+        return SourceQuality(
+            score=0.1,
+            reason="redirect_stub",
+            authority_score=0.1,
+            relevance_score=0.1,
+            crawlability_score=0.1,
+            information_density_score=0.1,
+            freshness_score=None,
+            safety_score=0.2,
+            freshness_state="unknown",
+            reasons=("redirect_stub", "freshness_unknown"),
+        )
 
     source_category = str(metadata.get("source_category") or "")
-    if source_category in {"official_about", "official_docs_reference"}:
-        return SourceQuality(score=0.95, reason="official_docs")
-    if source_category == "official_home":
-        return SourceQuality(score=0.72, reason="project_homepage")
-    if source_category == "github_readme_or_repo":
-        return SourceQuality(score=0.72, reason="official_github_repository")
-    if source_category == "secondary_reference":
-        return SourceQuality(score=0.55, reason="secondary_reference")
-    if source_category == "low_quality_or_blocked":
-        return SourceQuality(score=0.1, reason="low_quality_or_blocked")
-
     normalized_domain = domain.strip().lower().removeprefix("www.")
     path = urlsplit(canonical_url).path.strip().lower()
+    authority_score, primary_reason = _authority_score(
+        normalized_domain=normalized_domain,
+        path=path,
+        source_category=source_category,
+    )
+    relevance_score = _source_relevance_score(
+        normalized_domain=normalized_domain,
+        path=path,
+        source_category=source_category,
+    )
+    crawlability_score = _crawlability_score(metadata)
+    information_density_score = _source_information_density_score(metadata)
+    freshness_score, freshness_state = _freshness_score(metadata)
+    safety_score = _source_safety_score(normalized_domain, source_category=source_category)
+    freshness_component = 0.5 if freshness_score is None else freshness_score
+    final_score = (
+        (authority_score * 0.32)
+        + (relevance_score * 0.22)
+        + (crawlability_score * 0.18)
+        + (information_density_score * 0.16)
+        + (safety_score * 0.08)
+        + (freshness_component * 0.04)
+    )
+    if primary_reason == "official_docs":
+        final_score = max(final_score, 0.9)
+    elif primary_reason in {"project_homepage", "official_github_repository"}:
+        final_score = max(final_score, 0.66)
+    final_score = round(min(0.98, max(0.05, final_score)), 2)
+    reasons = [
+        primary_reason,
+        f"authority:{authority_score:.2f}",
+        f"relevance:{relevance_score:.2f}",
+        f"crawlability:{crawlability_score:.2f}",
+        f"information_density:{information_density_score:.2f}",
+        f"safety:{safety_score:.2f}",
+        f"freshness:{freshness_state}",
+    ]
+    return SourceQuality(
+        score=final_score,
+        reason=primary_reason,
+        authority_score=round(authority_score, 2),
+        relevance_score=round(relevance_score, 2),
+        crawlability_score=round(crawlability_score, 2),
+        information_density_score=round(information_density_score, 2),
+        freshness_score=None if freshness_score is None else round(freshness_score, 2),
+        safety_score=round(safety_score, 2),
+        freshness_state=freshness_state,
+        reasons=tuple(reasons),
+    )
+
+
+def _authority_score(
+    *,
+    normalized_domain: str,
+    path: str,
+    source_category: str,
+) -> tuple[float, str]:
+    if source_category in {"official_about", "official_docs_reference"}:
+        return 0.95, "official_docs"
+    if source_category == "official_home":
+        return 0.72, "project_homepage"
+    if source_category == "github_readme_or_repo":
+        return 0.72, "official_github_repository"
+    if source_category == "secondary_reference":
+        return 0.55, "secondary_reference"
+    if source_category == "low_quality_or_blocked":
+        return 0.1, "low_quality_or_blocked"
+
     if normalized_domain.startswith(("docs.", "reference.", "documentation.")) or _is_docs_path(
         path
     ):
-        return SourceQuality(score=0.95, reason="official_docs")
+        return 0.95, "official_docs"
     if normalized_domain.endswith("wikipedia.org"):
-        return SourceQuality(score=0.78, reason="wikipedia_article")
+        return 0.78, "wikipedia_article"
     if _is_project_homepage(normalized_domain, path):
-        return SourceQuality(score=0.72, reason="project_homepage")
+        return 0.72, "project_homepage"
     if normalized_domain == "github.com":
-        return SourceQuality(score=0.45, reason="github_repository_landing_page")
+        return 0.45, "github_repository_landing_page"
     if _is_social_video_or_forum_domain(normalized_domain):
-        return SourceQuality(score=0.2, reason="social_video_or_forum")
-    return SourceQuality(score=0.55, reason="generic_web_page")
+        return 0.2, "social_video_or_forum"
+    return 0.55, "generic_web_page"
 
 
 def assess_chunk_quality(
@@ -190,6 +268,7 @@ def assess_chunk_quality(
     is_diagram_or_config_section = _looks_like_diagram_or_config_section(normalized)
     boilerplate_score = _boilerplate_score(lower)
     query_relevance_score = _query_relevance_score(normalized, query)
+    information_density_score = _chunk_information_density_score(normalized)
     explanatory_score = 0.16 if _contains_explanatory_terms(lower) else 0.0
     paragraph_score = 0.08 if _looks_like_prose(normalized) else 0.0
     length_penalty = 0.22 if len(normalized) < 48 else 0.0
@@ -215,6 +294,7 @@ def assess_chunk_quality(
         0.22
         + (source_quality_score * 0.32)
         + (query_relevance_score * 0.22)
+        + (information_density_score * 0.1)
         + explanatory_score
         + paragraph_score
         - (boilerplate_score * 0.46)
@@ -243,11 +323,16 @@ def assess_chunk_quality(
         quality = "low"
     if not reasons and quality != "low":
         reasons.append("informative_prose")
+    if information_density_score < 0.35:
+        reasons.append("low_information_density")
+    elif information_density_score >= 0.72:
+        reasons.append("dense_informative_text")
 
     return ChunkQuality(
         content_quality_score=score,
         query_relevance_score=round(query_relevance_score, 2),
         boilerplate_score=round(boilerplate_score, 2),
+        information_density_score=round(information_density_score, 2),
         eligible_for_claims=eligible,
         is_navigation_noise=is_navigation_noise,
         is_reference_section=is_reference_section,
@@ -282,6 +367,111 @@ def _boilerplate_score(lower_text: str) -> float:
     )
     score += min(0.45, linkish_terms / token_count)
     return min(1.0, score)
+
+
+def _source_relevance_score(
+    *,
+    normalized_domain: str,
+    path: str,
+    source_category: str,
+) -> float:
+    if source_category in {"official_about", "official_docs_reference"}:
+        return 0.92
+    if source_category in {"official_home", "github_readme_or_repo"}:
+        return 0.78
+    if source_category == "secondary_reference":
+        return 0.58
+    if source_category == "low_quality_or_blocked":
+        return 0.12
+    if normalized_domain.startswith(("docs.", "reference.", "documentation.")) or _is_docs_path(
+        path
+    ):
+        return 0.88
+    if normalized_domain.endswith("wikipedia.org"):
+        return 0.7
+    if normalized_domain == "github.com":
+        return 0.5
+    if _is_social_video_or_forum_domain(normalized_domain):
+        return 0.35
+    return 0.52
+
+
+def _crawlability_score(metadata: dict[str, object]) -> float:
+    if metadata.get("reason") == "redirect_stub":
+        return 0.1
+    extracted_text_length = metadata.get("extracted_text_length")
+    if isinstance(extracted_text_length, int | float) and extracted_text_length <= 0:
+        return 0.2
+    if metadata.get("fallback_used") is True:
+        return 0.62
+    if metadata.get("extractor_strategy_used") or metadata.get("extractor"):
+        return 0.86
+    return 0.72
+
+
+def _source_information_density_score(metadata: dict[str, object]) -> float:
+    extracted_text_length = metadata.get("extracted_text_length")
+    if isinstance(extracted_text_length, int | float):
+        if extracted_text_length >= 4000:
+            return 0.88
+        if extracted_text_length >= 1200:
+            return 0.74
+        if extracted_text_length >= 300:
+            return 0.55
+        if extracted_text_length > 0:
+            return 0.28
+    return 0.5
+
+
+def _source_safety_score(normalized_domain: str, *, source_category: str) -> float:
+    if source_category == "low_quality_or_blocked":
+        return 0.22
+    if _is_social_video_or_forum_domain(normalized_domain):
+        return 0.42
+    return 0.84
+
+
+def _freshness_score(metadata: dict[str, object]) -> tuple[float | None, str]:
+    value = metadata.get("published_at") or metadata.get("publishedDate")
+    published_at = _parse_datetime(value)
+    if published_at is None:
+        return None, "unknown"
+    now = datetime.now(UTC)
+    age_days = max(0, (now - published_at.astimezone(UTC)).days)
+    if age_days <= 90:
+        return 0.95, "recent"
+    if age_days <= 365:
+        return 0.75, "current_year"
+    if age_days <= 1095:
+        return 0.45, "older"
+    return 0.25, "stale"
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _chunk_information_density_score(text: str) -> float:
+    tokens = _tokenize(text)
+    if not tokens:
+        return 0.0
+    token_count = len(tokens)
+    unique_ratio = len(set(tokens)) / token_count
+    length_score = min(token_count / 90, 1.0)
+    sentence_signal = 0.2 if _looks_like_prose(text) else 0.0
+    score = (unique_ratio * 0.42) + (length_score * 0.38) + sentence_signal
+    if _has_high_repetition(text):
+        score -= 0.25
+    return min(1.0, max(0.0, score))
 
 
 def _looks_like_redirect_stub(lower_text: str) -> bool:

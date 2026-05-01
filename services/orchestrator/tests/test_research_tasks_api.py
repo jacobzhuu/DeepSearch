@@ -61,6 +61,36 @@ def test_create_task_and_fetch_detail_and_events(client: TestClient) -> None:
     assert events_response.json()["events"][0]["payload"]["to_status"] == "PLANNED"
 
 
+def test_list_tasks_returns_recent_task_summaries(client: TestClient) -> None:
+    first_response = client.post(
+        "/api/v1/research/tasks",
+        json={"query": "First list task", "constraints": {}},
+    )
+    second_response = client.post(
+        "/api/v1/research/tasks",
+        json={"query": "Second list task", "constraints": {}},
+    )
+
+    list_response = client.get("/api/v1/research/tasks")
+    planned_response = client.get("/api/v1/research/tasks?status=planned&limit=1")
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 201
+    assert list_response.status_code == 200
+    list_payload = list_response.json()
+    assert list_payload["count"] >= 2
+    task_ids = [task["task_id"] for task in list_payload["tasks"]]
+    assert second_response.json()["task_id"] in task_ids
+    assert first_response.json()["task_id"] in task_ids
+    assert list_payload["tasks"][0]["events_total"] == 1
+    assert list_payload["tasks"][0]["latest_event_at"] is not None
+
+    assert planned_response.status_code == 200
+    planned_payload = planned_response.json()
+    assert planned_payload["count"] == 1
+    assert planned_payload["tasks"][0]["status"] == "PLANNED"
+
+
 def test_plan_endpoint_records_visible_pre_run_research_plan(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -75,6 +105,7 @@ def test_plan_endpoint_records_visible_pre_run_research_plan(
     task_id = create_response.json()["task_id"]
 
     plan_response = client.post(f"/api/v1/research/tasks/{task_id}/plan")
+    plan_read_response = client.get(f"/api/v1/research/tasks/{task_id}/plan")
     detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
     events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
 
@@ -87,6 +118,9 @@ def test_plan_endpoint_records_visible_pre_run_research_plan(
     assert plan_payload["research_plan"]["search_queries"]
     assert plan_payload["running_mode"].endswith("+no-LLM")
     assert "No LLM planner is active; deterministic planner used." in plan_payload["warnings"]
+    assert plan_read_response.status_code == 200
+    assert plan_read_response.json()["research_plan"]["intent"] == "definition_how_it_works"
+    assert plan_read_response.json()["planner_status"] == "created"
 
     detail_payload = detail_response.json()
     assert detail_payload["status"] == "PLANNED"

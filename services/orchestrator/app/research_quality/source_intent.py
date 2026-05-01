@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
 _SUBJECT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
@@ -17,7 +18,15 @@ _SUBJECT_SENSITIVE_SOURCE_CATEGORIES = frozenset(
         "github_readme_or_repo",
     }
 )
-_PROJECT_OWNERSHIP = {
+
+
+class _ProjectOwnershipProfile(TypedDict):
+    owned_domains: tuple[str, ...]
+    github_repos: tuple[tuple[str, str], ...]
+    secondary_domains: tuple[str, ...]
+
+
+_PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
     "langgraph": {
         "owned_domains": ("langchain.com",),
         "github_repos": (("langchain-ai", "langgraph"),),
@@ -74,7 +83,7 @@ class SourceIntentClassification:
     source_selection_guardrail_applied: bool
     known_path_candidate: bool
 
-    def to_metadata(self) -> dict[str, object]:
+    def to_metadata(self) -> dict[str, Any]:
         return {
             "fetch_priority_score": self.fetch_priority_score,
             "fetch_priority_reason": self.fetch_priority_reason,
@@ -159,7 +168,7 @@ def source_intent_metadata(
     title: str | None,
     query: str | None = None,
     known_path_candidate: bool = False,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     return classify_source_intent(
         canonical_url=canonical_url,
         domain=domain,
@@ -655,7 +664,7 @@ def _domain_matches_subject(domain: str, subject_terms: tuple[str, ...]) -> bool
     return any(term in compact_domain for term in subject_terms)
 
 
-def _project_profile(subject_terms: tuple[str, ...]) -> dict[str, object] | None:
+def _project_profile(subject_terms: tuple[str, ...]) -> _ProjectOwnershipProfile | None:
     for term in subject_terms:
         profile = _PROJECT_OWNERSHIP.get(term)
         if profile is not None:
@@ -663,10 +672,8 @@ def _project_profile(subject_terms: tuple[str, ...]) -> dict[str, object] | None
     return None
 
 
-def _domain_matches_owned_profile(domain: str, profile: dict[str, object]) -> bool:
-    owned_domains = profile.get("owned_domains")
-    if not isinstance(owned_domains, tuple):
-        return False
+def _domain_matches_owned_profile(domain: str, profile: _ProjectOwnershipProfile) -> bool:
+    owned_domains = profile["owned_domains"]
     return any(domain == item or domain.endswith(f".{item}") for item in owned_domains)
 
 
@@ -677,9 +684,7 @@ def _is_secondary_project_reference_domain(
     profile = _project_profile(subject_terms)
     if profile is None:
         return False
-    secondary_domains = profile.get("secondary_domains")
-    if not isinstance(secondary_domains, tuple):
-        return False
+    secondary_domains = profile["secondary_domains"]
     return any(domain == item or domain.endswith(f".{item}") for item in secondary_domains)
 
 
@@ -691,9 +696,7 @@ def _is_official_github_project_path(
     profile = _project_profile(subject_terms)
     if profile is None:
         return False
-    github_repos = profile.get("github_repos")
-    if not isinstance(github_repos, tuple):
-        return False
+    github_repos = profile["github_repos"]
     owner_repo = _github_owner_repo(path)
     if owner_repo is None:
         return False

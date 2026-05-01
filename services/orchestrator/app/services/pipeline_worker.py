@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from packages.db.repositories import ResearchTaskRepository, TaskEventRepository
 from packages.observability import get_logger
 from services.orchestrator.app.db import get_session_factory
-from services.orchestrator.app.services.debug_pipeline import STATUS_FAILED, DebugRealPipelineRunner
+from services.orchestrator.app.services.debug_pipeline import STATUS_FAILED
 from services.orchestrator.app.services.pipeline_runtime import (
     PipelineConfigurationError,
     create_pipeline_runner,
@@ -32,7 +32,11 @@ RECOVERABLE_WORKER_STATUSES = tuple(
 )
 
 
-RunnerFactory = Callable[[Session], DebugRealPipelineRunner]
+class PipelineRunner(Protocol):
+    def run(self, task_id: UUID) -> Any: ...
+
+
+RunnerFactory = Callable[[Session], PipelineRunner]
 
 
 class ResearchPipelineWorker:

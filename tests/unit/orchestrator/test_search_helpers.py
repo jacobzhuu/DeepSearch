@@ -15,13 +15,24 @@ from services.orchestrator.app.search import (
 from services.orchestrator.app.search import providers as provider_module
 
 
-def test_canonicalize_url_normalizes_and_preserves_non_root_trailing_slash() -> None:
+def test_canonicalize_url_normalizes_tracking_and_trailing_slash() -> None:
     canonical = canonicalize_url(" HTTPS://Exämple.com:443/a/../b/?utm_source=x&b=2&a=1#frag ")
 
     assert canonical is not None
     assert canonical.original_url == "HTTPS://Exämple.com:443/a/../b/?utm_source=x&b=2&a=1#frag"
     assert canonical.domain == "xn--exmple-cua.com"
-    assert canonical.canonical_url == "https://xn--exmple-cua.com/b/?a=1&b=2"
+    assert canonical.canonical_url == "https://xn--exmple-cua.com/b?a=1&b=2"
+
+
+def test_canonicalize_url_unwraps_known_redirect_urls() -> None:
+    canonical = canonicalize_url(
+        "https://www.google.com/url?q=https%3A%2F%2FExample.com%2Fdocs%2F%3Futm_medium%3Dx"
+    )
+
+    assert canonical is not None
+    assert canonical.original_url.startswith("https://www.google.com/url")
+    assert canonical.domain == "example.com"
+    assert canonical.canonical_url == "https://example.com/docs"
 
 
 def test_is_domain_allowed_applies_allow_and_deny_lists_to_subdomains() -> None:

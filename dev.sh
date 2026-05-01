@@ -12,10 +12,12 @@ ENV_FILE="${DEV_ENV_FILE:-$PROJECT_ROOT/.env}"
 BACKEND_PID_FILE="$RUN_DIR/backend.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
 MOCK_SEARCH_PID_FILE="$RUN_DIR/mock-searxng.pid"
+WORKER_PID_FILE="$RUN_DIR/worker.pid"
 
 BACKEND_LOG="$LOG_DIR/backend.log"
 FRONTEND_LOG="$LOG_DIR/frontend.log"
 MOCK_SEARCH_LOG="$LOG_DIR/mock-searxng.log"
+WORKER_LOG="$LOG_DIR/worker.log"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -361,6 +363,7 @@ stop_process_gracefully() {
 stop_services() {
     stop_process_gracefully "$FRONTEND_PID_FILE" "Frontend" "vite|node|npm"
     stop_process_gracefully "$BACKEND_PID_FILE" "Backend" "uvicorn|services\.orchestrator\.app\.main:app"
+    stop_process_gracefully "$WORKER_PID_FILE" "Worker" "research_worker\.py"
     stop_process_gracefully "$MOCK_SEARCH_PID_FILE" "Mock SearXNG" "mock_searxng\.py"
 }
 

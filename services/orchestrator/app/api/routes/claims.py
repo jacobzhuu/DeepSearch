@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated
 from uuid import UUID
 
@@ -166,6 +167,7 @@ def list_task_claims(
                 confidence=entry.claim.confidence,
                 verification_status=entry.claim.verification_status,
                 support_evidence_count=entry.support_evidence_count,
+                weak_support_evidence_count=entry.weak_support_evidence_count,
                 contradict_evidence_count=entry.contradict_evidence_count,
                 rationale=entry.rationale,
                 notes=entry.claim.notes_json,
@@ -193,6 +195,7 @@ def list_task_claim_evidence(
     except TaskNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
+    evidence_metadata = _evidence_metadata_by_id(claim_evidence)
     return ClaimEvidenceListResponse(
         task_id=task_id,
         claim_evidence=[
@@ -205,6 +208,31 @@ def list_task_claim_evidence(
                 statement=evidence.claim.statement,
                 relation_type=evidence.relation_type,
                 score=evidence.score,
+                relation_detail=_metadata_str(
+                    evidence_metadata.get(str(evidence.id), {}),
+                    "relation_detail",
+                ),
+                support_level=_metadata_str(
+                    evidence_metadata.get(str(evidence.id), {}),
+                    "support_level",
+                ),
+                verifier_method=_metadata_str(
+                    evidence_metadata.get(str(evidence.id), {}),
+                    "verifier_method",
+                ),
+                reasons=_metadata_str_list(
+                    evidence_metadata.get(str(evidence.id), {}),
+                    "reasons",
+                ),
+                citation_precision=_metadata_str(
+                    evidence_metadata.get(str(evidence.id), {}),
+                    "citation_precision",
+                ),
+                citation_precision_reason=_metadata_str(
+                    evidence_metadata.get(str(evidence.id), {}),
+                    "citation_precision_reason",
+                ),
+                quality=_evidence_quality_payload(evidence_metadata.get(str(evidence.id), {})),
                 start_offset=evidence.citation_span.start_offset,
                 end_offset=evidence.citation_span.end_offset,
                 excerpt=evidence.citation_span.excerpt,
@@ -258,6 +286,7 @@ def verify_task_claims(
                 confidence=entry.claim.confidence,
                 verification_status=entry.claim.verification_status,
                 support_evidence_count=entry.support_evidence_count,
+                weak_support_evidence_count=entry.weak_support_evidence_count,
                 contradict_evidence_count=entry.contradict_evidence_count,
                 rationale=entry.rationale,
                 notes=entry.claim.notes_json,
@@ -265,3 +294,57 @@ def verify_task_claims(
             for entry in result.entries
         ],
     )
+
+
+def _evidence_metadata_by_id(claim_evidence: Sequence[object]) -> dict[str, dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    for evidence in claim_evidence:
+        claim = getattr(evidence, "claim", None)
+        notes = getattr(claim, "notes_json", {}) or {}
+        verification = notes.get("verification") if isinstance(notes, dict) else {}
+        if not isinstance(verification, dict):
+            continue
+        relations = verification.get("evidence_relations")
+        if not isinstance(relations, list):
+            continue
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+            claim_evidence_id = relation.get("claim_evidence_id")
+            if isinstance(claim_evidence_id, str) and claim_evidence_id.strip():
+                rows[claim_evidence_id] = relation
+    return rows
+
+
+def _metadata_str(metadata: dict[str, object], key: str) -> str | None:
+    value = metadata.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _metadata_str_list(metadata: dict[str, object], key: str) -> list[str]:
+    value = metadata.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _evidence_quality_payload(metadata: dict[str, object]) -> dict[str, object]:
+    keys = (
+        "evidence_rank_score",
+        "diversity_adjusted_score",
+        "reuse_penalty",
+        "chunk_reuse_count_before",
+        "span_reuse_count_before",
+        "content_reuse_count_before",
+        "source_quality_score",
+        "content_quality_score",
+        "information_density_score",
+        "retrieval_score",
+        "selection_rank",
+        "content_hash",
+        "chunk_text_hash",
+        "span_text_hash",
+    )
+    return {key: metadata[key] for key in keys if key in metadata}

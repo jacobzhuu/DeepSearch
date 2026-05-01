@@ -23,6 +23,9 @@ export type {
   PipelineRunResponse,
   ResearchPlanResponse,
   ResearchTask,
+  ResearchTaskListItem,
+  ResearchTaskListResponse,
   TaskEvent,
   TaskEventListResponse,
+  TaskMutationResponse,
 } from '../../types/api';

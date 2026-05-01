@@ -235,7 +235,7 @@ def _render_validated_llm_payload(
         evidence_by_id=evidence_by_id,
         citation_by_evidence_id=citation_by_evidence_id,
         evidence_claim_id=evidence_claim_id,
-        allowed_statuses={"mixed", "unsupported", "supported"},
+        allowed_statuses={"mixed", "unsupported", "contradicted", "supported"},
         allow_weak_support=True,
     )
     if not executive_items and not any(items for _, items in sections) and not uncertainty_items:
@@ -298,6 +298,7 @@ def _render_validated_llm_payload(
         + labels["claim_counts"].format(
             supported=sum(1 for claim in claims if claim.verification_status == "supported"),
             mixed=sum(1 for claim in claims if claim.verification_status == "mixed"),
+            contradicted=sum(1 for claim in claims if claim.verification_status == "contradicted"),
             unsupported=sum(1 for claim in claims if claim.verification_status == "unsupported"),
         )
     )
@@ -320,6 +321,9 @@ def _render_validated_llm_payload(
         markdown=markdown,
         supported_count=sum(1 for claim in claims if claim.verification_status == "supported"),
         mixed_count=sum(1 for claim in claims if claim.verification_status == "mixed"),
+        contradicted_count=sum(
+            1 for claim in claims if claim.verification_status == "contradicted"
+        ),
         unsupported_count=sum(1 for claim in claims if claim.verification_status == "unsupported"),
         draft_count=0,
         answer_relevant_count=answer_relevant_claim_count,
@@ -543,7 +547,7 @@ def _labels(report_language: str) -> dict[str, str]:
             "claim": "Claim",
             "claim_counts": (
                 "已验证 claim 计数：{supported} 条 supported、{mixed} 条 mixed、"
-                "{unsupported} 条 unsupported。"
+                "{contradicted} 条 contradicted、{unsupported} 条 unsupported。"
             ),
             "claim_evidence": "claim_evidence",
             "claim_mapping": "附录：claim/evidence/citation 映射",
@@ -586,7 +590,7 @@ def _labels(report_language: str) -> dict[str, str]:
         "claim": "Claim",
         "claim_counts": (
             "Verified claim counts: {supported} supported, {mixed} mixed, "
-            "{unsupported} unsupported."
+            "{contradicted} contradicted, {unsupported} unsupported."
         ),
         "claim_evidence": "claim_evidence",
         "claim_mapping": "Appendix: Claim Evidence Mapping",

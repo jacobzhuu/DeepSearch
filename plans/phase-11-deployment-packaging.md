@@ -177,6 +177,20 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
     of presenting a disabled in-place rerun as the primary action
   - added a task-detail diagnostic panel for `searxng_html_response` and precondition failures
   - restarted the host-local backend/frontend with `./dev.sh restart`
+- 2026-05-01 live self-hosted alpha smoke:
+  - started real PostgreSQL 16.13, MinIO, OpenSearch 2.19.0, and SearXNG on the host-local path
+  - ran the product `/run` worker smoke against real search, MinIO storage, and OpenSearch indexing;
+    the task completed with persisted source documents, chunks, claims, evidence, and a Markdown
+    report artifact
+  - active pause validation exposed stale SQLAlchemy task-state caching in the pipeline runner:
+    `/pause` returned `PAUSED` during `SEARCHING`, but the worker advanced to `ACQUIRING`
+  - fixed the boundary check to refresh the task row before continuing, added regression coverage,
+    and documented the troubleshooting symptom
+  - reran active pause/resume/cancel validation successfully: active pause held at `PAUSED`,
+    resume returned `QUEUED`, active cancel held at `CANCELLED`
+  - reran the real `/run` worker smoke successfully as task
+    `09b6f2e4-c933-495c-a576-0f5c742ddd64`
+  - full requested validation commands passed
 
 ## 8. Validation
 
@@ -210,8 +224,21 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
   - `./dev.sh restart` — passed with `SEARCH_PROVIDER=smoke`, `INDEX_BACKEND=local`, and filesystem storage
   - `./dev.sh smoke` — passed against `http://127.0.0.1:8000`
   - manual API create plus `POST /api/v1/research/tasks/<task_id>/run` for `What is SearXNG and how does it work?` — passed with `COMPLETED`, `running_mode=smoke-search+deterministic-local+no-LLM`, 3 claims, and 1 report artifact
+- 2026-05-01 live self-hosted alpha smoke:
+  - real dependency health checks — passed for PostgreSQL 16.13, MinIO, OpenSearch 2.19.0
+    yellow health, and SearXNG JSON search results
+  - `python3 scripts/smoke_planner_pipeline.py --query "What is SearXNG and how does it work?" --base-url http://127.0.0.1:8000 --wait-seconds 420` — passed after the pause-boundary fix with task `09b6f2e4-c933-495c-a576-0f5c742ddd64`, `running_mode=real-search+opensearch+no-LLM`, 2 source documents, 5 source chunks, 5 supported claims, 5 claim-evidence rows, and 1 Markdown report artifact
+  - active control validation with task `5d64653c-2fd3-496d-b818-3c223960d4e9` — passed; pause during `SEARCHING` remained `PAUSED`, resume returned `QUEUED`, cancel during `ACQUIRING` ended in `CANCELLED`
+  - `python3 -m pytest services/orchestrator/tests/test_debug_pipeline_api.py::test_pipeline_boundary_refreshes_external_pause_before_next_stage -q` — passed
+  - `python3 -m ruff check .` — passed
+  - `python3 -m black --check .` — passed
+  - `python3 -m pytest` — passed, 270 tests
+  - `cd apps/web && npm run build` — passed
+  - `python3 -m mypy packages/db services/orchestrator/app services/orchestrator/tests tests/unit` — passed
+  - `git diff --check` — passed
 - known host limitation:
-  - `docker` is still unavailable on this machine, so `docker compose config/up` remains unvalidated in this turn
+  - the Docker CLI is installed, but the daemon was unavailable at the start of this live-smoke
+    turn; compose runtime remains unvalidated here
   - this is now acceptable because compose is optional tooling rather than the primary acceptance path
 
 ## 9. Risks and unknowns

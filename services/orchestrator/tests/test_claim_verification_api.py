@@ -111,6 +111,7 @@ def test_claim_verification_endpoints_verify_and_filter_evidence(
         assert verify_response.json()["verified_claims"] == 1
         assert verify_response.json()["claims"][0]["verification_status"] == "mixed"
         assert verify_response.json()["claims"][0]["support_evidence_count"] == 1
+        assert verify_response.json()["claims"][0]["weak_support_evidence_count"] == 0
         assert verify_response.json()["claims"][0]["contradict_evidence_count"] == 1
 
         assert claims_response.status_code == 200
@@ -119,6 +120,8 @@ def test_claim_verification_endpoints_verify_and_filter_evidence(
         assert contradict_evidence_response.status_code == 200
         evidence = contradict_evidence_response.json()["claim_evidence"][0]
         assert evidence["relation_type"] == "contradict"
+        assert evidence["relation_detail"] == "contradiction"
+        assert evidence["citation_precision"] == "sentence"
         assert evidence["excerpt"] == CONTRADICT_SENTENCE
     finally:
         client_generator.close()

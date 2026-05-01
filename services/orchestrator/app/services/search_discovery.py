@@ -205,7 +205,11 @@ class SearchDiscoveryService:
                     fallback_reason=error.reason,
                 )
                 remaining_slots -= known_path_result.added
-                fallback_payload = dict(search_query.raw_response_json["known_path_fallback"])
+                raw_response_json = search_query.raw_response_json or {}
+                known_path_fallback = raw_response_json.get("known_path_fallback")
+                fallback_payload = (
+                    dict(known_path_fallback) if isinstance(known_path_fallback, dict) else {}
+                )
                 fallback_payload["known_path_fallback_candidate_count"] = known_path_result.added
                 fallback_payload["known_path_fallback_duplicates_skipped"] = (
                     known_path_result.duplicates_skipped
@@ -214,7 +218,7 @@ class SearchDiscoveryService:
                     known_path_result.filtered_out
                 )
                 search_query.raw_response_json = {
-                    **search_query.raw_response_json,
+                    **raw_response_json,
                     "known_path_fallback": fallback_payload,
                 }
                 duplicates_skipped += known_path_result.duplicates_skipped

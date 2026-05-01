@@ -138,14 +138,7 @@ class LocalChunkIndexBackend:
                     score=score or 1.0,
                 )
             )
-        records.sort(
-            key=lambda item: (
-                -(item.score or 0.0),
-                str(item.source_document_id),
-                item.chunk_no,
-                str(item.source_chunk_id),
-            )
-        )
+        records = rerank_indexed_chunks(records, query=query)
         return IndexedChunkPage(total=len(records), hits=records[offset : offset + limit])
 
     def _records_for_task(self, task_id: UUID) -> list[IndexedChunkRecord]:
@@ -305,7 +298,11 @@ class OpenSearchChunkIndexBackend:
             },
         )
         self._ensure_success(response, operation="chunk retrieval")
-        return _parse_search_response(response.json())
+        page = _parse_search_response(response.json())
+        return IndexedChunkPage(
+            total=page.total,
+            hits=rerank_indexed_chunks(page.hits, query=query),
+        )
 
     def _ensure_index(self) -> None:
         if self._index_exists():
@@ -475,6 +472,137 @@ def _parse_search_response(payload: dict[str, Any]) -> IndexedChunkPage:
         )
 
     return IndexedChunkPage(total=int(total), hits=hits)
+
+
+def rerank_indexed_chunks(
+    records: Sequence[IndexedChunkRecord],
+    *,
+    query: str,
+) -> list[IndexedChunkRecord]:
+    query_tokens = _tokenize(query)
+    domain_counts: dict[str, int] = {}
+    reranked: list[IndexedChunkRecord] = []
+    for record in records:
+        prior_domain_count = domain_counts.get(record.domain, 0)
+        domain_counts[record.domain] = prior_domain_count + 1
+        metadata = dict(record.metadata)
+        components = _retrieval_score_components(
+            record,
+            query_tokens=query_tokens,
+            prior_domain_count=prior_domain_count,
+        )
+        metadata["retrieval_diagnostics"] = {
+            "method": "deterministic_lexical_quality_rerank_v1",
+            "backend_score": record.score,
+            "rerank_score": components["rerank_score"],
+            "components": components,
+            "query_token_count": len(query_tokens),
+            "fallback": "lexical_bm25_or_local_match",
+        }
+        reranked.append(
+            IndexedChunkRecord(
+                task_id=record.task_id,
+                source_document_id=record.source_document_id,
+                source_chunk_id=record.source_chunk_id,
+                canonical_url=record.canonical_url,
+                domain=record.domain,
+                chunk_no=record.chunk_no,
+                text=record.text,
+                metadata=metadata,
+                score=record.score,
+            )
+        )
+
+    reranked.sort(
+        key=lambda item: (
+            -_metadata_float(item.metadata, "retrieval_diagnostics", "rerank_score"),
+            -(item.score or 0.0),
+            str(item.source_document_id),
+            item.chunk_no,
+            str(item.source_chunk_id),
+        )
+    )
+    return reranked
+
+
+def _retrieval_score_components(
+    record: IndexedChunkRecord,
+    *,
+    query_tokens: set[str],
+    prior_domain_count: int,
+) -> dict[str, float]:
+    lexical_score = min(1.0, max(0.0, float(record.score or 0.0)))
+    if lexical_score <= 0.0 and query_tokens:
+        lexical_score = _local_match_score(query_tokens, record.text)
+    source_quality = _coerce_unit_score(
+        record.metadata.get("source_quality_score")
+        or _nested_metadata_value(record.metadata, "source_quality", "final_score"),
+        default=0.5,
+    )
+    chunk_quality = _coerce_unit_score(record.metadata.get("content_quality_score"), default=0.5)
+    information_density = _coerce_unit_score(
+        record.metadata.get("information_density_score"),
+        default=0.5,
+    )
+    freshness = _coerce_unit_score(
+        _nested_metadata_value(record.metadata, "source_quality", "freshness_score"),
+        default=0.5,
+    )
+    citation_precision = _citation_precision_likelihood(record.metadata)
+    diversity_penalty = min(0.18, prior_domain_count * 0.06)
+    rerank_score = (
+        lexical_score * 0.48
+        + source_quality * 0.22
+        + chunk_quality * 0.12
+        + information_density * 0.08
+        + citation_precision * 0.06
+        + freshness * 0.04
+        - diversity_penalty
+    )
+    return {
+        "lexical_score": round(lexical_score, 4),
+        "source_quality_score": round(source_quality, 4),
+        "chunk_quality_score": round(chunk_quality, 4),
+        "information_density_score": round(information_density, 4),
+        "freshness_score": round(freshness, 4),
+        "citation_precision_likelihood": round(citation_precision, 4),
+        "source_diversity_penalty": round(diversity_penalty, 4),
+        "rerank_score": round(max(0.0, min(1.0, rerank_score)), 4),
+    }
+
+
+def _citation_precision_likelihood(metadata: dict[str, Any]) -> float:
+    if metadata.get("page_range") or metadata.get("slide_range") or metadata.get("cell_ranges"):
+        return 0.9
+    if metadata.get("paragraph_range"):
+        return 0.75
+    if metadata.get("char_start") is not None and metadata.get("char_end") is not None:
+        return 0.65
+    return 0.45
+
+
+def _nested_metadata_value(
+    metadata: dict[str, Any],
+    parent_key: str,
+    child_key: str,
+) -> object | None:
+    parent = metadata.get(parent_key)
+    if not isinstance(parent, dict):
+        return None
+    return parent.get(child_key)
+
+
+def _metadata_float(metadata: dict[str, Any], parent_key: str, child_key: str) -> float:
+    value = _nested_metadata_value(metadata, parent_key, child_key)
+    if isinstance(value, int | float):
+        return float(value)
+    return 0.0
+
+
+def _coerce_unit_score(value: object, *, default: float) -> float:
+    if isinstance(value, int | float):
+        return min(1.0, max(0.0, float(value)))
+    return default
 
 
 def _coerce_score(value: object) -> float | None:

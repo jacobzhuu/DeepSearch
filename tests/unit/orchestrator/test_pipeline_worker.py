@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -15,6 +16,10 @@ from services.orchestrator.app.services.research_tasks import (
     create_research_task_service,
 )
 from services.orchestrator.app.settings import Settings
+
+
+class _TestPipelineRunner(Protocol):
+    def run(self, task_id: UUID) -> SimpleNamespace: ...
 
 
 def test_worker_runs_queued_task_with_injected_runner(
@@ -35,15 +40,19 @@ def test_worker_runs_queued_task_with_injected_runner(
     assert worker.run_once() == 1
 
     with session_factory() as session:
-        task = ResearchTaskRepository(session).get(task_id)
-        assert task is not None
-        assert task.status == "COMPLETED"
+        loaded_task = ResearchTaskRepository(session).get(task_id)
+        assert loaded_task is not None
+        assert loaded_task.status == "COMPLETED"
         event_types = [
             event.event_type for event in TaskEventRepository(session).list_for_task(task_id)
         ]
         assert "pipeline.queued" in event_types
         assert "pipeline.completed" in event_types
-        ResearchTaskRepository(session).set_status(task, PHASE2_ACTIVE_STATUS, ended_at=None)
+        ResearchTaskRepository(session).set_status(
+            loaded_task,
+            PHASE2_ACTIVE_STATUS,
+            ended_at=None,
+        )
         session.commit()
 
 
@@ -66,19 +75,23 @@ def test_worker_requeues_interrupted_runtime_status(
     assert worker.recover_interrupted_tasks() == 1
 
     with session_factory() as session:
-        task = ResearchTaskRepository(session).get(task_id)
-        assert task is not None
-        assert task.status == RUNTIME_QUEUED_STATUS
+        loaded_task = ResearchTaskRepository(session).get(task_id)
+        assert loaded_task is not None
+        assert loaded_task.status == RUNTIME_QUEUED_STATUS
         events = TaskEventRepository(session).list_for_task(task_id)
         assert events[-1].event_type == "pipeline.requeued"
         assert events[-1].payload_json["from_status"] == "SEARCHING"
-        ResearchTaskRepository(session).set_status(task, PHASE2_ACTIVE_STATUS, ended_at=None)
+        ResearchTaskRepository(session).set_status(
+            loaded_task,
+            PHASE2_ACTIVE_STATUS,
+            ended_at=None,
+        )
         session.commit()
 
 
-def _complete_task_runner(session: Session):
+def _complete_task_runner(session: Session) -> _TestPipelineRunner:
     class _Runner:
-        def run(self, task_id: UUID):
+        def run(self, task_id: UUID) -> SimpleNamespace:
             task_repository = ResearchTaskRepository(session)
             event_repository = TaskEventRepository(session)
             task = task_repository.get(task_id)

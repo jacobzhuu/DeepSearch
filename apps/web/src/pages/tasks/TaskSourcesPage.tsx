@@ -51,8 +51,23 @@ export const TaskSourcesPage: React.FC = () => {
               <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 1rem 0', fontSize: '0.9rem', color: '#555', display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
                 <li><strong>域名:</strong> {doc.domain}</li>
                 <li><strong>类型:</strong> {doc.source_type}</li>
+                <li><strong>格式:</strong> {String(doc.parser_metadata?.parser_kind || doc.source_type)}</li>
+                <li><strong>解析:</strong> {String(doc.parser_metadata?.parser_status || 'unknown')}</li>
+                <li><strong>质量:</strong> {formatScore(doc.final_source_score)}</li>
+                <li><strong>权威性:</strong> {formatScore(doc.authority_score)}</li>
+                <li><strong>时效:</strong> {doc.quality?.freshness_state || (doc.freshness_score === null ? 'unknown' : formatScore(doc.freshness_score))}</li>
                 <li><strong>获取时间:</strong> {new Date(doc.fetched_at).toLocaleString()}</li>
               </ul>
+              {doc.quality?.reasons && Array.isArray(doc.quality.reasons) && (
+                <div style={{ fontSize: '0.85rem', color: '#666', marginBottom: '1rem' }}>
+                  <strong>质量理由:</strong> {doc.quality.reasons.slice(0, 4).join(', ')}
+                </div>
+              )}
+              {doc.parser_metadata && Object.keys(doc.parser_metadata).length > 0 && (
+                <div style={{ fontSize: '0.85rem', color: '#475569', marginBottom: '1rem' }}>
+                  <strong>解析定位:</strong> {formatParserMetadata(doc.parser_metadata)}
+                </div>
+              )}
 
               <div>
                 <h4 style={{ fontSize: '1rem', marginBottom: '0.75rem', borderBottom: '1px solid #ccc', paddingBottom: '0.25rem' }}>
@@ -66,8 +81,17 @@ export const TaskSourcesPage: React.FC = () => {
                         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: '#888', marginBottom: '0.5rem' }}>
                           <span><strong>分块编号:</strong> {chunk.chunk_no}</span>
                           <span><strong>词元数:</strong> {chunk.token_count}</span>
+                          {typeof chunk.metadata?.content_quality_score === 'number' && (
+                            <span><strong>内容质量:</strong> {formatScore(chunk.metadata.content_quality_score)}</span>
+                          )}
+                          {typeof chunk.metadata?.information_density_score === 'number' && (
+                            <span><strong>密度:</strong> {formatScore(chunk.metadata.information_density_score)}</span>
+                          )}
                           {chunk.metadata?.strategy && (
                             <span><strong>策略:</strong> {chunk.metadata.strategy}</span>
+                          )}
+                          {(chunk.metadata?.page_range || chunk.metadata?.slide_range || chunk.metadata?.sheet_names) && (
+                            <span><strong>定位:</strong> {formatChunkLocator(chunk.metadata)}</span>
                           )}
                         </div>
                         <p style={{ margin: 0, fontSize: '0.95rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
@@ -86,4 +110,34 @@ export const TaskSourcesPage: React.FC = () => {
       </div>
     </PageLayout>
   );
+};
+
+const formatScore = (value: number | null | undefined) => (
+  typeof value === 'number' ? value.toFixed(2) : 'unknown'
+);
+
+const formatParserMetadata = (metadata: Record<string, any>) => {
+  const parts: string[] = [];
+  if (metadata.page_range) parts.push(`页 ${metadata.page_range.join('-')}`);
+  if (metadata.slide_range) parts.push(`幻灯片 ${metadata.slide_range.join('-')}`);
+  if (Array.isArray(metadata.sheet_names) && metadata.sheet_names.length > 0) {
+    parts.push(`表 ${metadata.sheet_names.join(', ')}`);
+  }
+  if (Array.isArray(metadata.cell_ranges) && metadata.cell_ranges.length > 0) {
+    parts.push(`单元格 ${metadata.cell_ranges.join(', ')}`);
+  }
+  if (metadata.locator_fallback_reason) parts.push(`fallback: ${metadata.locator_fallback_reason}`);
+  if (Array.isArray(metadata.parser_warnings) && metadata.parser_warnings.length > 0) {
+    parts.push(`warning: ${metadata.parser_warnings.slice(0, 2).join(', ')}`);
+  }
+  return parts.join(' / ') || String(metadata.parser_kind || 'unknown');
+};
+
+const formatChunkLocator = (metadata: Record<string, any>) => {
+  if (metadata.page_range) return `页 ${metadata.page_range.join('-')}`;
+  if (metadata.slide_range) return `幻灯片 ${metadata.slide_range.join('-')}`;
+  if (Array.isArray(metadata.sheet_names) && metadata.sheet_names.length > 0) {
+    return `表 ${metadata.sheet_names.join(', ')}`;
+  }
+  return '结构定位';
 };

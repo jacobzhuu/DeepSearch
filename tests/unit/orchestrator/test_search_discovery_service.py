@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from sqlalchemy.orm import Session
 
+from packages.db.models import SearchQuery
 from packages.db.repositories import (
     CandidateUrlRepository,
     ResearchRunRepository,
@@ -55,6 +56,11 @@ class StaticSearchProvider:
             results=results,
             metadata=self.metadata or {"request_query": request.query_text},
         )
+
+
+def _raw_response(search_query: SearchQuery) -> dict[str, Any]:
+    assert search_query.raw_response_json is not None
+    return search_query.raw_response_json
 
 
 @dataclass
@@ -168,9 +174,9 @@ def test_discover_candidates_persists_search_queries_and_deduped_urls(db_session
     assert result.duplicates_skipped == 1
     assert result.filtered_out == 2
     assert [candidate.canonical_url for candidate in persisted_candidates] == [
-        "https://example.com/a/?a=1&b=2",
+        "https://example.com/a?a=1&b=2",
         "https://allowed.com/path?a=1&b=2",
-        "https://example.com/deep/path/",
+        "https://example.com/deep/path",
     ]
     assert persisted_candidates[0].metadata_json["source_engine"] == "google"
     assert persisted_candidates[0].metadata_json["task_revision_no"] == 1
@@ -337,14 +343,10 @@ def test_discover_candidates_uses_deduped_planner_queries(db_session: Session) -
     )
     assert about_candidate.metadata_json["known_path_candidate"] is True
     assert about_candidate.metadata_json["source_engine"] == "deterministic_known_path"
-    assert persisted_queries[0].raw_response_json["expansion_kind"] == "research_plan"
-    assert (
-        persisted_queries[0].raw_response_json["expansion_metadata"]["expected_source_type"]
-        == "official_docs"
-    )
-    assert persisted_queries[0].raw_response_json["expansion_metadata"]["query_source"] == (
-        "guardrail_query"
-    )
+    first_raw_response = _raw_response(persisted_queries[0])
+    assert first_raw_response["expansion_kind"] == "research_plan"
+    assert first_raw_response["expansion_metadata"]["expected_source_type"] == "official_docs"
+    assert first_raw_response["expansion_metadata"]["query_source"] == ("guardrail_query")
 
 
 def test_discover_candidates_injects_langgraph_known_path_fallback_on_unresponsive_search(
@@ -378,7 +380,7 @@ def test_discover_candidates_injects_langgraph_known_path_fallback_on_unresponsi
     assert canonical_urls == [
         "https://docs.langchain.com/oss/python/langgraph/overview",
         "https://docs.langchain.com/oss/javascript/langgraph/overview",
-        "https://reference.langchain.com/python/langgraph/",
+        "https://reference.langchain.com/python/langgraph",
         "https://reference.langchain.com/python/langgraph/graph/state",
         "https://www.langchain.com/langgraph",
         "https://github.com/langchain-ai/langgraph",
@@ -397,7 +399,7 @@ def test_discover_candidates_injects_langgraph_known_path_fallback_on_unresponsi
         for candidate in persisted_candidates
     )
 
-    fallback_payload = persisted_queries[0].raw_response_json["known_path_fallback"]
+    fallback_payload = _raw_response(persisted_queries[0])["known_path_fallback"]
     assert fallback_payload["known_path_fallback_applied"] is True
     assert fallback_payload["known_path_fallback_candidate_count"] == 6
     assert fallback_payload["known_path_fallback_duplicates_skipped"] == 0

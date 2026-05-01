@@ -3,6 +3,8 @@ from __future__ import annotations
 from services.orchestrator.app.claims import (
     CLAIM_EVIDENCE_RELATION_CONTRADICT,
     CLAIM_EVIDENCE_RELATION_SUPPORT,
+    CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT,
+    CLAIM_VERIFICATION_STATUS_CONTRADICTED,
     CLAIM_VERIFICATION_STATUS_MIXED,
     CLAIM_VERIFICATION_STATUS_SUPPORTED,
     CLAIM_VERIFICATION_STATUS_UNSUPPORTED,
@@ -64,9 +66,35 @@ def test_select_verification_span_marks_moderate_overlap_as_weak_support() -> No
     )
 
     assert match is not None
-    assert match.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT
+    assert match.relation_type == CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT
     assert match.relation_detail == "weak_support"
     assert match.support_level == "weak"
+    assert match.citation_precision == "sentence"
+
+
+def test_select_verification_span_can_use_short_adjacent_sentence_span() -> None:
+    text = (
+        "SearXNG is a free internet metasearch engine. "
+        "It aggregates results from more than 70 search services. "
+        "The project also documents self-hosting options."
+    )
+
+    match = select_verification_span(
+        text,
+        (
+            "SearXNG is a free metasearch engine that aggregates results from more than "
+            "70 search services."
+        ),
+    )
+
+    assert match is not None
+    assert match.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT
+    assert match.citation_precision == "short_span"
+    assert match.citation_precision_reason == "adjacent_sentences_needed_for_claim_support"
+    assert match.excerpt == (
+        "SearXNG is a free internet metasearch engine. "
+        "It aggregates results from more than 70 search services."
+    )
 
 
 def test_select_verification_span_rejects_numeric_mismatch() -> None:
@@ -91,6 +119,14 @@ def test_resolve_verification_status_and_rationale_cover_minimum_phase8_states()
     )
     assert (
         resolve_verification_status(support_count=0, contradict_count=1)
+        == CLAIM_VERIFICATION_STATUS_CONTRADICTED
+    )
+    assert (
+        resolve_verification_status(
+            support_count=0,
+            contradict_count=0,
+            weak_support_count=1,
+        )
         == CLAIM_VERIFICATION_STATUS_UNSUPPORTED
     )
     assert (

@@ -24,6 +24,7 @@ class ReportResponse(BaseModel):
 class GenerateReportResponse(ReportResponse):
     supported_claims: int
     mixed_claims: int
+    contradicted_claims: int
     unsupported_claims: int
     draft_claims: int
     reused_existing: bool

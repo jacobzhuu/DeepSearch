@@ -162,6 +162,18 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="LLM_REPORT_WRITER_ENABLED",
     )
+    llm_source_judge_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_SOURCE_JUDGE_ENABLED",
+    )
+    llm_source_judge_active_rerank: bool = Field(
+        default=False,
+        validation_alias="LLM_SOURCE_JUDGE_ACTIVE_RERANK",
+    )
+    llm_source_judge_max_candidates: int = Field(
+        default=5,
+        validation_alias="LLM_SOURCE_JUDGE_MAX_CANDIDATES",
+    )
     llm_report_max_output_tokens: int = Field(
         default=2400,
         validation_alias="LLM_REPORT_MAX_OUTPUT_TOKENS",
@@ -194,6 +206,9 @@ class Settings(BaseSettings):
             "llm_max_output_tokens": self.llm_max_output_tokens,
             "llm_report_writer_enabled": self.llm_report_writer_enabled,
             "llm_report_max_output_tokens": self.llm_report_max_output_tokens,
+            "llm_source_judge_enabled": self.llm_source_judge_enabled,
+            "llm_source_judge_active_rerank": self.llm_source_judge_active_rerank,
+            "llm_source_judge_max_candidates": self.llm_source_judge_max_candidates,
             "research_planner_enabled": self.research_planner_enabled,
             "research_planner_max_subquestions": self.research_planner_max_subquestions,
             "research_planner_max_search_queries": self.research_planner_max_search_queries,

@@ -91,6 +91,7 @@ class ReportSynthesisResult:
     llm_writer_status: str | None
     supported_claims: int
     mixed_claims: int
+    contradicted_claims: int
     unsupported_claims: int
     draft_claims: int
 
@@ -283,6 +284,7 @@ class ReportSynthesisService:
             llm_writer_status=_string_or_none(writer.get("status")),
             supported_claims=0,
             mixed_claims=0,
+            contradicted_claims=0,
             unsupported_claims=0,
             draft_claims=0,
         )
@@ -318,12 +320,18 @@ class ReportSynthesisService:
                     continue
                 source_document = source_chunk.source_document
                 relation_metadata = relation_metadata_by_span.get(str(citation_span.id), {})
+                effective_relation_type = (
+                    _string_or_none(relation_metadata.get("relation_type"))
+                    or evidence.relation_type
+                )
+                if effective_relation_type != evidence.relation_type and relation_metadata:
+                    continue
                 report_evidence = ReportEvidenceItem(
                     claim_evidence_id=evidence.id,
                     citation_span_id=citation_span.id,
                     source_document_id=source_document.id,
                     source_chunk_id=source_chunk.id,
-                    relation_type=cast(EvidenceRelation, evidence.relation_type),
+                    relation_type=cast(EvidenceRelation, effective_relation_type),
                     score=evidence.score,
                     canonical_url=source_document.canonical_url,
                     domain=source_document.domain,
@@ -334,9 +342,23 @@ class ReportSynthesisService:
                     relation_detail=_string_or_none(relation_metadata.get("relation_detail")),
                     support_level=_string_or_none(relation_metadata.get("support_level")),
                     verifier_method=_string_or_none(relation_metadata.get("verifier_method")),
+                    citation_precision=_string_or_none(relation_metadata.get("citation_precision")),
+                    citation_precision_reason=_string_or_none(
+                        relation_metadata.get("citation_precision_reason")
+                    ),
+                    reuse_penalty=_numeric_note(relation_metadata.get("reuse_penalty")),
+                    chunk_reuse_count_before=_int_note(
+                        relation_metadata.get("chunk_reuse_count_before")
+                    ),
+                    span_reuse_count_before=_int_note(
+                        relation_metadata.get("span_reuse_count_before")
+                    ),
+                    content_reuse_count_before=_int_note(
+                        relation_metadata.get("content_reuse_count_before")
+                    ),
                     reasons=_relation_reasons(relation_metadata),
                 )
-                if evidence.relation_type == "support":
+                if effective_relation_type in {"support", "weak_support"}:
                     support_evidence.append(report_evidence)
                     source_items[source_document.id] = ReportSourceItem(
                         source_document_id=source_document.id,
@@ -344,7 +366,7 @@ class ReportSynthesisService:
                         domain=source_document.domain,
                         title=source_document.title,
                     )
-                elif evidence.relation_type == "contradict":
+                elif effective_relation_type == "contradict":
                     contradict_evidence.append(report_evidence)
                     source_items[source_document.id] = ReportSourceItem(
                         source_document_id=source_document.id,
@@ -354,8 +376,10 @@ class ReportSynthesisService:
                     )
 
             normalized_status = self._normalize_status(claim.verification_status)
-            if normalized_status in {"supported", "mixed"} and not support_evidence:
+            if normalized_status == "supported" and not support_evidence:
                 normalized_status = "unsupported"
+            if normalized_status == "mixed" and not (support_evidence and contradict_evidence):
+                normalized_status = "unsupported" if not contradict_evidence else "contradicted"
 
             report_claims.append(
                 ReportClaimItem(
@@ -492,6 +516,7 @@ class ReportSynthesisService:
             llm_writer_status=_string_or_none(report_writer.get("status")),
             supported_claims=rendered.supported_count,
             mixed_claims=rendered.mixed_count,
+            contradicted_claims=rendered.contradicted_count,
             unsupported_claims=rendered.unsupported_count,
             draft_claims=rendered.draft_count,
         )
@@ -517,7 +542,7 @@ class ReportSynthesisService:
 
     def _normalize_status(self, status: str) -> str:
         normalized_status = status.strip().lower()
-        if normalized_status in {"draft", "supported", "mixed", "unsupported"}:
+        if normalized_status in {"draft", "supported", "mixed", "unsupported", "contradicted"}:
             return normalized_status
         return "draft"
 
@@ -610,6 +635,14 @@ def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | N
 def _numeric_note(value: object) -> float | None:
     if isinstance(value, int | float):
         return float(value)
+    return None
+
+
+def _int_note(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
     return None
 
 
@@ -808,6 +841,9 @@ def _report_verification_summary(claims: list[ReportClaimItem]) -> dict[str, obj
             if claim.verification_status == "supported" and claim.support_level == "weak"
         ),
         "mixed_claim_count": sum(1 for claim in claims if claim.verification_status == "mixed"),
+        "contradicted_claim_count": sum(
+            1 for claim in claims if claim.verification_status == "contradicted"
+        ),
         "unsupported_claim_count": sum(
             1 for claim in claims if claim.verification_status == "unsupported"
         ),

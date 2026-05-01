@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, replace
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -15,8 +17,10 @@ from packages.db.repositories import (
 )
 from packages.observability import get_logger, record_verify_results
 from services.orchestrator.app.claims import (
+    CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT,
     CLAIM_EVIDENCE_RELATION_CONTRADICT,
     CLAIM_EVIDENCE_RELATION_SUPPORT,
+    CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT,
     CLAIM_TYPE_FACT,
     CLAIM_VERIFICATION_STATUS_DRAFT,
     MIN_DRAFT_CLAIM_QUALITY_SCORE,
@@ -24,6 +28,7 @@ from services.orchestrator.app.claims import (
     VERIFIER_METHOD_LEXICAL_HEURISTIC_V2,
     ClaimCandidateScore,
     SupportingSpan,
+    VerificationSpanMatch,
     build_verification_rationale,
     candidate_category_sort_key,
     classify_query_intent,
@@ -137,13 +142,14 @@ class ClaimDraftBatchResult:
     created_claim_evidence: int
     reused_claim_evidence: int
     entries: list[DraftClaimEntry]
-    diagnostics: dict[str, object]
+    diagnostics: dict[str, Any]
 
 
 @dataclass(frozen=True)
 class ClaimSummaryEntry:
     claim: Claim
     support_evidence_count: int
+    weak_support_evidence_count: int
     contradict_evidence_count: int
     rationale: str | None
 
@@ -152,8 +158,35 @@ class ClaimSummaryEntry:
 class VerifiedClaimEntry:
     claim: Claim
     support_evidence_count: int
+    weak_support_evidence_count: int
     contradict_evidence_count: int
     rationale: str
+
+
+@dataclass(frozen=True)
+class VerificationEvidenceCandidate:
+    source_chunk: SourceChunk
+    matched_span: VerificationSpanMatch
+    retrieval_score: float | None
+    rank_score: float
+    diversity_adjusted_score: float
+    reuse_penalty: float
+    chunk_reuse_count_before: int
+    span_reuse_count_before: int
+    content_reuse_count_before: int
+    source_quality_score: float
+    content_quality_score: float
+    information_density_score: float
+    content_hash: str | None
+    chunk_text_hash: str
+    span_text_hash: str
+
+
+@dataclass
+class EvidenceReuseTracker:
+    chunk_counts: dict[str, int]
+    span_counts: dict[str, int]
+    content_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -258,7 +291,7 @@ class ClaimDraftingService:
                 retrieval_score=retrieval_score,
                 candidate=candidate,
                 selection_rank=selection_rank,
-                relation_type=CLAIM_EVIDENCE_RELATION_SUPPORT,
+                relation_type=CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT,
                 evidence_candidate=evidence_candidate,
             )
 
@@ -298,7 +331,7 @@ class ClaimDraftingService:
             claim_evidence, reused_evidence = self._ensure_claim_evidence(
                 claim=claim,
                 citation_span=citation_span,
-                relation_type=CLAIM_EVIDENCE_RELATION_SUPPORT,
+                relation_type=CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT,
                 score=confidence,
             )
             if reused_evidence:
@@ -409,9 +442,14 @@ class ClaimDraftingService:
         created_claim_evidence = 0
         reused_claim_evidence = 0
         entries: list[VerifiedClaimEntry] = []
+        reuse_tracker = EvidenceReuseTracker(
+            chunk_counts={},
+            span_counts={},
+            content_counts={},
+        )
 
         for claim in claims:
-            evidence_relation_details: list[dict[str, object]] = []
+            verification_candidates: list[VerificationEvidenceCandidate] = []
             retrieval_hits = self.index_backend.retrieve_chunks(
                 task_id=task.id,
                 query=claim.statement,
@@ -419,45 +457,80 @@ class ClaimDraftingService:
                 limit=self.retrieval_max_results_per_request,
             ).hits
             if retrieval_hits:
-                for source_chunk, _ in self._load_retrieved_chunks(task.id, retrieval_hits):
+                for source_chunk, retrieval_score in self._load_retrieved_chunks(
+                    task.id,
+                    retrieval_hits,
+                ):
                     if not _source_chunk_eligible_for_claims(source_chunk):
                         continue
                     matched_span = select_verification_span(source_chunk.text, claim.statement)
                     if matched_span is None:
                         continue
+                    verification_candidates.append(
+                        _verification_evidence_candidate(
+                            source_chunk=source_chunk,
+                            matched_span=matched_span,
+                            retrieval_score=retrieval_score,
+                        )
+                    )
 
-                    citation_span, reused_citation_span = self._ensure_citation_span(
-                        source_chunk=source_chunk,
-                        start_offset=matched_span.start_offset,
-                        end_offset=matched_span.end_offset,
-                        excerpt=matched_span.excerpt,
-                    )
-                    if reused_citation_span:
-                        reused_citation_spans += 1
-                    else:
-                        created_citation_spans += 1
+            selected_candidates = _select_verification_evidence(
+                verification_candidates,
+                reuse_tracker=reuse_tracker,
+            )
+            evidence_relation_details: list[dict[str, object]] = []
+            for selection_rank, candidate in enumerate(selected_candidates, start=1):
+                source_chunk = candidate.source_chunk
+                matched_span = candidate.matched_span
+                citation_span, reused_citation_span = self._ensure_citation_span(
+                    source_chunk=source_chunk,
+                    start_offset=matched_span.start_offset,
+                    end_offset=matched_span.end_offset,
+                    excerpt=matched_span.excerpt,
+                )
+                if reused_citation_span:
+                    reused_citation_spans += 1
+                else:
+                    created_citation_spans += 1
 
-                    claim_evidence, reused_evidence = self._ensure_claim_evidence(
-                        claim=claim,
-                        citation_span=citation_span,
-                        relation_type=matched_span.relation_type,
-                        score=matched_span.score,
-                    )
-                    evidence_relation_details.append(
-                        {
-                            "claim_evidence_id": str(claim_evidence.id),
-                            "claim_evidence_reused": reused_evidence,
-                            "claim_id": str(claim.id),
-                            "citation_span_id": str(citation_span.id),
-                            "source_chunk_id": str(source_chunk.id),
-                            "source_document_id": str(source_chunk.source_document_id),
-                            **matched_span.to_metadata(),
-                        }
-                    )
-                    if reused_evidence:
-                        reused_claim_evidence += 1
-                    else:
-                        created_claim_evidence += 1
+                claim_evidence, reused_evidence = self._ensure_claim_evidence(
+                    claim=claim,
+                    citation_span=citation_span,
+                    relation_type=matched_span.relation_type,
+                    score=candidate.rank_score,
+                )
+                evidence_relation_details.append(
+                    {
+                        "claim_evidence_id": str(claim_evidence.id),
+                        "claim_evidence_reused": reused_evidence,
+                        "claim_id": str(claim.id),
+                        "citation_span_id": str(citation_span.id),
+                        "source_chunk_id": str(source_chunk.id),
+                        "source_document_id": str(source_chunk.source_document_id),
+                        "source_domain": source_chunk.source_document.domain,
+                        "source_url": source_chunk.source_document.canonical_url,
+                        "selection_rank": selection_rank,
+                        "evidence_rank_score": candidate.rank_score,
+                        "diversity_adjusted_score": candidate.diversity_adjusted_score,
+                        "reuse_penalty": candidate.reuse_penalty,
+                        "chunk_reuse_count_before": candidate.chunk_reuse_count_before,
+                        "span_reuse_count_before": candidate.span_reuse_count_before,
+                        "content_reuse_count_before": candidate.content_reuse_count_before,
+                        "source_quality_score": candidate.source_quality_score,
+                        "content_quality_score": candidate.content_quality_score,
+                        "information_density_score": candidate.information_density_score,
+                        "retrieval_score": candidate.retrieval_score,
+                        "content_hash": candidate.content_hash,
+                        "chunk_text_hash": candidate.chunk_text_hash,
+                        "span_text_hash": candidate.span_text_hash,
+                        **matched_span.to_metadata(),
+                    }
+                )
+                _record_candidate_reuse(reuse_tracker, candidate)
+                if reused_evidence:
+                    reused_claim_evidence += 1
+                else:
+                    created_claim_evidence += 1
 
             support_count, weak_support_count, contradict_count = self._count_claim_evidence(
                 claim.id,
@@ -485,9 +558,20 @@ class ClaimDraftingService:
                     "weak_support_evidence_count": weak_support_count,
                     "contradict_evidence_count": contradict_count,
                     "insufficient_evidence_count": (
-                        1 if support_count == 0 and weak_support_count == 0 else 0
+                        1
+                        if support_count == 0 and weak_support_count == 0 and contradict_count == 0
+                        else 0
+                    ),
+                    "candidate_evidence_count": len(verification_candidates),
+                    "selected_evidence_count": len(selected_candidates),
+                    "dropped_evidence_count": max(
+                        0,
+                        len(verification_candidates) - len(selected_candidates),
                     ),
                     "evidence_relations": evidence_relation_details,
+                    "evidence_diversity": _evidence_diversity_summary(
+                        evidence_relation_details,
+                    ),
                     "rationale": rationale,
                 },
             }
@@ -495,6 +579,7 @@ class ClaimDraftingService:
                 VerifiedClaimEntry(
                     claim=claim,
                     support_evidence_count=support_count,
+                    weak_support_evidence_count=weak_support_count,
                     contradict_evidence_count=contradict_count,
                     rationale=rationale,
                 )
@@ -621,7 +706,7 @@ class ClaimDraftingService:
         chunks_seen: list[tuple[SourceChunk, float | None]],
         query: str,
         limit: int,
-    ) -> tuple[list[DraftClaimCandidate], dict[str, object]]:
+    ) -> tuple[list[DraftClaimCandidate], dict[str, Any]]:
         candidates: list[DraftClaimCandidate] = []
         for source_chunk, retrieval_score in chunks_seen:
             content_quality_score = _chunk_content_quality_score(source_chunk)
@@ -815,8 +900,10 @@ class ClaimDraftingService:
         candidate: DraftClaimCandidate,
         selection_rank: int,
         relation_type: str,
-        evidence_candidate: dict[str, object],
-    ) -> dict[str, object]:
+        evidence_candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        slot_ids_value = evidence_candidate.get("slot_ids")
+        slot_ids = list(slot_ids_value) if isinstance(slot_ids_value, list | tuple) else []
         return {
             "draft_query": query,
             "draft_method": "query_aware_sentence_ranker_v1",
@@ -829,7 +916,7 @@ class ClaimDraftingService:
             "relation_type": relation_type,
             "selection_rank": selection_rank,
             "paragraph_index": candidate.paragraph_key[1],
-            "slot_ids": list(evidence_candidate.get("slot_ids", [])),
+            "slot_ids": slot_ids,
             "source_intent": evidence_candidate.get("source_intent"),
             "evidence_candidate_id": evidence_candidate.get("evidence_candidate_id"),
             "evidence_quality_score": evidence_candidate.get("quality_score"),
@@ -841,9 +928,9 @@ class ClaimDraftingService:
 
     def _merge_claim_notes(
         self,
-        existing_notes: dict[str, object],
-        new_notes: dict[str, object],
-    ) -> dict[str, object]:
+        existing_notes: dict[str, Any],
+        new_notes: dict[str, Any],
+    ) -> dict[str, Any]:
         existing_score = _numeric_note(existing_notes.get("claim_selection_score"))
         new_score = _numeric_note(new_notes.get("claim_selection_score"))
         if existing_score is not None and new_score is not None and existing_score >= new_score:
@@ -913,6 +1000,7 @@ class ClaimDraftingService:
                 evidence.claim_id,
                 {
                     CLAIM_EVIDENCE_RELATION_SUPPORT: 0,
+                    CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT: 0,
                     CLAIM_EVIDENCE_RELATION_CONTRADICT: 0,
                 },
             )
@@ -926,6 +1014,7 @@ class ClaimDraftingService:
                 claim.id,
                 {
                     CLAIM_EVIDENCE_RELATION_SUPPORT: 0,
+                    CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT: 0,
                     CLAIM_EVIDENCE_RELATION_CONTRADICT: 0,
                 },
             )
@@ -933,6 +1022,7 @@ class ClaimDraftingService:
                 ClaimSummaryEntry(
                     claim=claim,
                     support_evidence_count=counts[CLAIM_EVIDENCE_RELATION_SUPPORT],
+                    weak_support_evidence_count=counts[CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT],
                     contradict_evidence_count=counts[CLAIM_EVIDENCE_RELATION_CONTRADICT],
                     rationale=verification_notes.get("rationale"),
                 )
@@ -945,22 +1035,33 @@ class ClaimDraftingService:
         *,
         relation_details: list[dict[str, object]] | None = None,
     ) -> tuple[int, int, int]:
+        if relation_details is not None:
+            support_count = sum(
+                1
+                for detail in relation_details
+                if detail.get("relation_type") == CLAIM_EVIDENCE_RELATION_SUPPORT
+            )
+            weak_support_count = sum(
+                1
+                for detail in relation_details
+                if detail.get("relation_type") == CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT
+            )
+            contradict_count = sum(
+                1
+                for detail in relation_details
+                if detail.get("relation_type") == CLAIM_EVIDENCE_RELATION_CONTRADICT
+            )
+            return support_count, weak_support_count, contradict_count
+
         claim_evidence = self.claim_evidence_repository.list_for_claim(claim_id)
-        weak_citation_ids = {
-            detail.get("citation_span_id")
-            for detail in relation_details or []
-            if detail.get("relation_type") == CLAIM_EVIDENCE_RELATION_SUPPORT
-            and detail.get("support_level") == "weak"
-        }
         support_count = 0
         weak_support_count = 0
         contradict_count = 0
         for evidence in claim_evidence:
             if evidence.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT:
-                if str(evidence.citation_span_id) in weak_citation_ids:
-                    weak_support_count += 1
-                else:
-                    support_count += 1
+                support_count += 1
+            elif evidence.relation_type == CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT:
+                weak_support_count += 1
             elif evidence.relation_type == CLAIM_EVIDENCE_RELATION_CONTRADICT:
                 contradict_count += 1
         return support_count, weak_support_count, contradict_count
@@ -1023,6 +1124,8 @@ class ClaimDraftingService:
             )
             return claim_evidence, False
 
+        if score is not None and (claim_evidence.score is None or score > claim_evidence.score):
+            claim_evidence.score = score
         return claim_evidence, True
 
     def _get_task(self, task_id: UUID) -> ResearchTask:
@@ -1056,6 +1159,250 @@ def create_claim_drafting_service(
         draft_allowed_statuses=draft_allowed_statuses,
         verify_allowed_statuses=verify_allowed_statuses,
     )
+
+
+def _verification_evidence_candidate(
+    *,
+    source_chunk: SourceChunk,
+    matched_span: VerificationSpanMatch,
+    retrieval_score: float | None,
+) -> VerificationEvidenceCandidate:
+    source_quality_score = _source_quality_score(source_chunk)
+    content_quality_score = _chunk_content_quality_score(source_chunk)
+    information_density_score = _chunk_information_density_score(source_chunk)
+    retrieval_component = min(max(retrieval_score or 0.0, 0.0), 5.0) / 5.0
+    rank_score = (
+        (matched_span.score * 0.46)
+        + ((source_quality_score or 0.5) * 0.2)
+        + ((content_quality_score or 0.5) * 0.14)
+        + ((information_density_score or 0.5) * 0.1)
+        + (retrieval_component * 0.1)
+    )
+    rounded_rank_score = round(min(0.99, max(0.0, rank_score)), 4)
+    return VerificationEvidenceCandidate(
+        source_chunk=source_chunk,
+        matched_span=matched_span,
+        retrieval_score=retrieval_score,
+        rank_score=rounded_rank_score,
+        diversity_adjusted_score=rounded_rank_score,
+        reuse_penalty=0.0,
+        chunk_reuse_count_before=0,
+        span_reuse_count_before=0,
+        content_reuse_count_before=0,
+        source_quality_score=round(source_quality_score or 0.5, 4),
+        content_quality_score=round(content_quality_score or 0.5, 4),
+        information_density_score=round(information_density_score or 0.5, 4),
+        content_hash=_source_content_hash(source_chunk),
+        chunk_text_hash=_source_chunk_text_hash(source_chunk),
+        span_text_hash=normalized_excerpt_hash(matched_span.excerpt),
+    )
+
+
+def _select_verification_evidence(
+    candidates: list[VerificationEvidenceCandidate],
+    *,
+    reuse_tracker: EvidenceReuseTracker | None = None,
+) -> list[VerificationEvidenceCandidate]:
+    if not candidates:
+        return []
+    strong_support = _select_diverse_relation_evidence(
+        candidates,
+        relation_type=CLAIM_EVIDENCE_RELATION_SUPPORT,
+        limit=1,
+        reuse_tracker=reuse_tracker,
+    )
+    contradict = _select_diverse_relation_evidence(
+        candidates,
+        relation_type=CLAIM_EVIDENCE_RELATION_CONTRADICT,
+        limit=1,
+        reuse_tracker=reuse_tracker,
+    )
+    weak_limit = 1 if not strong_support or contradict else 0
+    weak_support = _select_diverse_relation_evidence(
+        candidates,
+        relation_type=CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT,
+        limit=weak_limit,
+        used_keys=_candidate_diversity_keys(strong_support + contradict),
+        reuse_tracker=reuse_tracker,
+    )
+    selected = strong_support + contradict + weak_support
+    return sorted(
+        selected,
+        key=lambda item: (
+            _verification_relation_sort_key(item.matched_span.relation_type),
+            -item.diversity_adjusted_score,
+            -item.rank_score,
+            item.source_chunk.source_document.domain,
+            item.source_chunk.chunk_no,
+            item.matched_span.start_offset,
+        ),
+    )
+
+
+def _select_diverse_relation_evidence(
+    candidates: list[VerificationEvidenceCandidate],
+    *,
+    relation_type: str,
+    limit: int,
+    used_keys: set[tuple[str, str | None]] | None = None,
+    reuse_tracker: EvidenceReuseTracker | None = None,
+) -> list[VerificationEvidenceCandidate]:
+    if limit <= 0:
+        return []
+    selected: list[VerificationEvidenceCandidate] = []
+    selected_keys = set(used_keys or set())
+    relation_candidates = sorted(
+        (
+            _candidate_with_reuse_penalty(candidate, reuse_tracker)
+            for candidate in candidates
+            if candidate.matched_span.relation_type == relation_type
+        ),
+        key=lambda item: (
+            -item.diversity_adjusted_score,
+            -item.rank_score,
+            -item.source_quality_score,
+            -item.content_quality_score,
+            item.source_chunk.source_document.domain,
+            item.source_chunk.chunk_no,
+            item.matched_span.start_offset,
+        ),
+    )
+    for candidate in relation_candidates:
+        diversity_key = (
+            candidate.source_chunk.source_document.domain,
+            candidate.content_hash,
+        )
+        if diversity_key in selected_keys:
+            continue
+        selected.append(candidate)
+        selected_keys.add(diversity_key)
+        if len(selected) >= limit:
+            break
+    if len(selected) >= limit:
+        return selected
+    for candidate in relation_candidates:
+        if candidate in selected:
+            continue
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _candidate_diversity_keys(
+    candidates: list[VerificationEvidenceCandidate],
+) -> set[tuple[str, str | None]]:
+    return {
+        (
+            candidate.source_chunk.source_document.domain,
+            candidate.content_hash,
+        )
+        for candidate in candidates
+    }
+
+
+def _candidate_with_reuse_penalty(
+    candidate: VerificationEvidenceCandidate,
+    reuse_tracker: EvidenceReuseTracker | None,
+) -> VerificationEvidenceCandidate:
+    if reuse_tracker is None:
+        return candidate
+    chunk_key = _candidate_chunk_key(candidate)
+    span_key = _candidate_span_key(candidate)
+    content_key = _candidate_content_key(candidate)
+    chunk_reuse_count = reuse_tracker.chunk_counts.get(chunk_key, 0)
+    span_reuse_count = reuse_tracker.span_counts.get(span_key, 0)
+    content_reuse_count = reuse_tracker.content_counts.get(content_key, 0)
+    penalty = min(
+        0.14,
+        min(0.08, chunk_reuse_count * 0.04)
+        + min(0.10, span_reuse_count * 0.05)
+        + min(0.06, content_reuse_count * 0.03),
+    )
+    adjusted_score = round(max(0.0, candidate.rank_score - penalty), 4)
+    return replace(
+        candidate,
+        diversity_adjusted_score=adjusted_score,
+        reuse_penalty=round(penalty, 4),
+        chunk_reuse_count_before=chunk_reuse_count,
+        span_reuse_count_before=span_reuse_count,
+        content_reuse_count_before=content_reuse_count,
+    )
+
+
+def _record_candidate_reuse(
+    reuse_tracker: EvidenceReuseTracker,
+    candidate: VerificationEvidenceCandidate,
+) -> None:
+    chunk_key = _candidate_chunk_key(candidate)
+    span_key = _candidate_span_key(candidate)
+    content_key = _candidate_content_key(candidate)
+    reuse_tracker.chunk_counts[chunk_key] = reuse_tracker.chunk_counts.get(chunk_key, 0) + 1
+    reuse_tracker.span_counts[span_key] = reuse_tracker.span_counts.get(span_key, 0) + 1
+    reuse_tracker.content_counts[content_key] = reuse_tracker.content_counts.get(content_key, 0) + 1
+
+
+def _candidate_chunk_key(candidate: VerificationEvidenceCandidate) -> str:
+    return str(candidate.source_chunk.id)
+
+
+def _candidate_span_key(candidate: VerificationEvidenceCandidate) -> str:
+    return (
+        f"{candidate.source_chunk.id}:"
+        f"{candidate.matched_span.start_offset}:"
+        f"{candidate.matched_span.end_offset}:"
+        f"{candidate.span_text_hash}"
+    )
+
+
+def _candidate_content_key(candidate: VerificationEvidenceCandidate) -> str:
+    return candidate.span_text_hash or candidate.chunk_text_hash
+
+
+def _evidence_diversity_summary(
+    evidence_relation_details: list[dict[str, object]],
+) -> dict[str, object]:
+    source_document_ids = _unique_strings(evidence_relation_details, "source_document_id")
+    source_chunk_ids = _unique_strings(evidence_relation_details, "source_chunk_id")
+    citation_span_ids = _unique_strings(evidence_relation_details, "citation_span_id")
+    span_hashes = _unique_strings(evidence_relation_details, "span_text_hash")
+    reuse_penalties = [
+        value
+        for value in (
+            _numeric_note(item.get("reuse_penalty")) for item in evidence_relation_details
+        )
+        if value is not None
+    ]
+    return {
+        "evidence_count": len(evidence_relation_details),
+        "unique_source_count": len(source_document_ids),
+        "unique_chunk_count": len(source_chunk_ids),
+        "unique_span_count": len(citation_span_ids),
+        "unique_span_hash_count": len(span_hashes),
+        "max_reuse_penalty": round(max(reuse_penalties), 4) if reuse_penalties else 0.0,
+        "mean_reuse_penalty": (
+            round(sum(reuse_penalties) / len(reuse_penalties), 4) if reuse_penalties else 0.0
+        ),
+    }
+
+
+def _unique_strings(rows: list[dict[str, object]], key: str) -> set[str]:
+    values: set[str] = set()
+    for row in rows:
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            values.add(value)
+    return values
+
+
+def _verification_relation_sort_key(relation_type: str) -> int:
+    if relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT:
+        return 0
+    if relation_type == CLAIM_EVIDENCE_RELATION_CONTRADICT:
+        return 1
+    if relation_type == CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT:
+        return 2
+    return 3
 
 
 def _source_chunk_eligible_for_claims(source_chunk: SourceChunk) -> bool:
@@ -1221,7 +1568,7 @@ def _build_claim_drafting_diagnostics(
     chunks_seen: list[tuple[SourceChunk, float | None]],
     candidates: list[DraftClaimCandidate],
     query: str,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     rejected_candidates = [candidate for candidate in candidates if candidate.rejected_rules]
     distribution: dict[str, int] = {}
     for candidate in rejected_candidates:
@@ -1265,7 +1612,7 @@ def _candidate_diagnostic(
     candidate: DraftClaimCandidate,
     *,
     query: str | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     rejected_reason = _first_rejection_reason(list(candidate.rejected_rules), candidate.score)
     return {
         **_evidence_candidate_payload(candidate, query=query),
@@ -1283,7 +1630,7 @@ def _candidate_diagnostic(
     }
 
 
-def _chunk_diagnostic(source_chunk: SourceChunk) -> dict[str, object]:
+def _chunk_diagnostic(source_chunk: SourceChunk) -> dict[str, Any]:
     metadata = source_chunk.metadata_json or {}
     return {
         "source_chunk_id": str(source_chunk.id),
@@ -1301,7 +1648,7 @@ def _evidence_candidate_payload(
     candidate: DraftClaimCandidate,
     *,
     query: str | None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     source_chunk = candidate.source_chunk
     source_document = source_chunk.source_document
     metadata = source_chunk.metadata_json or {}
@@ -1359,10 +1706,10 @@ def _candidate_evidence_id(candidate: DraftClaimCandidate) -> str:
 
 def _claim_lineage_notes(
     *,
-    evidence_candidate: dict[str, object],
+    evidence_candidate: dict[str, Any],
     citation_span_id: str,
     claim_evidence_id: str,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     candidate_with_links = {
         **evidence_candidate,
         "citation_span_id": citation_span_id,
@@ -1383,11 +1730,33 @@ def _chunk_content_quality_score(source_chunk: SourceChunk) -> float | None:
     return None
 
 
+def _chunk_information_density_score(source_chunk: SourceChunk) -> float | None:
+    metadata = source_chunk.metadata_json or {}
+    quality_score = metadata.get("information_density_score")
+    if isinstance(quality_score, int | float):
+        return float(quality_score)
+    return None
+
+
 def _source_quality_score(source_chunk: SourceChunk) -> float | None:
     source_score = source_chunk.source_document.final_source_score
     if isinstance(source_score, int | float):
         return float(source_score)
     return None
+
+
+def _source_content_hash(source_chunk: SourceChunk) -> str | None:
+    content_snapshot = source_chunk.source_document.content_snapshot
+    if content_snapshot is None:
+        return None
+    content_hash = content_snapshot.content_hash
+    return content_hash if isinstance(content_hash, str) and content_hash.strip() else None
+
+
+def _source_chunk_text_hash(source_chunk: SourceChunk) -> str:
+    normalized = " ".join(source_chunk.text.lower().split())
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _paragraph_index(text: str, start_offset: int) -> int:

@@ -6,10 +6,18 @@ import {
   PlanTaskRequest,
   PipelineRunResponse,
   ResearchPlanResponse,
+  ResearchTaskListResponse,
   TaskEventListResponse,
+  TaskMutationResponse,
 } from './types';
 
 export const taskApi = {
+  listTasks: async (): Promise<ResearchTaskListResponse> => {
+    return fetchApi<ResearchTaskListResponse>('/api/v1/research/tasks', {
+      method: 'GET',
+    });
+  },
+
   createTask: async (data: CreateTaskRequest): Promise<CreateTaskResponse> => {
     return fetchApi<CreateTaskResponse>('/api/v1/research/tasks', {
       method: 'POST',
@@ -41,6 +49,24 @@ export const taskApi = {
 
   runTask: async (taskId: string): Promise<PipelineRunResponse> => {
     return fetchApi<PipelineRunResponse>(`/api/v1/research/tasks/${taskId}/run`, {
+      method: 'POST',
+    });
+  },
+
+  pauseTask: async (taskId: string): Promise<TaskMutationResponse> => {
+    return fetchApi<TaskMutationResponse>(`/api/v1/research/tasks/${taskId}/pause`, {
+      method: 'POST',
+    });
+  },
+
+  resumeTask: async (taskId: string): Promise<TaskMutationResponse> => {
+    return fetchApi<TaskMutationResponse>(`/api/v1/research/tasks/${taskId}/resume`, {
+      method: 'POST',
+    });
+  },
+
+  cancelTask: async (taskId: string): Promise<TaskMutationResponse> => {
+    return fetchApi<TaskMutationResponse>(`/api/v1/research/tasks/${taskId}/cancel`, {
       method: 'POST',
     });
   },

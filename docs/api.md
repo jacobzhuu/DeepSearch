@@ -110,6 +110,37 @@ Response `201 Created`:
 }
 ```
 
+### `GET /api/v1/research/tasks`
+
+Purpose: list recent `research_task` rows for the single-operator web workspace.
+
+Query parameters:
+
+- `status`: optional status filter, case-insensitive
+- `limit`: optional page size cap, `1..200`, default `50`
+
+Response `200 OK`:
+
+```json
+{
+  "tasks": [
+    {
+      "task_id": "uuid",
+      "query": "近30天 NVIDIA 在开源模型生态上的关键发布与影响",
+      "status": "COMPLETED",
+      "revision_no": 1,
+      "created_at": "2026-04-22T12:00:00Z",
+      "updated_at": "2026-04-22T12:10:00Z",
+      "started_at": "2026-04-22T12:01:00Z",
+      "ended_at": "2026-04-22T12:10:00Z",
+      "events_total": 12,
+      "latest_event_at": "2026-04-22T12:10:00Z"
+    }
+  ],
+  "count": 1
+}
+```
+
 ### `POST /api/v1/research/tasks/{task_id}/plan`
 
 Purpose: create a visible pre-run research plan for a `PLANNED` task and emit
@@ -177,6 +208,15 @@ preview, a raw-output hash, and categorized validation errors such as missing fi
 fields, invalid enum values, wrong types, and failed paths when available. If the operator edits a
 fallback plan, the latest task detail still preserves the prior planner diagnostics.
 
+### `GET /api/v1/research/tasks/{task_id}/plan`
+
+Purpose: return the latest visible research plan for the task as a stable read surface over the
+`research_plan.created` task-event ledger. This endpoint does not introduce a separate
+`research_plan` table.
+
+Response `200 OK` returns task metadata plus `research_plan`. If no plan has been generated yet,
+`research_plan` is `null`.
+
 ### `GET /api/v1/research/tasks/{task_id}`
 
 Purpose: return task metadata, current status, and minimal progress.
@@ -220,6 +260,10 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 - `fetch_failed`
 - `failed_sources` with URL, HTTP status, error code, and error reason when available
 - `parse_decisions` with per-snapshot parsing outcome details when parsing has run or failed
+- multiformat parser diagnostics, including source format, parser status/kind, parser warnings,
+  MIME policy, page range, slide range, sheet names, cell ranges, and locator fallback reasons
+- `source_judgments` when optional shadow LLM source judge is enabled; these are advisory
+  diagnostics only and do not participate in final ranking in this MVP
 - `answer_yield` per source document, including extracted text length, chunk counts, candidate sentence counts, answer-relevant candidate counts, accepted claim candidate counts, category coverage, and low-yield reasons
 - `answer_coverage` for definition, mechanism, privacy, and feature coverage
 - `answer_slots` and `report_slot_coverage`, derived from the query-specific deterministic answer-slot contract
@@ -289,7 +333,9 @@ Response `200 OK`:
 
 ### `POST /api/v1/research/tasks/{task_id}/pause`
 
-Purpose: perform the minimal Phase 2 transition `PLANNED -> PAUSED` and emit `task.paused`.
+Purpose: transition `PLANNED` or an active runtime status to `PAUSED` and emit `task.paused`.
+
+Boundary: pause is checked between pipeline stages. A long in-flight fetch, parse, index, or report operation may finish its current service call before the worker observes the pause.
 
 ### `POST /api/v1/research/tasks/{task_id}/resume`
 
@@ -299,7 +345,9 @@ Semantics: `resume` requeues paused work for the host-local worker. It does not 
 
 ### `POST /api/v1/research/tasks/{task_id}/cancel`
 
-Purpose: perform the minimal Phase 2 transition `PLANNED|PAUSED -> CANCELLED` and emit `task.cancelled`.
+Purpose: transition `PLANNED`, `PAUSED`, or an active runtime status to `CANCELLED` and emit `task.cancelled`.
+
+Boundary: cancel is also observed at pipeline stage boundaries and before supplemental work; it is not a distributed worker interrupt or lease revocation protocol.
 
 ### `POST /api/v1/research/tasks/{task_id}/revise`
 
@@ -337,9 +385,9 @@ Command responses use the same shape:
 
 ## Phase 2 task transition rules
 
-- `pause`: allowed only from `PLANNED`
+- `pause`: allowed from `PLANNED` and active runtime statuses
 - `resume`: allowed only from `PAUSED`
-- `cancel`: allowed from `PLANNED` and `PAUSED`
+- `cancel`: allowed from `PLANNED`, `PAUSED`, and active runtime statuses
 - `revise`: allowed from `PLANNED` and `PAUSED`, and always results in `PLANNED`
 - invalid transitions return `409 Conflict`
 - unknown task ids return `404 Not Found`
@@ -761,6 +809,7 @@ Read contract:
 
 - ordered by `fetched_at`, then ascending `source_document_id`
 - each row includes `content_snapshot_id` so parsed output remains traceable to the exact snapshot used
+- each row exposes deterministic source-quality audit fields: `authority_score`, `freshness_score`, `originality_score`, `consistency_score`, `safety_score`, `final_source_score`, and a `quality` object with source-quality reasons; `quality.freshness_state = "unknown"` is explicit when no publication date is available
 - current rows are current-state source records, not a parse-history version chain
 
 Response `200 OK`:
@@ -772,12 +821,29 @@ Response `200 OK`:
     {
       "source_document_id": "uuid",
       "content_snapshot_id": "uuid",
+      "content_hash": "sha256:...",
       "canonical_url": "https://example.com/",
       "domain": "example.com",
       "title": "Example Domain",
       "source_type": "web_page",
       "published_at": null,
-      "fetched_at": "2026-04-23T13:00:01Z"
+      "fetched_at": "2026-04-23T13:00:01Z",
+      "authority_score": 0.84,
+      "freshness_score": null,
+      "originality_score": 0.74,
+      "consistency_score": 0.88,
+      "safety_score": 0.84,
+      "final_source_score": 0.9,
+      "quality": {
+        "final_score": 0.9,
+        "authority_score": 0.95,
+        "relevance_score": 0.88,
+        "crawlability_score": 0.86,
+        "information_density_score": 0.74,
+        "freshness_state": "unknown",
+        "reason": "official_docs",
+        "reasons": ["official_docs", "freshness:unknown"]
+      }
     }
   ]
 }
@@ -1027,7 +1093,7 @@ Response `200 OK`:
 
 ### `POST /api/v1/research/tasks/{task_id}/claims/draft`
 
-Purpose: execute the current minimal claim-drafting flow for a task, selecting chunks from retrieval or explicit `source_chunk` ids, drafting support-only claims, and binding each claim to one validated `citation_span` plus one `claim_evidence` row.
+Purpose: execute the current minimal claim-drafting flow for a task, selecting chunks from retrieval or explicit `source_chunk` ids, drafting candidate claims, and binding each claim to one validated `citation_span` plus one `candidate_support` `claim_evidence` row. Draft evidence is provenance for the candidate; it is not counted as verified support.
 
 Request:
 
@@ -1070,7 +1136,7 @@ Response `200 OK`:
       "claim_type": "fact",
       "confidence": 0.73,
       "verification_status": "draft",
-      "relation_type": "support",
+      "relation_type": "candidate_support",
       "evidence_score": 0.73,
       "start_offset": 16,
       "end_offset": 94,
@@ -1087,7 +1153,7 @@ Response `200 OK`:
 Command contract:
 
 - allowed only when the task status is `PLANNED`
-- drafting remains support-only; it does not create contradiction or mixed-evidence judgments
+- drafting creates only `candidate_support`; it does not create verified support, weak support, contradiction, or mixed-evidence judgments
 - drafting sets `verification_status = "draft"` only; no verifier semantics are implied
 - each created or reused citation span is validated against the exact `source_chunk.text` slice before use
 - repeated calls are guarded by exact-statement claim reuse and existing citation or claim-evidence uniqueness boundaries
@@ -1111,6 +1177,7 @@ Read contract:
   - `confidence`
   - `verification_status`
   - `support_evidence_count`
+  - `weak_support_evidence_count`
   - `contradict_evidence_count`
   - `rationale`
   - `notes`
@@ -1129,13 +1196,16 @@ Read contract:
 
 - ordered by ascending `claim_id`, then ascending `claim_evidence_id`
 - each item includes the exact `citation_span` offsets and excerpt so the evidence chain is reconstructible without additional joins
+- verifier-created evidence includes `relation_detail`, `support_level`, `verifier_method`, `reasons`, `citation_precision`, `citation_precision_reason`, and a `quality` object containing evidence rank, diversity-adjusted score, reuse penalty/counts, source quality, content quality, information density, retrieval score, selection rank, source content hash, chunk text hash, and span text hash when available
 - `relation_type` currently uses the minimum stable Phase 8 set:
+  - `candidate_support`
   - `support`
+  - `weak_support`
   - `contradict`
 
 ### `POST /api/v1/research/tasks/{task_id}/claims/verify`
 
-Purpose: execute the minimal synchronous Phase 8 verification flow for existing task claims, reusing current retrieval to scan task-scoped `source_chunk` candidates, adding any new `support` or `contradict` evidence links, and updating each processed claim to `supported`, `mixed`, or `unsupported`. The verifier remains deterministic and lexical; it records `strong_support`, `weak_support`, contradiction, numeric/date mismatch, shallow-overlap, and scope-mismatch metadata in `claim.notes_json["verification"]` without adding new persisted statuses.
+Purpose: execute the minimal synchronous Phase 8 verification flow for existing task claims, reusing current retrieval to scan task-scoped `source_chunk` candidates, ranking and diversifying candidate evidence, adding selected `support`, `weak_support`, or `contradict` evidence links, and updating each processed claim to `supported`, `mixed`, `contradicted`, or `unsupported`. The verifier remains deterministic and lexical; it records `strong_support`, `weak_support`, contradiction, numeric/date mismatch, shallow-overlap, scope-mismatch, evidence-selection, cross-claim reuse, and citation-precision metadata in `claim.notes_json["verification"]`.
 
 Request:
 
@@ -1171,14 +1241,19 @@ Response `200 OK`:
       "confidence": 0.73,
       "verification_status": "mixed",
       "support_evidence_count": 1,
+      "weak_support_evidence_count": 0,
       "contradict_evidence_count": 1,
       "rationale": "Found 1 support evidence and 1 contradict evidence.",
       "notes": {
         "verification": {
-          "method": "retrieval_conflict_scan_v1",
+          "method": "lexical_overlap_contradiction_scan_v2",
           "verification_query": "This domain is for use in illustrative examples in documents and test content.",
           "support_evidence_count": 1,
+          "weak_support_evidence_count": 0,
           "contradict_evidence_count": 1,
+          "candidate_evidence_count": 2,
+          "selected_evidence_count": 2,
+          "dropped_evidence_count": 0,
           "rationale": "Found 1 support evidence and 1 contradict evidence."
         }
       }
@@ -1191,13 +1266,15 @@ Command contract:
 
 - allowed only when the task status is `PLANNED`
 - verification builds on the current retrieval, `citation_span`, and `claim_evidence` seams
-- verification adds only these evidence relations:
+- verification adds only these verifier evidence relations:
   - `support`
+  - `weak_support`
   - `contradict`
 - verification updates `claim.verification_status` only within this minimum stable set:
   - `draft`
   - `supported`
   - `mixed`
+  - `contradicted`
   - `unsupported`
 - exact citation-span validation still applies before create or reuse:
   - `start_offset < end_offset`
@@ -1213,9 +1290,12 @@ Command contract:
   - `draft`
   - `supported`
   - `mixed`
+  - `contradicted`
   - `unsupported`
 - current claim evidence uses this minimum stable set:
+  - `candidate_support`
   - `support`
+  - `weak_support`
   - `contradict`
 - citation spans are validated before create or reuse:
   - `start_offset < end_offset`
@@ -1243,10 +1323,12 @@ Command contract:
 - verification skips citation excerpts that fail the same minimum claimable-excerpt rules, so short fragments are not added as support evidence
 - verification is deterministic and explainable:
   - retrieve task-scoped chunks by `claim.statement`
-  - classify the best sentence-like span as `support`, `contradict`, or no match
+  - classify the best sentence-like span as `support`, `weak_support`, `contradict`, or no match
+  - rank candidate evidence by lexical match, source quality, chunk content quality, information density, retrieval score, and source/content diversity
+  - select a small evidence set instead of persisting every weakly related chunk
   - persist or reuse the exact `citation_span`
   - persist or reuse the relation-specific `claim_evidence`
-  - aggregate support and contradict counts into `claim.notes["verification"]`
+  - aggregate strong support, weak support, contradiction, selected/dropped evidence counts, relation reasons, and citation precision into `claim.notes["verification"]`
 
 ## Report endpoints
 
@@ -1279,6 +1361,7 @@ Response `200 OK`:
   "created_at": "2026-04-24T10:30:00Z",
   "supported_claims": 1,
   "mixed_claims": 1,
+  "contradicted_claims": 0,
   "unsupported_claims": 1,
   "draft_claims": 0,
   "reused_existing": false,
@@ -1295,7 +1378,7 @@ Command contract:
   - `claim_evidence`
   - `verification_status`
 - `supported` claims may appear as settled conclusions
-- `mixed`, `unsupported`, and `draft` claims must remain explicitly labeled in the report body
+- `mixed`, `contradicted`, `unsupported`, and `draft` claims must remain explicitly labeled in the report body
 - LLM-written report prose is allowed only from a structured claim/evidence/citation-span bundle; every rendered LLM item must carry valid claim/evidence/citation ids
 - repeated calls reuse the latest artifact when the newly rendered Markdown bytes are identical
 - repeated calls create a new Markdown artifact version only when the rendered content changes
@@ -1354,7 +1437,7 @@ Response `200 OK`:
   - appendix: claim evidence mapping
 - current report synthesis never invents unsupported conclusions:
   - only `supported` claims appear as settled conclusions
-  - `mixed` and `unsupported` claims are rendered only inside uncertainty-aware sections with explicit status labels
+  - `mixed`, `contradicted`, and `unsupported` claims are rendered only inside uncertainty-aware sections with explicit status labels
 - grounded LLM report synthesis is constrained by ids:
   - the LLM prompt receives only verified claim rows and their claim-evidence / citation-span excerpts
   - the LLM must return structured JSON, not free-form Markdown
@@ -1396,6 +1479,7 @@ Execution contract:
 - transitions the task to `QUEUED`, emits `pipeline.queued`, and returns immediately
 - uses the existing database state as the minimal host-local queue; no Celery, Redis, or LangGraph runner is required
 - the worker may reuse a pre-run `research_plan.created` event; if no pre-run plan exists, it may run optional Research Planner v1 before search only when `LLM_ENABLED=true` and `RESEARCH_PLANNER_ENABLED=true`
+- the debug endpoint and host-local worker both use the same `DebugRealPipelineRunner` core pipeline; the difference is that `/debug/run-real-pipeline` invokes it synchronously for development, while `/run` only queues the task and `scripts/research_worker.py` invokes the runner in a worker process
 - never uses an LLM to draft claims or verify evidence; final report writing may use the optional grounded LLM writer only when explicitly enabled and only from verified claim/evidence/citation-span bundles
 - the worker reuses the existing service-layer seams:
   - optional research planning
@@ -1578,7 +1662,7 @@ External dependencies:
 - `OPENSEARCH_INDEX_NAME`
 - optional planner-only OpenAI-compatible provider through `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`
 
-No LLM API is used by claim drafting or verification. Report writing remains deterministic unless `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`; in that mode the grounded report writer receives only verified claims and their evidence/citation-span excerpts, and invalid LLM output falls back to deterministic Markdown. Planner output is stored only in task-event payload JSON and task-detail observability summaries; there is no research-plan schema migration.
+No LLM API is used by claim drafting or verification. Report writing remains deterministic unless `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`; in that mode the grounded report writer receives only verified claims and their evidence/citation-span excerpts, and invalid LLM output falls back to deterministic Markdown. Planner output is stored only in task-event payload JSON and task-detail observability summaries; there is no research-plan schema migration. Optional source judging is controlled by `LLM_SOURCE_JUDGE_ENABLED=false` by default, `LLM_SOURCE_JUDGE_MAX_CANDIDATES=5`, and reserved `LLM_SOURCE_JUDGE_ACTIVE_RERANK=false`; the MVP records shadow diagnostics only and sets `used_in_final_ranking=false`.
 
 ## Phase 10 infrastructure-hardening rules
 
@@ -1615,6 +1699,12 @@ No LLM API is used by claim drafting or verification. Report writing remains det
   - it fails if no `content_snapshot`, `source_document`, or `source_chunk` is produced
   - it fails if indexing, claim drafting, verification, or report synthesis produces no persisted output
 - Phase 11 also adds a deterministic repository-local `scripts/mock_searxng.py` helper so the API smoke can be reproduced without relying on a live external search backend
+- `scripts/smoke_planner_pipeline.py` exercises the product worker path:
+  - `POST /api/v1/research/tasks`
+  - `POST /api/v1/research/tasks/{task_id}/run`
+  - poll `GET /api/v1/research/tasks/{task_id}` until the host-local worker reaches `COMPLETED`, `FAILED`, `CANCELLED`, or `PAUSED`
+  - verify non-empty `source_documents`, `source_chunks`, `claims`, and a readable Markdown `report_artifact`
+  - print task events and ledger highlights for operator diagnosis
 
 ## Out of scope in Phase 11
 

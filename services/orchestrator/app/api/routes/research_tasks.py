@@ -12,7 +12,10 @@ from services.orchestrator.app.api.schemas.research_tasks import (
     CreateResearchTaskRequest,
     PlanResearchTaskRequest,
     ResearchPlanMutationResponse,
+    ResearchPlanResponse,
     ResearchTaskDetailResponse,
+    ResearchTaskListItemResponse,
+    ResearchTaskListResponse,
     ResearchTaskMutationResponse,
     ResearchTaskObservabilityResponse,
     ResearchTaskProgressResponse,
@@ -75,6 +78,18 @@ def create_research_task(
         revision_no=task.revision_no,
         updated_at=task.updated_at,
     )
+
+
+@router.get("", response_model=ResearchTaskListResponse)
+def list_research_tasks(
+    service: ServiceDep,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> ResearchTaskListResponse:
+    normalized_status = status_filter.strip().upper() if status_filter else None
+    snapshots = service.list_task_snapshots(status=normalized_status, limit=limit)
+    tasks = [_serialize_task_list_item(snapshot) for snapshot in snapshots]
+    return ResearchTaskListResponse(tasks=tasks, count=len(tasks))
 
 
 @router.get("/{task_id}", response_model=ResearchTaskDetailResponse)
@@ -192,6 +207,40 @@ def plan_research_task(
         running_mode=running_mode,
         dependencies=dependencies,
         warnings=response_warnings,
+    )
+
+
+@router.get("/{task_id}/plan", response_model=ResearchPlanResponse)
+def get_research_plan(task_id: UUID, service: ServiceDep) -> ResearchPlanResponse:
+    snapshot = _get_task_snapshot_or_404(service, task_id)
+    for event in reversed(snapshot.events):
+        if event.event_type != "research_plan.created":
+            continue
+        payload = event.payload_json or {}
+        if not isinstance(payload, dict):
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            continue
+        plan = result.get("research_plan")
+        if not isinstance(plan, dict):
+            continue
+        return ResearchPlanResponse(
+            task_id=snapshot.task.id,
+            status=snapshot.task.status,
+            revision_no=snapshot.task.revision_no,
+            research_plan=plan,
+            planner_status=_string_or_none(payload.get("planner_status")),
+            planner_mode=_string_or_none(payload.get("planner_mode")),
+            plan_source=_string_or_none(payload.get("plan_source")),
+            created_at=event.created_at,
+            warnings=_string_list(payload.get("warnings")),
+        )
+    return ResearchPlanResponse(
+        task_id=snapshot.task.id,
+        status=snapshot.task.status,
+        revision_no=snapshot.task.revision_no,
+        research_plan=None,
     )
 
 
@@ -321,6 +370,22 @@ def _serialize_task_snapshot(snapshot: TaskSnapshot) -> ResearchTaskDetailRespon
     )
 
 
+def _serialize_task_list_item(snapshot: TaskSnapshot) -> ResearchTaskListItemResponse:
+    latest_event = snapshot.events[-1] if snapshot.events else None
+    return ResearchTaskListItemResponse(
+        task_id=snapshot.task.id,
+        query=snapshot.task.query,
+        status=snapshot.task.status,
+        revision_no=snapshot.task.revision_no,
+        created_at=snapshot.task.created_at,
+        updated_at=snapshot.task.updated_at,
+        started_at=snapshot.task.started_at,
+        ended_at=snapshot.task.ended_at,
+        events_total=len(snapshot.events),
+        latest_event_at=latest_event.created_at if latest_event is not None else None,
+    )
+
+
 def _dependency_summary(settings: Any) -> dict[str, Any]:
     search_mode = settings.search_provider.strip().lower()
     index_mode = settings.index_backend.strip().lower()
@@ -345,6 +410,10 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
             settings.research_planner_enabled and settings.llm_enabled
         ),
         "llm_report_writer_enabled": _llm_report_writer_configured(settings),
+        "llm_source_judge_enabled": _llm_source_judge_configured(settings),
+        "llm_source_judge_active_rerank": bool(
+            settings.llm_source_judge_active_rerank and _llm_source_judge_configured(settings)
+        ),
         "report_writer_mode": (
             "llm-grounded" if _llm_report_writer_configured(settings) else "deterministic"
         ),
@@ -371,7 +440,11 @@ def _uses_llm_api(settings: Any) -> bool:
     return bool(
         settings.llm_enabled
         and settings.llm_provider.strip().lower() not in {"", "noop"}
-        and (settings.research_planner_enabled or settings.llm_report_writer_enabled)
+        and (
+            settings.research_planner_enabled
+            or settings.llm_report_writer_enabled
+            or settings.llm_source_judge_enabled
+        )
     )
 
 
@@ -381,6 +454,10 @@ def _llm_report_writer_configured(settings: Any) -> bool:
         and settings.llm_report_writer_enabled
         and settings.llm_provider.strip().lower() not in {"", "noop"}
     )
+
+
+def _llm_source_judge_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_source_judge_enabled)
 
 
 def _running_mode(dependencies: dict[str, Any]) -> str:
@@ -441,6 +518,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     known_path_fallback: dict[str, Any] | None = None
     selected_sources_from_search: list[dict[str, Any]] = []
     selected_sources: list[dict[str, Any]] = []
+    source_judgments: list[dict[str, Any]] = []
     fetch_succeeded: int | None = None
     fetch_failed: int | None = None
     fetch_succeeded_total = 0
@@ -504,9 +582,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 subquestions = result_plan.get("subquestions")
                 if isinstance(subquestions, list):
                     subquestion_count = len(subquestions)
-                search_queries = result_plan.get("search_queries")
-                if isinstance(search_queries, list):
-                    planner_search_query_count = len(search_queries)
+                plan_search_queries = result_plan.get("search_queries")
+                if isinstance(plan_search_queries, list):
+                    planner_search_query_count = len(plan_search_queries)
                 raw_planner_queries = (
                     _object_list(result_plan.get("raw_planner_queries")) or raw_planner_queries
                 )
@@ -564,6 +642,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             if isinstance(fallback, dict):
                 known_path_fallback = fallback
             selected_sources = _object_list(result.get("selected_sources"))
+            source_judgments = _object_list(result.get("source_judgments")) or source_judgments
             raw_planner_queries = (
                 _object_list(result.get("raw_planner_queries")) or raw_planner_queries
             )
@@ -666,6 +745,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 if isinstance(fallback, dict):
                     known_path_fallback = fallback
                 selected_sources = _object_list(search.get("selected_sources")) or selected_sources
+                source_judgments = _object_list(search.get("source_judgments")) or source_judgments
             acquisition = result.get("acquisition")
             if isinstance(acquisition, dict):
                 succeeded = acquisition.get(
@@ -805,6 +885,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and known_path_fallback is None
         and not selected_sources_from_search
         and not selected_sources
+        and not source_judgments
         and fetch_succeeded is None
         and fetch_failed is None
         and not attempted_sources
@@ -850,6 +931,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         known_path_fallback=known_path_fallback,
         selected_sources_from_search=selected_sources_from_search,
         selected_sources=selected_sources,
+        source_judgments=source_judgments,
         fetch_succeeded=fetch_succeeded,
         fetch_failed=fetch_failed,
         attempted_sources=attempted_sources,

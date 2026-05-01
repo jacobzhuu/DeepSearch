@@ -7,8 +7,35 @@ import {
   PlanTaskRequest,
   PipelineRunResponse,
   ResearchPlanResponse,
+  ResearchTaskListResponse,
   TaskEventListResponse,
+  TaskMutationResponse,
 } from './types';
+
+export function useTasks() {
+  const [tasksData, setTasksData] = useState<ResearchTaskListResponse | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [error, setError] = useState<Error | null>(null);
+
+  const fetchTasks = useCallback(async (background = false) => {
+    if (!background) setIsLoading(true);
+    setError(null);
+    try {
+      const data = await taskApi.listTasks();
+      setTasksData(data);
+    } catch (err) {
+      setError(err instanceof Error ? err : new Error('Failed to fetch tasks'));
+    } finally {
+      if (!background) setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchTasks();
+  }, [fetchTasks]);
+
+  return { tasksData, isLoading, error, refetch: fetchTasks };
+}
 
 export function useTask(taskId: string | undefined) {
   const [task, setTask] = useState<ResearchTask | null>(null);
@@ -86,6 +113,34 @@ export function useRunTask() {
   };
 
   return { runTask, isRunning, result, error };
+}
+
+export function useTaskAction() {
+  const [isMutating, setIsMutating] = useState<boolean>(false);
+  const [error, setError] = useState<Error | null>(null);
+
+  const mutateTask = async (
+    taskId: string,
+    action: 'pause' | 'resume' | 'cancel',
+  ): Promise<TaskMutationResponse | null> => {
+    setIsMutating(true);
+    setError(null);
+    try {
+      const result = action === 'pause'
+        ? await taskApi.pauseTask(taskId)
+        : action === 'resume'
+          ? await taskApi.resumeTask(taskId)
+          : await taskApi.cancelTask(taskId);
+      return result;
+    } catch (err) {
+      setError(err instanceof Error ? err : new Error(`Failed to ${action} task`));
+      return null;
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  return { mutateTask, isMutating, error };
 }
 
 export function usePlanTask() {

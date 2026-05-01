@@ -16,14 +16,15 @@ from services.orchestrator.app.research_quality import (
     slot_ids_for_claim_category,
 )
 
-ClaimStatus = Literal["draft", "supported", "mixed", "unsupported"]
-EvidenceRelation = Literal["support", "contradict"]
+ClaimStatus = Literal["draft", "supported", "mixed", "unsupported", "contradicted"]
+EvidenceRelation = Literal["candidate_support", "support", "weak_support", "contradict"]
 
 _STATUS_PRIORITY: dict[str, int] = {
     "supported": 0,
     "mixed": 1,
-    "unsupported": 2,
-    "draft": 3,
+    "contradicted": 2,
+    "unsupported": 3,
+    "draft": 4,
 }
 _CATEGORY_PRIORITY: dict[str, int] = {
     "definition": 0,
@@ -52,6 +53,12 @@ class ReportEvidenceItem:
     relation_detail: str | None = None
     support_level: str | None = None
     verifier_method: str | None = None
+    citation_precision: str | None = None
+    citation_precision_reason: str | None = None
+    reuse_penalty: float | None = None
+    chunk_reuse_count_before: int | None = None
+    span_reuse_count_before: int | None = None
+    content_reuse_count_before: int | None = None
     reasons: tuple[str, ...] = ()
 
 
@@ -88,6 +95,7 @@ class RenderedMarkdownReport:
     supported_count: int
     mixed_count: int
     unsupported_count: int
+    contradicted_count: int
     draft_count: int
     answer_relevant_count: int
     excluded_low_quality_count: int
@@ -123,6 +131,9 @@ def render_markdown_report(
         item for item in supported_claims if _claim_support_level(item) != "weak"
     ]
     mixed_claims = [item for item in ordered_claims if item.verification_status == "mixed"]
+    contradicted_claims = [
+        item for item in ordered_claims if item.verification_status == "contradicted"
+    ]
     unsupported_claims = [
         item for item in ordered_claims if item.verification_status == "unsupported"
     ]
@@ -177,11 +188,12 @@ def render_markdown_report(
                 categories="/".join(missing_core_categories) or labels["additional"]
             )
         )
-    if mixed_claims or unsupported_claims or draft_claims:
+    if mixed_claims or contradicted_claims or unsupported_claims or draft_claims:
         lines.append(
             "- "
             + labels["uncertainty_counts"].format(
                 mixed=len(mixed_claims),
+                contradicted=len(contradicted_claims),
                 unsupported=len(unsupported_claims),
                 draft=len(draft_claims),
             )
@@ -261,6 +273,7 @@ def render_markdown_report(
             strong=len(strong_supported_claims),
             weak=len(weak_supported_claims),
             mixed=len(mixed_claims),
+            contradicted=len(contradicted_claims),
             unsupported=len(unsupported_claims),
             draft=len(draft_claims),
         )
@@ -285,7 +298,13 @@ def render_markdown_report(
         lines.append(f"- {labels['one_domain_warning']}")
 
     lines.extend(["", f"## {labels['unresolved']}", ""])
-    unresolved_claims = weak_supported_claims + mixed_claims + unsupported_claims + draft_claims
+    unresolved_claims = (
+        weak_supported_claims
+        + mixed_claims
+        + contradicted_claims
+        + unsupported_claims
+        + draft_claims
+    )
     weak_or_missing_slots = [
         slot
         for slot in slot_coverage_summary
@@ -332,6 +351,7 @@ def render_markdown_report(
         supported_count=len(supported_claims),
         mixed_count=len(mixed_claims),
         unsupported_count=len(unsupported_claims),
+        contradicted_count=len(contradicted_claims),
         draft_count=len(draft_claims),
         answer_relevant_count=answer_relevant_claim_count,
         excluded_low_quality_count=excluded_low_quality_claim_count,
@@ -543,7 +563,7 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "citation": "citation",
             "claim_counts": (
                 "Claim 计数：{strong} 条强支持、{weak} 条弱支持、{mixed} 条混合、"
-                "{unsupported} 条不支持、{draft} 条草稿。"
+                "{contradicted} 条反驳、{unsupported} 条不支持、{draft} 条草稿。"
             ),
             "claim_evidence_id": "claim_evidence",
             "claim_label": "Claim",
@@ -582,8 +602,8 @@ def _report_labels(report_language: str) -> dict[str, str]:
                 "本报告严格由已持久化的 task、claim、citation、evidence 和 verification 记录综合。"
             ),
             "uncertainty_counts": (
-                "当前仍有不确定性：{mixed} 条 mixed、{unsupported} 条 unsupported、"
-                "{draft} 条 draft。"
+                "当前仍有不确定性：{mixed} 条 mixed、{contradicted} 条 contradicted、"
+                "{unsupported} 条 unsupported、{draft} 条 draft。"
             ),
             "unresolved": "未解决问题 / 低覆盖区域",
             "weak_missing_slots": "缺失或较弱的必需答案槽位：{slots}。",
@@ -599,7 +619,8 @@ def _report_labels(report_language: str) -> dict[str, str]:
         "citation": "citation",
         "claim_counts": (
             "Claim counts: {strong} strongly supported, {weak} weak-supported, "
-            "{mixed} mixed, {unsupported} unsupported, {draft} draft."
+            "{mixed} mixed, {contradicted} contradicted, {unsupported} unsupported, "
+            "{draft} draft."
         ),
         "claim_evidence_id": "claim_evidence",
         "claim_label": "Claim",
@@ -652,8 +673,8 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "evidence, and verification records."
         ),
         "uncertainty_counts": (
-            "Current uncertainty remains: {mixed} mixed, {unsupported} unsupported, "
-            "{draft} draft."
+            "Current uncertainty remains: {mixed} mixed, {contradicted} contradicted, "
+            "{unsupported} unsupported, {draft} draft."
         ),
         "unresolved": "Unresolved / Low Coverage Areas",
         "weak_missing_slots": "Missing or weak required answer slots: {slots}.",

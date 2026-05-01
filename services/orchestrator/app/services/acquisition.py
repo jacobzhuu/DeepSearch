@@ -454,14 +454,15 @@ def _fetch_priority_key(
 
 
 def _fetch_priority_score(candidate_url: CandidateUrl, *, query: str | None = None) -> int:
-    return int(fetch_priority_metadata(candidate_url, query=query)["fetch_priority_score"])
+    score = fetch_priority_metadata(candidate_url, query=query).get("fetch_priority_score")
+    return score if isinstance(score, int) else 0
 
 
 def fetch_priority_metadata(
     candidate_url: CandidateUrl,
     *,
     query: str | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     known_path_candidate = bool((candidate_url.metadata_json or {}).get("known_path_candidate"))
     return source_intent_metadata(
         canonical_url=candidate_url.canonical_url,

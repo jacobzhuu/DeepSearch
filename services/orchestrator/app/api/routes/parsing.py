@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
@@ -107,6 +107,27 @@ def parse_task_snapshots(
                 reason=entry.reason,
                 decision=entry.decision,
                 parser_error=entry.parser_error,
+                source_format=_str_metadata(entry.source_document, "source_format"),
+                parser_status=_str_metadata(entry.source_document, "parser_status"),
+                parser_kind=_str_metadata(entry.source_document, "parser_kind"),
+                parser_warnings=_list_metadata(entry.source_document, "parser_warnings"),
+                parser_failure_reason=_str_metadata(
+                    entry.source_document,
+                    "parser_failure_reason",
+                ),
+                mime_policy=_dict_metadata(entry.source_document, "mime_policy"),
+                page_range=_int_list_metadata(entry.source_document, "page_range"),
+                page_locator_reliable=_bool_metadata(
+                    entry.source_document,
+                    "page_locator_reliable",
+                ),
+                locator_fallback_reason=_str_metadata(
+                    entry.source_document,
+                    "locator_fallback_reason",
+                ),
+                slide_range=_int_list_metadata(entry.source_document, "slide_range"),
+                sheet_names=_str_list_metadata(entry.source_document, "sheet_names"),
+                cell_ranges=_str_list_metadata(entry.source_document, "cell_ranges"),
                 updated_existing=entry.updated_existing,
             )
             for entry in result.entries
@@ -131,12 +152,21 @@ def list_task_source_documents(
             SourceDocumentResponse(
                 source_document_id=source_document.id,
                 content_snapshot_id=source_document.content_snapshot_id,
+                content_hash=_source_content_hash(source_document),
                 canonical_url=source_document.canonical_url,
                 domain=source_document.domain,
                 title=source_document.title,
                 source_type=source_document.source_type,
                 published_at=source_document.published_at,
                 fetched_at=source_document.fetched_at,
+                authority_score=source_document.authority_score,
+                freshness_score=source_document.freshness_score,
+                originality_score=source_document.originality_score,
+                consistency_score=source_document.consistency_score,
+                safety_score=source_document.safety_score,
+                final_source_score=source_document.final_source_score,
+                quality=_source_quality_payload(source_document),
+                parser_metadata=_source_parser_metadata(source_document),
             )
             for source_document in source_documents
         ],
@@ -160,12 +190,21 @@ def list_task_sources(
             SourceDocumentResponse(
                 source_document_id=source_document.id,
                 content_snapshot_id=source_document.content_snapshot_id,
+                content_hash=_source_content_hash(source_document),
                 canonical_url=source_document.canonical_url,
                 domain=source_document.domain,
                 title=source_document.title,
                 source_type=source_document.source_type,
                 published_at=source_document.published_at,
                 fetched_at=source_document.fetched_at,
+                authority_score=source_document.authority_score,
+                freshness_score=source_document.freshness_score,
+                originality_score=source_document.originality_score,
+                consistency_score=source_document.consistency_score,
+                safety_score=source_document.safety_score,
+                final_source_score=source_document.final_source_score,
+                quality=_source_quality_payload(source_document),
+                parser_metadata=_source_parser_metadata(source_document),
             )
             for source_document in source_documents
         ],
@@ -203,3 +242,98 @@ def list_task_source_chunks(
             for source_chunk in source_chunks
         ],
     )
+
+
+def _source_quality_payload(source_document: object) -> dict[str, object]:
+    chunks = getattr(source_document, "chunks", []) or []
+    first_chunk_metadata: dict[str, Any] = {}
+    if chunks:
+        first_chunk_metadata = getattr(chunks[0], "metadata_json", {}) or {}
+    nested_quality = first_chunk_metadata.get("source_quality")
+    if isinstance(nested_quality, dict):
+        return dict(nested_quality)
+    return {
+        "final_score": getattr(source_document, "final_source_score", None),
+        "authority_score": getattr(source_document, "authority_score", None),
+        "freshness_score": getattr(source_document, "freshness_score", None),
+        "relevance_score": getattr(source_document, "consistency_score", None),
+        "information_density_score": getattr(source_document, "originality_score", None),
+        "safety_score": getattr(source_document, "safety_score", None),
+        "freshness_state": (
+            "unknown" if getattr(source_document, "freshness_score", None) is None else "known"
+        ),
+    }
+
+
+def _source_parser_metadata(source_document: object) -> dict[str, object]:
+    chunks = getattr(source_document, "chunks", []) or []
+    first_chunk_metadata: dict[str, Any] = {}
+    if chunks:
+        first_chunk_metadata = getattr(chunks[0], "metadata_json", {}) or {}
+    keys = (
+        "source_format",
+        "parser_status",
+        "parser_kind",
+        "parser_warnings",
+        "parser_failure_reason",
+        "mime_policy",
+        "page_range",
+        "page_locator_reliable",
+        "locator_fallback_reason",
+        "slide_range",
+        "sheet_names",
+        "cell_ranges",
+        "paragraph_range",
+    )
+    return {key: value for key in keys if (value := first_chunk_metadata.get(key)) is not None}
+
+
+def _source_content_hash(source_document: object) -> str | None:
+    content_snapshot = getattr(source_document, "content_snapshot", None)
+    content_hash = getattr(content_snapshot, "content_hash", None)
+    if isinstance(content_hash, str) and content_hash.strip():
+        return content_hash
+    return None
+
+
+def _first_chunk_metadata(source_document: object | None, key: str) -> object | None:
+    if source_document is None:
+        return None
+    chunks = getattr(source_document, "chunks", []) or []
+    if not chunks:
+        return None
+    metadata = getattr(chunks[0], "metadata_json", {}) or {}
+    return metadata.get(key)
+
+
+def _dict_metadata(source_document: object | None, key: str) -> dict[str, Any] | None:
+    value = _first_chunk_metadata(source_document, key)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _str_metadata(source_document: object | None, key: str) -> str | None:
+    value = _first_chunk_metadata(source_document, key)
+    return value if isinstance(value, str) else None
+
+
+def _list_metadata(source_document: object | None, key: str) -> list[str] | None:
+    return _str_list_metadata(source_document, key)
+
+
+def _str_list_metadata(source_document: object | None, key: str) -> list[str] | None:
+    value = _first_chunk_metadata(source_document, key)
+    if not isinstance(value, list):
+        return None
+    return [str(item) for item in value]
+
+
+def _int_list_metadata(source_document: object | None, key: str) -> list[int] | None:
+    value = _first_chunk_metadata(source_document, key)
+    if not isinstance(value, list):
+        return None
+    return [item for item in value if isinstance(item, int)]
+
+
+def _bool_metadata(source_document: object | None, key: str) -> bool | None:
+    value = _first_chunk_metadata(source_document, key)
+    return value if isinstance(value, bool) else None

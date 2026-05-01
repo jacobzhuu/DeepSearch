@@ -109,14 +109,14 @@ def test_claim_drafting_endpoints_draft_and_list_claims(
 
         assert draft_response.status_code == 200
         assert draft_response.json()["created_claims"] == 1
-        assert draft_response.json()["claims"][0]["relation_type"] == "support"
+        assert draft_response.json()["claims"][0]["relation_type"] == "candidate_support"
 
         assert claims_response.status_code == 200
         assert claims_response.json()["claims"][0]["verification_status"] == "draft"
 
         assert evidence_response.status_code == 200
         evidence = evidence_response.json()["claim_evidence"][0]
-        assert evidence["relation_type"] == "support"
+        assert evidence["relation_type"] == "candidate_support"
         assert evidence["excerpt"] == seeded.text[evidence["start_offset"] : evidence["end_offset"]]
     finally:
         client_generator.close()

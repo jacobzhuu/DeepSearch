@@ -57,6 +57,7 @@ class SearchProviderError(RuntimeError):
         content_type: str | None,
         body_preview: str | None,
         unresponsive_engines: list[str],
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.reason = reason
@@ -64,6 +65,7 @@ class SearchProviderError(RuntimeError):
         self.content_type = content_type
         self.body_preview = body_preview
         self.unresponsive_engines = unresponsive_engines
+        self.details = details or {}
 
     def to_payload(self) -> dict[str, Any]:
         return {

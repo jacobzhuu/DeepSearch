@@ -64,6 +64,9 @@ def build_report_manifest(
                 1 for item in ordered_claims if item.verification_status == "supported"
             ),
             "mixed": sum(1 for item in ordered_claims if item.verification_status == "mixed"),
+            "contradicted": sum(
+                1 for item in ordered_claims if item.verification_status == "contradicted"
+            ),
             "unsupported": sum(
                 1 for item in ordered_claims if item.verification_status == "unsupported"
             ),
@@ -118,5 +121,11 @@ def _serialize_evidence(evidence: ReportEvidenceItem) -> dict[str, object]:
         "relation_detail": evidence.relation_detail,
         "support_level": evidence.support_level,
         "verifier_method": evidence.verifier_method,
+        "citation_precision": evidence.citation_precision,
+        "citation_precision_reason": evidence.citation_precision_reason,
+        "reuse_penalty": evidence.reuse_penalty,
+        "chunk_reuse_count_before": evidence.chunk_reuse_count_before,
+        "span_reuse_count_before": evidence.span_reuse_count_before,
+        "content_reuse_count_before": evidence.content_reuse_count_before,
         "reasons": list(evidence.reasons),
     }

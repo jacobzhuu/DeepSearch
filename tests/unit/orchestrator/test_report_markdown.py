@@ -85,4 +85,5 @@ def test_render_markdown_report_contains_required_sections_and_status_labels() -
     assert report.supported_count == 0
     assert report.mixed_count == 1
     assert report.unsupported_count == 0
+    assert report.contradicted_count == 0
     assert report.draft_count == 0

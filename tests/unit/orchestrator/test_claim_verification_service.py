@@ -16,11 +16,12 @@ from packages.db.repositories import (
     SourceDocumentRepository,
 )
 from services.orchestrator.app.claims import (
+    CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT,
     CLAIM_EVIDENCE_RELATION_CONTRADICT,
     CLAIM_EVIDENCE_RELATION_SUPPORT,
+    CLAIM_VERIFICATION_STATUS_CONTRADICTED,
     CLAIM_VERIFICATION_STATUS_DRAFT,
     CLAIM_VERIFICATION_STATUS_MIXED,
-    CLAIM_VERIFICATION_STATUS_UNSUPPORTED,
 )
 from services.orchestrator.app.indexing import (
     ChunkIndexDocument,
@@ -128,13 +129,15 @@ def test_claim_verification_service_marks_claim_mixed_when_support_and_contradic
     assert verify_result.verified_claims == 1
     assert verify_result.created_citation_spans == 1
     assert verify_result.reused_citation_spans == 1
-    assert verify_result.created_claim_evidence == 1
-    assert verify_result.reused_claim_evidence == 1
+    assert verify_result.created_claim_evidence == 2
+    assert verify_result.reused_claim_evidence == 0
     assert verify_result.entries[0].support_evidence_count == 1
+    assert verify_result.entries[0].weak_support_evidence_count == 0
     assert verify_result.entries[0].contradict_evidence_count == 1
     assert claim.verification_status == CLAIM_VERIFICATION_STATUS_MIXED
     assert relation_types == {
         CLAIM_EVIDENCE_RELATION_SUPPORT,
+        CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT,
         CLAIM_EVIDENCE_RELATION_CONTRADICT,
     }
     assert claim.notes_json["verification"]["rationale"] == (
@@ -200,9 +203,142 @@ def test_claim_verification_service_marks_claim_unsupported_when_only_contradict
     assert verify_result.verified_claims == 1
     assert verify_result.entries[0].support_evidence_count == 0
     assert verify_result.entries[0].contradict_evidence_count == 1
-    assert refreshed_claim.verification_status == CLAIM_VERIFICATION_STATUS_UNSUPPORTED
+    assert refreshed_claim.verification_status == CLAIM_VERIFICATION_STATUS_CONTRADICTED
     assert refreshed_claim.notes_json["verification"]["rationale"] == (
         "No support evidence found; found 1 contradict evidence."
+    )
+
+
+def test_claim_verification_service_downranks_reused_chunk_for_later_claim(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="SearXNG privacy and engine aggregation",
+        constraints={},
+    )
+    first_source = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://example.com/source-a",
+            domain="example.com",
+            title="Source A",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 23, 12, 0, tzinfo=UTC),
+            authority_score=0.8,
+            freshness_score=None,
+            originality_score=0.8,
+            consistency_score=0.8,
+            safety_score=0.9,
+            final_source_score=0.8,
+        )
+    )
+    second_source = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://example.net/source-b",
+            domain="example.net",
+            title="Source B",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 23, 12, 0, tzinfo=UTC),
+            authority_score=0.8,
+            freshness_score=None,
+            originality_score=0.8,
+            consistency_score=0.8,
+            safety_score=0.9,
+            final_source_score=0.8,
+        )
+    )
+    first_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=first_source.id,
+            chunk_no=0,
+            text=DIVERSITY_TEXT,
+            token_count=24,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.8},
+        )
+    )
+    second_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=second_source.id,
+            chunk_no=0,
+            text=DIVERSITY_TEXT,
+            token_count=24,
+            metadata_json={"strategy": "paragraph_window_v1", "content_quality_score": 0.8},
+        )
+    )
+    first_claim = ClaimRepository(db_session).add(
+        Claim(
+            task_id=task.id,
+            statement=(
+                "SearXNG aggregates results from multiple search engines without storing "
+                "user profiles."
+            ),
+            claim_type="fact",
+            confidence=0.7,
+            verification_status=CLAIM_VERIFICATION_STATUS_DRAFT,
+            notes_json={},
+        )
+    )
+    second_claim = ClaimRepository(db_session).add(
+        Claim(
+            task_id=task.id,
+            statement="SearXNG lets operators choose which engines to enable.",
+            claim_type="fact",
+            confidence=0.7,
+            verification_status=CLAIM_VERIFICATION_STATUS_DRAFT,
+            notes_json={},
+        )
+    )
+    db_session.commit()
+    backend = InMemoryChunkIndexBackend(
+        hits=[
+            _indexed_hit(
+                task_id=task.id,
+                source_document_id=first_source.id,
+                source_chunk_id=first_chunk.id,
+                canonical_url=first_source.canonical_url,
+                domain=first_source.domain,
+                text=DIVERSITY_TEXT,
+                score=1.5,
+            ),
+            _indexed_hit(
+                task_id=task.id,
+                source_document_id=second_source.id,
+                source_chunk_id=second_chunk.id,
+                canonical_url=second_source.canonical_url,
+                domain=second_source.domain,
+                text=DIVERSITY_TEXT,
+                score=1.45,
+            ),
+        ]
+    )
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=backend,
+        max_candidates_per_request=5,
+        verification_max_claims_per_request=5,
+        retrieval_max_results_per_request=5,
+    )
+
+    service.verify_claims(task.id, claim_ids=[first_claim.id, second_claim.id], limit=2)
+
+    refreshed_first = ClaimRepository(db_session).get(first_claim.id)
+    refreshed_second = ClaimRepository(db_session).get(second_claim.id)
+    assert refreshed_first is not None
+    assert refreshed_second is not None
+    first_relation = refreshed_first.notes_json["verification"]["evidence_relations"][0]
+    second_relation = refreshed_second.notes_json["verification"]["evidence_relations"][0]
+
+    assert first_relation["source_chunk_id"] == str(first_chunk.id)
+    assert first_relation["reuse_penalty"] == 0.0
+    assert second_relation["source_chunk_id"] == str(second_chunk.id)
+    assert second_relation["reuse_penalty"] == 0.0
+    assert (
+        refreshed_second.notes_json["verification"]["evidence_diversity"]["unique_chunk_count"] == 1
     )
 
 
@@ -310,4 +446,9 @@ SUPPORT_TEXT = (
 
 CONTRADICT_TEXT = (
     "Counterpoint.\n\n" "This domain is not for use in illustrative examples in documents."
+)
+
+DIVERSITY_TEXT = (
+    "SearXNG aggregates results from multiple search engines without storing user profiles. "
+    "SearXNG lets operators choose which engines to enable."
 )

@@ -17,7 +17,7 @@ from packages.db.repositories import (
     SourceDocumentRepository,
 )
 from services.orchestrator.app.claims import (
-    CLAIM_EVIDENCE_RELATION_SUPPORT,
+    CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT,
     CLAIM_TYPE_FACT,
     CLAIM_VERIFICATION_STATUS_DRAFT,
 )
@@ -122,7 +122,10 @@ def test_claim_drafting_service_creates_claim_citation_and_evidence(db_session: 
     assert first_result.created_claim_evidence == 1
     assert first_result.entries[0].claim.claim_type == CLAIM_TYPE_FACT
     assert first_result.entries[0].claim.verification_status == CLAIM_VERIFICATION_STATUS_DRAFT
-    assert first_result.entries[0].claim_evidence.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT
+    assert (
+        first_result.entries[0].claim_evidence.relation_type
+        == CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT
+    )
     assert (
         source_chunk.text[
             first_result.entries[0]

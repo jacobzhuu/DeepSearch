@@ -88,6 +88,9 @@ def test_opensearch_backend_upserts_lists_and_retrieves_chunks() -> None:
     assert retrieved.total == 1
     assert retrieved.hits[0].source_chunk_id == source_chunk_id
     assert retrieved.hits[0].score == 1.0
+    assert retrieved.hits[0].metadata["retrieval_diagnostics"]["method"] == (
+        "deterministic_lexical_quality_rerank_v1"
+    )
 
 
 def test_opensearch_backend_returns_empty_page_when_index_does_not_exist() -> None:
@@ -247,6 +250,12 @@ def test_local_index_backend_upserts_lists_and_retrieves_chunks() -> None:
     assert retrieved.total == 1
     assert retrieved.hits[0].source_chunk_id == source_chunk_id
     assert retrieved.hits[0].score == 1.0
+    assert (
+        retrieved.hits[0].metadata["retrieval_diagnostics"]["components"][
+            "citation_precision_likelihood"
+        ]
+        >= 0.45
+    )
 
 
 def _search_payload(

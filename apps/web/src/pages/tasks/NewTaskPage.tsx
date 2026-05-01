@@ -167,7 +167,7 @@ export const NewTaskPage: React.FC = () => {
                 {displayedPlan.planner_mode} / {displayedPlan.plan_source}
               </span>
             </div>
-            <PlanPreview plan={displayedPlan.research_plan} />
+            <PlanPreview plan={displayedPlan.research_plan || {}} />
             <label htmlFor="plan-json" style={{ display: 'block', marginTop: '1rem', fontWeight: 'bold' }}>
               可编辑计划 JSON
             </label>

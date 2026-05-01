@@ -182,8 +182,8 @@ def test_parsing_service_skips_unsupported_mime_type(
     content_snapshot, source_document_repo, _ = _seed_snapshot(
         db_session,
         snapshot_root=tmp_path,
-        mime_type="application/pdf",
-        content=b"%PDF-1.7",
+        mime_type="application/octet-stream",
+        content=b"binary",
     )
     service = create_parsing_service(
         db_session,
@@ -200,8 +200,46 @@ def test_parsing_service_skips_unsupported_mime_type(
     assert result.skipped_unsupported == 1
     assert result.entries[0].reason == ParseResultReason.UNSUPPORTED_MIME_TYPE
     assert result.entries[0].decision == "skipped_unsupported_mime"
-    assert result.entries[0].body_length == len(b"%PDF-1.7")
+    assert result.entries[0].body_length == len(b"binary")
     assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
+
+
+def test_parsing_service_creates_pdf_source_with_page_metadata(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    pdf_content = (
+        b"%PDF-1.4\n"
+        b"1 0 obj<</Type /Page>>stream\n"
+        b"BT (PDF evidence sentence.) Tj ET\n"
+        b"endstream\n%%EOF"
+    )
+    content_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        mime_type="application/pdf",
+        content=pdf_content,
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    source_document = source_document_repo.get_for_content_snapshot(content_snapshot.id)
+    assert result.created == 1
+    assert source_document is not None
+    assert source_document.source_type == "pdf_document"
+    chunks = source_chunk_repo.list_for_document(source_document.id)
+    assert chunks[0].metadata_json["source_format"] == "pdf"
+    assert chunks[0].metadata_json["parser_status"] == "success"
+    assert chunks[0].metadata_json["page_range"] == [1, 1]
+    assert chunks[0].metadata_json["page_locator_reliable"] is True
 
 
 def test_parsing_service_records_empty_body_decision(

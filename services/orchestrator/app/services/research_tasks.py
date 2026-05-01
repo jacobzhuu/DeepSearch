@@ -150,6 +150,18 @@ class ResearchTaskService:
         events = self.event_repository.list_for_task(task_id)
         return TaskSnapshot(task=task, events=events)
 
+    def list_task_snapshots(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[TaskSnapshot]:
+        tasks = self.task_repository.list_recent(status=status, limit=limit)
+        return [
+            TaskSnapshot(task=task, events=self.event_repository.list_for_task(task.id))
+            for task in tasks
+        ]
+
     def get_events(
         self,
         task_id: UUID,

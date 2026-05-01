@@ -10,6 +10,7 @@ from services.orchestrator.app.indexing.backends import (
     LocalChunkIndexBackend,
     OpenSearchChunkIndexBackend,
     build_chunk_index_backend,
+    rerank_indexed_chunks,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "LocalChunkIndexBackend",
     "OpenSearchChunkIndexBackend",
     "build_chunk_index_backend",
+    "rerank_indexed_chunks",
 ]

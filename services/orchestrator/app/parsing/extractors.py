@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from html import unescape
 from html.parser import HTMLParser
+from typing import Any, TypedDict
 
 
 class UnsupportedMimeTypeError(Exception):
@@ -17,7 +18,13 @@ class ParsedContent:
     text: str
     title: str | None
     source_type: str
-    metadata: dict[str, object] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class _ParagraphExtractionOptions(TypedDict, total=False):
+    target_class: str
+    target_id: str
+    body_only: bool
 
 
 def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
@@ -28,7 +35,20 @@ def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
             text=text,
             title=_derive_text_title(text),
             source_type="plain_text",
-            metadata={"mime_type": normalized_mime_type, "extractor": "plain_text_v1"},
+            metadata={
+                "mime_type": normalized_mime_type,
+                "content_type": normalized_mime_type,
+                "extractor": "plain_text_v1",
+                "parser_status": "success",
+                "parser_kind": "plain_text",
+                "text_length": len(text),
+                "mime_policy": {
+                    "supported": True,
+                    "office_macros_executed": False,
+                    "external_resources_loaded": False,
+                    "embedded_objects_executed": False,
+                },
+            },
         )
 
     if normalized_mime_type == "text/html":
@@ -53,18 +73,28 @@ def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
             extractor_strategy_used = "title_text_fallback"
             fallback_used = True
         text, dropped_broken_link_fragments = _cleanup_broken_link_fragments(text)
-        metadata: dict[str, object] = {
+        metadata: dict[str, Any] = {
             "mime_type": normalized_mime_type,
+            "content_type": normalized_mime_type,
             "extractor": "html_main_content_v1",
+            "parser_status": "success",
+            "parser_kind": "html",
             "extractor_fallback": parser.extractor_fallback,
             "extractor_strategy_used": extractor_strategy_used,
             "fallback_used": fallback_used,
             "removed_boilerplate_count": parser.removed_boilerplate_count,
             "extracted_text_length": len(text),
+            "text_length": len(text),
             "text_cleanup_applied": bool(dropped_broken_link_fragments),
             "dropped_broken_link_fragments": dropped_broken_link_fragments,
             "preserved_link_text_count": parser.preserved_link_text_count,
             "link_text_extraction_strategy": "html_parser_data_nodes",
+            "mime_policy": {
+                "supported": True,
+                "office_macros_executed": False,
+                "external_resources_loaded": False,
+                "embedded_objects_executed": False,
+            },
         }
         redirect_stub = _detect_redirect_stub(text=text, raw_html=decoded_content)
         if redirect_stub is not None:
@@ -75,6 +105,15 @@ def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
             source_type="web_page",
             metadata=metadata,
         )
+
+    if normalized_mime_type.startswith("application/"):
+        from services.orchestrator.app.parsing.document_extractors import (
+            SUPPORTED_DOCUMENT_MIME_TYPES,
+            extract_document_content,
+        )
+
+        if normalized_mime_type in SUPPORTED_DOCUMENT_MIME_TYPES:
+            return extract_document_content(mime_type=normalized_mime_type, content=content)
 
     raise UnsupportedMimeTypeError(normalized_mime_type)
 
@@ -464,7 +503,7 @@ def _looks_like_mediawiki_html(raw_html: str) -> bool:
 
 
 def _extract_mediawiki_fallback_text(raw_html: str) -> tuple[str, str]:
-    strategies: tuple[tuple[str, dict[str, object]], ...] = (
+    strategies: tuple[tuple[str, _ParagraphExtractionOptions], ...] = (
         ("wikipedia_mw_parser_output_paragraphs", {"target_class": "mw-parser-output"}),
         ("wikipedia_mw_content_text_paragraphs", {"target_id": "mw-content-text"}),
         ("body_readable_paragraphs", {"body_only": True}),

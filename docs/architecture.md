@@ -10,12 +10,47 @@ For technical library or framework concept queries, source-intent classification
 
 The planned next LLM-assisted quality layer is documented in `plans/llm-assisted-source-judge-and-planner.md`. It preserves the current deterministic pipeline as the authority of record. The rollout order is planner-only, source judge shadow mode, source judge active reranking, gap reasoner, and grounded report writer hardening. The LLM planner may suggest bounded subquestions and search queries, but deterministic planner guardrails still preserve required searches and downrank unsafe suggestions. The LLM source judge will receive candidate URL metadata plus deterministic source-intent, low-value, and ownership signals; it may return a structured advisory label, confidence scores, rationale, and a bounded priority adjustment. It cannot mark a source official without deterministic ownership evidence, cannot override low-value/blocklist rules, and cannot promote mirrors or third-party GitHub tutorials above owned official docs/reference/upstream repositories. The LLM gap reasoner may explain missing slots and suggest query intents, but deterministic gap limits, dedupe, and fetch eligibility remain final. The grounded report writer remains the only report-prose LLM surface and must render only from verified claim/evidence/citation-span bundles.
 
+### Deployment report quality increment
+
+Deployment-oriented tasks keep the same ledger-first path but use a specialized deterministic
+contract. SearXNG Docker deployment queries can inject bounded known-path candidates for the
+official installation page, the `github.com/searxng/searxng-docker` repository, raw GitHub
+README candidates for repository pages, and raw compose/env examples. Raw `README.md`, YAML, and
+env files are parsed as safe text, with YAML/env indentation preserved for command/config
+evidence. The `searxng/searxng-docker` repository is classified as `official_repository`, while
+its archived/superseded status can enter the report as a limitation or maintenance caveat.
+Deployment answer slots cover prerequisites, Docker run/compose, volumes, ports, configuration,
+security, troubleshooting, and update/maintenance.
+
+Claim drafting normally rejects diagram/config fragments, but deployment queries may promote
+Docker commands, compose YAML, port mappings, volume mounts, prerequisites, `settings.yml`,
+`SEARXNG_*` environment values, reverse-proxy / limiter / secret / certificate guidance,
+troubleshooting text, and maintenance commands into evidence-backed claim records. Multiline
+shell/YAML/env fenced blocks are kept as complete citation spans when possible. Deployment claim
+selection uses a deployment-specific cap plus slot- and marker-diverse selection, so broad slot
+coverage does not crowd out exact snippets such as `sudo usermod -aG docker`, `docker compose pull`,
+`.env`, `SEARXNG_*`, reverse proxy, limiter/bot protection, certificates, and troubleshooting
+commands when those snippets are present in parsed chunks. Security coverage is intentionally
+narrow: reverse proxy, limiter/bot protection, secrets, certificates, and public instance exposure
+can satisfy the security slot; `docker exec ... root` is troubleshooting, and `FORCE_OWNERSHIP` is
+volume/configuration evidence only. Those records still bind to exact `citation_span` excerpts and
+verified `claim_evidence`; the no-schema metadata lives in existing JSON fields such as
+`source_chunk.metadata_json` and `claim.notes_json`.
+
+The grounded LLM report writer receives the resolved report language in both metadata and the
+grounding bundle. Chinese requests are validated for Chinese output before rendering; English-only
+LLM payloads for `zh-CN` requests fall back to deterministic Markdown. Deployment reports render
+slot-organized evidence, fenced code/config blocks with claim/evidence/citation traceability, and
+explicit coverage gaps when the verified ledger lacks a command or configuration snippet for a
+required slot. For deployment code/config records, rendering prefers the complete claim statement
+or persisted full evidence excerpt over a shortened citation excerpt.
+
 ## Layer boundaries
 
 - UI / gateway layer: `apps/web/` now provides task listing, task creation, pre-run plan confirmation, queued worker start, status-aware Run/Pause/Resume/Cancel controls, polling task detail progress/events, source, claim, and Markdown report views
 - orchestrator / workflow layer: `services/orchestrator/app/` now contains the thin research task API, request and response schemas, database dependencies, the task service layer, the host-local worker, the Phase 3 search-discovery seams, the Phase 4 acquisition service, the Phase 5 parsing service, the Phase 6 indexing service, the Phase 7 plus Phase 8 claims service, and the Phase 9 plus Phase 10 report-synthesis and deploy-hardening services
 - persistence / ledger layer: `migrations/` and `packages/db/` hold the schema, ORM, session helpers, and repositories
-- acquisition / parsing / indexing layer: the codebase now includes a minimal search-provider abstraction, a SearXNG-backed implementation, a policy-guarded HTTP acquisition client, a filesystem-backed and MinIO-backed snapshot storage seam, a minimal parser and chunker for `text/html` plus `text/plain`, MediaWiki/Wikipedia article-body extraction with paragraph fallback metadata, deterministic source/chunk quality scoring, a chunk-index backend seam with a live-validatable OpenSearch REST implementation plus task-scoped retrieval, and deterministic claim-drafting plus verification helpers for candidate citation binding, weak/strong support, contradiction scanning, and evidence ranking; browser, Tika, embeddings, and semantic reranking remain placeholders
+- acquisition / parsing / indexing layer: the codebase now includes a minimal search-provider abstraction, a SearXNG-backed implementation, a policy-guarded HTTP acquisition client, a filesystem-backed and MinIO-backed snapshot storage seam, a minimal parser and chunker for `text/html`, `text/plain`, and safe raw text formats such as Markdown/YAML/env, MediaWiki/Wikipedia article-body extraction with paragraph fallback metadata, deterministic source/chunk quality scoring, a chunk-index backend seam with a live-validatable OpenSearch REST implementation plus task-scoped retrieval, and deterministic claim-drafting plus verification helpers for candidate citation binding, weak/strong support, contradiction scanning, and evidence ranking; browser, Tika, embeddings, and semantic reranking remain placeholders
 - reporting / delivery layer: a minimal Markdown report synthesis path now exists inside orchestrator, while dedicated report service and export formats remain placeholders
 - observability layer: `packages/observability/` now provides JSON-log configuration, request metrics, and key task/fetch/parse/verify/report counters
 
@@ -31,8 +66,8 @@ The planned next LLM-assisted quality layer is documented in `plans/llm-assisted
 - `services/orchestrator/app/storage/`: snapshot and artifact object-store interface plus filesystem and MinIO backends
 - `services/orchestrator/app/indexing/`: chunk-index backend abstraction plus the minimal OpenSearch REST implementation with Phase 10 validation and error wrapping
 - `services/orchestrator/app/research_quality/`: shared deterministic source-intent classification, answer-slot coverage, evidence-candidate, source-yield, evidence-yield, dropped-source reason, and slot-coverage contracts used across selection, diagnostics, verification, and reporting
-- `services/orchestrator/app/claims/`: deterministic Phase 7 and Phase 8 helpers for claim sentence selection, confidence heuristics, citation span validation, and minimal verification conflict handling
-- `services/orchestrator/app/reporting/`: deterministic Phase 9 Markdown report rendering, optional grounded LLM report writing, report-language helpers, and Phase 10 manifest helpers
+- `services/orchestrator/app/claims/`: deterministic Phase 7 and Phase 8 helpers for claim sentence selection, deployment command/config evidence extraction, confidence heuristics, citation span validation, and minimal verification conflict handling
+- `services/orchestrator/app/reporting/`: deterministic Phase 9 Markdown report rendering, deployment slot coverage/gap rendering, optional grounded LLM report writing, report-language helpers, and Phase 10 manifest helpers
 - `packages/db/`: SQLAlchemy models, session helpers, and repository skeletons for the research ledger
 - `packages/observability/`: JSON logging and metrics helpers
 - `migrations/`: Alembic environment and the initial reversible schema migration
@@ -61,7 +96,7 @@ The planned next LLM-assisted quality layer is documented in `plans/llm-assisted
 - keep search discovery, acquisition, and parsing bounded; product execution is worker-driven, while the debug endpoint remains synchronous for development diagnostics
 - canonicalize URLs before task-scoped dedupe and allow or deny filtering
 - keep acquisition policy explicit: only `http` and `https`, no loopback or private targets, bounded timeouts, bounded redirects, and bounded response sizes
-- keep parsing and chunking explicit: only `text/html` and `text/plain`, minimal body extraction, MediaWiki paragraph fallback when strict article extraction would be empty, and a stable paragraph-window chunker
+- keep parsing and chunking explicit: `text/html`, `text/plain`, and safe raw text formats such as Markdown/YAML/env are parsed without executing remote code; HTML uses minimal body extraction plus MediaWiki paragraph fallback when strict article extraction would be empty, and chunking uses a stable paragraph-window chunker
 - keep indexing and retrieval explicit: deterministic `source_chunk_id` traceability, task-scoped filtering, simple match retrieval, and thin debug APIs only
 - keep claim drafting explicit: candidate-only evidence binding, draft-only verification status, deterministic query-aware sentence scoring/selection, conservative explanatory fallback only after strict filters produce no claims, no-claims diagnostics in pipeline failure details, and exact offset plus excerpt validation against `source_chunk.text`
 - keep deterministic claim quality filters conservative: skip short fragments, title/question-like statements, figure captions, diagram/config fragments, incomplete sentences, and case/punctuation duplicates before claim persistence or report rendering
@@ -71,6 +106,7 @@ The planned next LLM-assisted quality layer is documented in `plans/llm-assisted
 - keep gap recovery deterministic: after verification, required answer slots that are missing or weak may trigger up to `RESEARCH_GAP_MAX_ROUNDS` supplemental search/fetch/parse/index/draft/verify rounds before reporting
 - keep technical concept source selection deterministic: title-only generic tutorials must not be promoted to official/about, official docs/reference/GitHub candidates should be attempted before generic articles when the query subject matches owned project metadata, localized mirrors should remain secondary unless explicitly whitelisted as owned, third-party GitHub tutorials should not receive upstream repository priority, and job/freelance/listing pages should stay low quality for overview queries
 - keep answer slots explicit and deterministic: planning and reporting may expose query-specific slots, but slot coverage must be derived from persisted claim categories and evidence-backed claims rather than LLM-written facts
+- keep deployment answers evidence-first: deployment reports should organize prerequisites, Docker run/compose, volumes, ports, configuration, security, troubleshooting, and update/maintenance from verified command/config evidence, and must show coverage gaps instead of inventing missing commands
 - keep verification explicit: candidate evidence is not verified support, weak lexical support is not promoted to support, selected evidence is ranked and diversified deterministically, and the stable verification statuses are `draft`, `supported`, `mixed`, `contradicted`, and `unsupported`
 - keep reporting explicit: Markdown only, evidence-first synthesis only, no claim without persisted evidence, no low-quality/off-query claim promoted solely because it is marked `supported`, and optional LLM report prose must be grounded by validated claim/evidence/citation ids
 - keep provider, acquisition, parser, object-store, worker, and index seams minimal but extensible for later leases, browser-fetch, Tika, and richer OpenSearch work

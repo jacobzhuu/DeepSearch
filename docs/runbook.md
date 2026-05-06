@@ -37,7 +37,8 @@ The current v1 path supports:
 - task list API and web task list page for recent `research_task` records
 - worker-executed search discovery with canonicalized candidate URLs
 - worker-executed HTTP acquisition with fetch jobs, attempts, and stored snapshots
-- worker-executed parsing for `text/html` and `text/plain`
+- worker-executed parsing for `text/html`, `text/plain`, safe raw text formats, and the documented
+  multiformat parser inputs
 - task-scoped chunk indexing and retrieval through OpenSearch
 - candidate claim drafting with citation span binding, query-aware deterministic claim scoring, and answer-focused top-K selection
 - deterministic claim verification with `support`, `weak_support`, and `contradict` evidence and `supported` / `unsupported` / `mixed` / `contradicted` statuses
@@ -110,7 +111,8 @@ The current v1 path supports:
 
 Parser support in this MVP:
 
-- supported: `text/html`, `text/plain`, `application/pdf`, DOCX, PPTX, XLSX OpenXML MIME types
+- supported: `text/html`, `text/plain`, safe raw text formats such as Markdown/YAML/env,
+  `application/pdf`, DOCX, PPTX, XLSX OpenXML MIME types
 - unsupported MIME types are skipped with an auditable parse decision
 - Office macros, scripts, external resources, and embedded objects are not executed
 - PDF page numbers are best-effort; unreliable cases record a locator fallback reason
@@ -163,7 +165,9 @@ Development-only note:
 
 Claim drafting is deterministic and no-LLM. For definition/mechanism queries such as `What is SearXNG and how does it work?`, the selector now assigns an `answer_role` and prefers definition, mechanism, privacy/design-goal, feature, and low-priority deployment/self-hosting sentences. It rejects contribution calls-to-action, community logistics, documentation pointers, promotional slogans, lowercase fragments, setup/getting-started instructions, diagram/config fragments, and broken-link residue such as `listed at .` before claim persistence. Scoring metadata is stored in `claim.notes_json` and regenerated reports use that metadata to exclude low-quality, setup, unsupported-category, or off-query supported claims from the report body.
 
-Evidence-quality metadata is a code-level contract, not a new table. Source/chunk APIs expose source quality fields from existing `source_document` score columns plus chunk metadata. Claim notes and task/report diagnostics may include `evidence_candidate_id`, `slot_ids`, `source_intent`, citation span ids, claim evidence ids, source-yield rows, evidence-yield summaries, verification evidence rank scores, citation precision, chunk/span/content reuse diagnostics, and slot-coverage summaries. Dropped-source reasons use this taxonomy: `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`.
+Deployment queries such as `How to deploy SearXNG with Docker?` use a separate evidence path for commands and configuration. SearXNG Docker tasks can inject the official installation docs, `github.com/searxng/searxng-docker`, raw GitHub README candidates for repository pages, and raw compose/env example candidates; the `searxng/searxng-docker` repository is classified as `official_repository`, and archived/superseded repository status can be reported as a limitation/maintenance caveat. Docker commands, Compose YAML, ports, volumes, prerequisites, `settings.yml`, `SEARXNG_SECRET` / other `SEARXNG_*` values, reverse proxy / limiter / secret / custom-certificate guidance, troubleshooting text, and update/maintenance commands may be drafted as `deployment_code_or_config` evidence with deployment `slot_ids`, then verified against exact citation spans before any report renders them. Deployment drafting uses a deployment-specific cap above the generic claim limit and applies both slot-diverse and marker-diverse selection so exact snippets such as `sudo usermod -aG docker`, `docker compose pull`, `.env`, `SEARXNG_*`, reverse proxy, limiter/bot protection, certificates, and troubleshooting commands survive when they are already present in parsed chunks. Security slot coverage is intentionally strict: reverse proxy, limiter/bot protection, secrets, certificates, and public instance exposure count; `docker exec ... root` is troubleshooting only, and `FORCE_OWNERSHIP` is volume/configuration evidence only. Command/config evidence is rendered as fenced Markdown code blocks with claim/evidence/citation traceability, preferring the complete claim statement or persisted full evidence excerpt over a shortened citation excerpt. If a required deployment slot has no verified command/config evidence, the report should show a coverage gap rather than a generic deployment answer.
+
+Evidence-quality metadata is a code-level contract, not a new table. Source/chunk APIs expose source quality fields from existing `source_document` score columns plus chunk metadata. Claim notes and task/report diagnostics may include `evidence_candidate_id`, `slot_ids`, `source_intent`, `evidence_kind`, citation span ids, claim evidence ids, source-yield rows, evidence-yield summaries, verification evidence rank scores, citation precision, chunk/span/content reuse diagnostics, and slot-coverage summaries. Dropped-source reasons use this taxonomy: `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`.
 
 Backward compatibility note: old tasks and report artifacts may not have the newer diagnostics payloads. The API and benchmark script normalize missing `source_yield_summary`, `dropped_sources`, and `slot_coverage_summary` to `[]`, and missing `evidence_yield_summary` or `verification_summary` to `{}` whenever an observability payload exists. Older claim notes without `evidence_candidate_id` remain reportable through their persisted citation spans.
 
@@ -281,6 +285,14 @@ task constraint:
   }
 }
 ```
+
+On task creation, top-level `report_language` also fills `constraints.language` when the
+request did not already provide one. On revision, top-level `report_language` changes only
+the report language; send `constraints.language` explicitly if the search/planning language
+should change too. The grounded report writer receives the resolved language in prompt
+metadata and the grounding bundle. If `report_language=zh-CN` and the LLM returns an
+English-only structured payload, the writer is treated as a validation failure and the task
+falls back to deterministic Chinese Markdown.
 
 DeepSeek planner smoke test:
 
@@ -948,7 +960,8 @@ At minimum, that route would still need:
 
 ### Smoke test fails at parse
 
-- supported MIME types are `text/html`, `text/plain`, `application/pdf`, DOCX, PPTX, and XLSX OpenXML documents
+- supported MIME types are `text/html`, `text/plain`, safe raw text formats such as Markdown/YAML/env,
+  `application/pdf`, DOCX, PPTX, and XLSX OpenXML documents
 - inspect task events or `GET /api/v1/research/tasks/<task_id>` for `progress.observability.parse_decisions`
 - parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, `parser_error`, `extractor_strategy_used`, `fallback_used`, `removed_boilerplate_count`, `extracted_text_length`, `text_cleanup_applied`, `dropped_broken_link_fragments`, and `preserved_link_text_count`
 - for Wikipedia/MediaWiki pages, expected extraction is article-body text from `main`, `article`, `#content`, `#bodyContent`, `#mw-content-text`, or `.mw-parser-output`, with paragraph fallback from `.mw-parser-output p`, `#mw-content-text p`, or readable body paragraphs if strict extraction would otherwise be empty

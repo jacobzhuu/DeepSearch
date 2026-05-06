@@ -22,7 +22,13 @@ from packages.db.models import (
 )
 from packages.db.repositories import ReportArtifactRepository
 from packages.db.repositories.sources import SourceChunkRepository, SourceDocumentRepository
+from services.orchestrator.app.indexing import (
+    ChunkIndexDocument,
+    IndexedChunkPage,
+)
 from services.orchestrator.app.llm import LLMRequest, LLMResponse
+from services.orchestrator.app.services.claims import create_claim_drafting_service
+from services.orchestrator.app.services.debug_pipeline import _claim_limit_for_query
 from services.orchestrator.app.services.reporting import (
     ReportArtifactContentMismatchError,
     create_report_synthesis_service,
@@ -50,9 +56,39 @@ class FakeReportLLMProvider:
         )
 
 
+class EmptyChunkIndexBackend:
+    def validate_configuration(self) -> None:
+        return None
+
+    def ensure_index(self) -> None:
+        return None
+
+    def upsert_chunks(self, documents: list[ChunkIndexDocument]) -> None:
+        del documents
+
+    def list_chunks(self, *, task_id: UUID, offset: int, limit: int) -> IndexedChunkPage:
+        del task_id, offset, limit
+        return IndexedChunkPage(total=0, hits=[])
+
+    def retrieve_chunks(
+        self,
+        *,
+        task_id: UUID,
+        query: str,
+        offset: int,
+        limit: int,
+    ) -> IndexedChunkPage:
+        del task_id, query, offset, limit
+        return IndexedChunkPage(total=0, hits=[])
+
+
 def _manifest(artifact: ReportArtifact) -> dict[str, Any]:
     assert artifact.manifest_json is not None
     return artifact.manifest_json
+
+
+def test_deployment_pipeline_claim_limit_allows_more_than_slot_count() -> None:
+    assert _claim_limit_for_query("How to deploy SearXNG with Docker?", 5) == 16
 
 
 def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
@@ -172,6 +208,103 @@ def test_report_synthesis_service_can_use_grounded_llm_writer(
     manifest = _manifest(result.artifact)
     assert manifest["report_writer"]["mode"] == "llm_grounded"
     assert manifest["report_writer"]["status"] == "used"
+
+
+def test_grounded_llm_writer_uses_selected_chinese_report_language(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    seeded = _seed_verified_claims(db_session)
+    task = db_session.get(ResearchTask, seeded.task_id)
+    assert task is not None
+    task.constraints_json = {"report_language": "zh-CN"}
+    db_session.commit()
+    claim, evidence = _first_supported_claim_and_evidence(db_session, seeded.task_id)
+    provider = FakeReportLLMProvider(
+        {
+            "title": "中文证据报告",
+            "executive_summary": [
+                {
+                    "text": "这个结论只使用已验证证据。",
+                    "claim_ids": [str(claim.id)],
+                    "claim_evidence_ids": [str(evidence.id)],
+                    "citation_span_ids": [str(evidence.citation_span_id)],
+                }
+            ],
+            "sections": [],
+            "uncertainties": [],
+            "unresolved": [],
+        }
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+        llm_provider=provider,
+        llm_model="fake-report-model",
+        llm_report_writer_enabled=True,
+    )
+
+    result = service.generate_markdown_report(seeded.task_id)
+    manifest = _manifest(result.artifact)
+    request = provider.requests[0]
+
+    assert "Simplified Chinese" in request.system_prompt
+    assert request.metadata["report_language"] == "zh-CN"
+    assert '"report_language": "zh-CN"' in request.user_prompt
+    assert result.report_language == "zh-CN"
+    assert result.writer_mode == "llm_grounded"
+    assert "# 中文证据报告" in result.markdown
+    assert "## 执行摘要" in result.markdown
+    assert manifest["report_language"] == "zh-CN"
+    assert manifest["report_writer"]["report_language"] == "zh-CN"
+
+
+def test_grounded_llm_writer_falls_back_when_chinese_request_returns_english(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    seeded = _seed_verified_claims(db_session)
+    task = db_session.get(ResearchTask, seeded.task_id)
+    assert task is not None
+    task.constraints_json = {"report_language": "zh-CN"}
+    db_session.commit()
+    claim, evidence = _first_supported_claim_and_evidence(db_session, seeded.task_id)
+    provider = FakeReportLLMProvider(
+        {
+            "title": "English report",
+            "executive_summary": [
+                {
+                    "text": "This sentence ignores the requested report language.",
+                    "claim_ids": [str(claim.id)],
+                    "claim_evidence_ids": [str(evidence.id)],
+                    "citation_span_ids": [str(evidence.citation_span_id)],
+                }
+            ],
+            "sections": [],
+            "uncertainties": [],
+            "unresolved": [],
+        }
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+        llm_provider=provider,
+        llm_model="fake-report-model",
+        llm_report_writer_enabled=True,
+    )
+
+    result = service.generate_markdown_report(seeded.task_id)
+
+    assert result.writer_mode == "deterministic"
+    assert result.llm_writer_status == "fallback_after_llm_validation_error"
+    assert "## 执行摘要" in result.markdown
+    assert "This sentence ignores" not in result.markdown
 
 
 def test_report_synthesis_service_falls_back_when_llm_ids_are_not_grounded(
@@ -730,6 +863,599 @@ def test_report_synthesis_excludes_supported_other_and_setup_claims(
     assert other_chunk.text not in result.markdown
     assert setup_chunk.text not in result.markdown
     assert "Excluded low-quality or off-query claims: 2." in result.markdown
+
+
+def test_deployment_report_renders_slot_sections_and_coverage_gaps(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/admin/installation-docker",
+            domain="docs.searxng.org",
+            title="Installation container",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 5, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    command = (
+        "$ docker run --name searxng -d -p 8888:8080 "
+        '-v "./config/:/etc/searxng/" docker.io/searxng/searxng:latest'
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=command,
+            token_count=24,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "quality_reasons": ["deployment_code_or_config"],
+            },
+        )
+    )
+    statement = f"Deployment command evidence: `{command}`."
+    claim = Claim(
+        task_id=task.id,
+        statement=statement,
+        claim_type="fact",
+        confidence=0.92,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "deployment/self_hosting",
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.9,
+            "slot_ids": [
+                "deployment_run_or_compose",
+                "deployment_ports",
+                "deployment_volumes",
+            ],
+            "evidence_kind": "deployment_code_or_config",
+        },
+    )
+    db_session.add(claim)
+    db_session.flush()
+    span = CitationSpan(
+        source_chunk_id=source_chunk.id,
+        start_offset=0,
+        end_offset=len(command),
+        excerpt=command,
+        normalized_excerpt_hash="sha256:deployment-command",
+    )
+    db_session.add(span)
+    db_session.flush()
+    db_session.add(
+        ClaimEvidence(
+            claim_id=claim.id,
+            citation_span_id=span.id,
+            relation_type="support",
+            score=0.92,
+        )
+    )
+    db_session.commit()
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = service.generate_markdown_report(task.id)
+
+    assert "### Docker run / Docker Compose" in result.markdown
+    assert "### Volumes" in result.markdown
+    assert "### Ports" in result.markdown
+    assert "### Security" in result.markdown
+    assert statement in result.markdown
+    assert "```" in result.markdown
+    assert command in result.markdown
+    assert "Answer slot coverage: 3/8." in result.markdown
+    manifest = _manifest(result.artifact)
+    security_slot = next(
+        row for row in manifest["slot_coverage_summary"] if row["slot_id"] == "deployment_security"
+    )
+    assert security_slot["status"] == "missing"
+
+
+def test_deployment_report_uses_full_evidence_excerpt_over_truncated_citation(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml",
+            domain="raw.githubusercontent.com",
+            title="docker-compose.yml",
+            source_type="plain_text",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 5, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    full_compose = (
+        "services:\n"
+        "  searxng:\n"
+        "    image: docker.io/searxng/searxng:latest\n"
+        "    environment:\n"
+        "      - SEARXNG_SECRET=change-me\n"
+        "      - SEARXNG_BASE_URL=https://example.test/\n"
+        "    ports:\n"
+        "      - 8888:8080\n"
+    )
+    truncated_excerpt = "services:\n  searxng:"
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=full_compose,
+            token_count=42,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "quality_reasons": ["deployment_code_or_config"],
+            },
+        )
+    )
+    statement = f"Deployment Compose evidence: `{full_compose}`."
+    claim = Claim(
+        task_id=task.id,
+        statement=statement,
+        claim_type="fact",
+        confidence=0.92,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "deployment/self_hosting",
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.9,
+            "slot_ids": [
+                "deployment_run_or_compose",
+                "deployment_ports",
+                "deployment_configuration",
+                "deployment_security",
+            ],
+            "evidence_kind": "deployment_code_or_config",
+            "evidence_candidate": {"excerpt": full_compose},
+        },
+    )
+    db_session.add(claim)
+    db_session.flush()
+    span = CitationSpan(
+        source_chunk_id=source_chunk.id,
+        start_offset=0,
+        end_offset=len(truncated_excerpt),
+        excerpt=truncated_excerpt,
+        normalized_excerpt_hash="sha256:truncated-compose",
+    )
+    db_session.add(span)
+    db_session.flush()
+    db_session.add(
+        ClaimEvidence(
+            claim_id=claim.id,
+            citation_span_id=span.id,
+            relation_type="support",
+            score=0.92,
+        )
+    )
+    db_session.commit()
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = service.generate_markdown_report(task.id)
+
+    assert "SEARXNG_SECRET=change-me" in result.markdown
+    assert "SEARXNG_BASE_URL=https://example.test/" in result.markdown
+    assert "8888:8080" in result.markdown
+    assert "```" in result.markdown
+
+
+def test_deployment_source_chunks_promote_to_supported_claims_and_chinese_report(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={"report_language": "zh-CN"},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/admin/installation-docker",
+            domain="docs.searxng.org",
+            title="Installation container",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 6, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    docker_run = (
+        "$ docker run --name searxng -d \\\n"
+        "    -p 8888:8080 \\\n"
+        '    -v "./config/:/etc/searxng/" \\\n'
+        '    -v "./data/:/var/cache/searxng/" \\\n'
+        "    docker.io/searxng/searxng:latest"
+    )
+    compose_commands = "cp .env.example .env\n" "docker compose up -d\n" "docker compose pull"
+    source_text = (
+        f"{docker_run}\n\n"
+        f"{compose_commands}\n\n"
+        "The host requires Docker or Podman, and operators can run sudo usermod -aG "
+        "docker $USER when Docker group access is needed.\n\n"
+        "Configure settings.yml, .env.example, .env, SEARXNG_SECRET, and SEARXNG_BASE_URL "
+        "for the container deployment.\n\n"
+        "Use a reverse proxy with certificates, update-ca-certificates, and limiter bot "
+        "protection before exposing a public SearXNG instance.\n\n"
+        "Use docker compose logs and docker compose exec searxng sh for troubleshooting."
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=source_text,
+            token_count=130,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.95,
+                "eligible_for_claims": True,
+                "quality_reasons": ["deployment_code_or_config"],
+            },
+        )
+    )
+    db_session.commit()
+    claims_service = create_claim_drafting_service(
+        db_session,
+        index_backend=EmptyChunkIndexBackend(),
+        max_candidates_per_request=8,
+        verification_max_claims_per_request=8,
+        retrieval_max_results_per_request=5,
+    )
+
+    draft_result = claims_service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=8,
+    )
+    verify_result = claims_service.verify_claims(task.id, claim_ids=None, limit=8)
+
+    claims = list(db_session.scalars(select(Claim).where(Claim.task_id == task.id)))
+    supported_claims = [claim for claim in claims if claim.verification_status == "supported"]
+    supported_text = "\n".join(claim.statement for claim in supported_claims)
+
+    assert draft_result.created_claims >= 6
+    assert verify_result.verified_claims == len(draft_result.entries)
+    assert len(supported_claims) == len(draft_result.entries)
+    for expected in (
+        "Docker or Podman",
+        "sudo usermod -aG docker",
+        "docker compose pull",
+        "settings.yml",
+        ".env.example",
+        ".env",
+        "SEARXNG_SECRET",
+        "SEARXNG_BASE_URL",
+        "reverse proxy",
+        "limiter bot protection",
+        "certificates",
+        "update-ca-certificates",
+        "docker compose logs",
+        "docker compose exec searxng sh",
+    ):
+        assert expected in supported_text
+
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    report_service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = report_service.generate_markdown_report(task.id)
+
+    assert result.report_language == "zh-CN"
+    assert result.writer_mode == "deterministic"
+    assert "## 执行摘要" in result.markdown
+    assert "### 前置条件" in result.markdown
+    assert "### Docker run / Docker Compose" in result.markdown
+    assert "### 配置" in result.markdown
+    assert "### 安全" in result.markdown
+    assert "### 故障排查" in result.markdown
+    assert "### 更新 / 维护" in result.markdown
+    assert "```" in result.markdown
+    assert docker_run in result.markdown
+    assert "claim_evidence" in result.markdown
+    for expected in (
+        "Docker or Podman",
+        "sudo usermod -aG docker",
+        "docker compose pull",
+        "settings.yml",
+        ".env.example",
+        ".env",
+        "SEARXNG_SECRET",
+        "SEARXNG_BASE_URL",
+        "reverse proxy",
+        "limiter bot protection",
+        "certificates",
+        "update-ca-certificates",
+    ):
+        assert expected in result.markdown
+
+    support_evidence = [
+        evidence
+        for claim in supported_claims
+        for evidence in claim.claim_evidences
+        if evidence.relation_type == "support"
+    ]
+    assert support_evidence
+    assert all(evidence.citation_span.excerpt in source_text for evidence in support_evidence)
+
+
+def test_grounded_deployment_report_renders_all_supported_slot_claims(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={"report_language": "zh-CN"},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/admin/installation-docker",
+            domain="docs.searxng.org",
+            title="Installation container",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 6, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    docker_run = (
+        "$ docker run --name searxng -d \\\n"
+        "    -p 8888:8080 \\\n"
+        '    -v "./config/:/etc/searxng/" \\\n'
+        '    -v "./data/:/var/cache/searxng/" \\\n'
+        "    docker.io/searxng/searxng:latest"
+    )
+    source_text = (
+        "The host requires Docker or Podman before deploying SearXNG with containers.\n\n"
+        "Operators can run sudo usermod -aG docker $USER when Docker group access is needed.\n\n"
+        f"{docker_run}\n\n"
+        "Run docker compose pull when updating the container deployment.\n\n"
+        "Configure settings.yml for the SearXNG container deployment.\n\n"
+        "Copy .env.example to .env before starting Docker Compose.\n\n"
+        "Set SEARXNG_BASE_URL=https://search.example.test/ for the deployment.\n\n"
+        "Use a reverse proxy before exposing a public SearXNG instance.\n\n"
+        "Enable limiter bot protection before exposing the public instance.\n\n"
+        "Install custom certificates with update-ca-certificates for trusted outbound TLS.\n\n"
+        "Run docker compose logs for troubleshooting the SearXNG container.\n\n"
+        "Run docker compose exec searxng sh for troubleshooting shell access."
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=source_text,
+            token_count=170,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.95,
+                "eligible_for_claims": True,
+                "quality_reasons": ["deployment_code_or_config"],
+            },
+        )
+    )
+    db_session.commit()
+    claims_service = create_claim_drafting_service(
+        db_session,
+        index_backend=EmptyChunkIndexBackend(),
+        max_candidates_per_request=12,
+        verification_max_claims_per_request=12,
+        retrieval_max_results_per_request=5,
+    )
+
+    draft_result = claims_service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=12,
+    )
+    claims_service.verify_claims(task.id, claim_ids=None, limit=12)
+
+    claims = list(db_session.scalars(select(Claim).where(Claim.task_id == task.id)))
+    supported_claims = [claim for claim in claims if claim.verification_status == "supported"]
+    assert len(draft_result.entries) > 8
+    assert len(supported_claims) == len(draft_result.entries)
+    first_claim = supported_claims[0]
+    first_support = next(
+        evidence for evidence in first_claim.claim_evidences if evidence.relation_type == "support"
+    )
+    provider = FakeReportLLMProvider(
+        {
+            "title": "SearXNG Docker 部署报告",
+            "executive_summary": [
+                {
+                    "text": "部署结论只使用已验证证据。",
+                    "claim_ids": [str(first_claim.id)],
+                    "claim_evidence_ids": [str(first_support.id)],
+                    "citation_span_ids": [str(first_support.citation_span_id)],
+                }
+            ],
+            "sections": [],
+            "uncertainties": [],
+            "unresolved": [],
+        }
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    report_service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+        llm_provider=provider,
+        llm_model="fake-report-model",
+        llm_report_writer_enabled=True,
+    )
+
+    result = report_service.generate_markdown_report(task.id)
+
+    assert result.report_language == "zh-CN"
+    assert result.writer_mode == "llm_grounded"
+    assert docker_run in result.markdown
+    assert "Docker or Podman" in result.markdown
+    assert "sudo usermod -aG docker" in result.markdown
+    assert "docker compose pull" in result.markdown
+    assert "settings.yml" in result.markdown
+    assert ".env.example" in result.markdown
+    assert ".env" in result.markdown
+    assert "SEARXNG_BASE_URL" in result.markdown
+    assert "reverse proxy" in result.markdown
+    assert "limiter bot protection" in result.markdown
+    assert "update-ca-certificates" in result.markdown
+    assert "docker compose logs" in result.markdown
+    assert "docker compose exec searxng sh" in result.markdown
+    assert result.markdown.count("claim_evidence") >= len(supported_claims)
+    assert result.markdown.count("citations") >= len(supported_claims)
+
+
+def test_deployment_report_includes_official_repository_archived_caveat(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://github.com/searxng/searxng-docker",
+            domain="github.com",
+            title="searxng/searxng-docker",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 5, 10, 0, tzinfo=UTC),
+            authority_score=0.86,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.86,
+        )
+    )
+    statement = (
+        "The searxng-docker repository is archived and superseded by the main SearXNG "
+        "repository."
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=statement,
+            token_count=18,
+            metadata_json={"eligible_for_claims": True, "content_quality_score": 0.9},
+        )
+    )
+    claim = Claim(
+        task_id=task.id,
+        statement=statement,
+        claim_type="fact",
+        confidence=0.9,
+        verification_status="supported",
+        notes_json={
+            "verification": {"rationale": "Found 1 support evidence and no contradict evidence."},
+            "claim_category": "deployment/self_hosting",
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.9,
+            "slot_ids": ["deployment_update_maintenance"],
+        },
+    )
+    db_session.add(claim)
+    db_session.flush()
+    span = CitationSpan(
+        source_chunk_id=source_chunk.id,
+        start_offset=0,
+        end_offset=len(statement),
+        excerpt=statement,
+        normalized_excerpt_hash="sha256:archived-caveat",
+    )
+    db_session.add(span)
+    db_session.flush()
+    db_session.add(
+        ClaimEvidence(
+            claim_id=claim.id,
+            citation_span_id=span.id,
+            relation_type="support",
+            score=0.9,
+        )
+    )
+    db_session.commit()
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+    result = service.generate_markdown_report(task.id)
+    manifest = _manifest(result.artifact)
+    update_slot = next(
+        row
+        for row in manifest["slot_coverage_summary"]
+        if row["slot_id"] == "deployment_update_maintenance"
+    )
+
+    assert "### Update / maintenance" in result.markdown
+    assert "archived and superseded" in result.markdown
+    assert update_slot["status"] == "covered"
 
 
 class SeededReportClaims:

@@ -33,9 +33,14 @@ from services.orchestrator.app.claims import (
     candidate_category_sort_key,
     classify_query_intent,
     compute_claim_confidence,
+    deployment_evidence_statement,
+    deployment_slot_ids_for_claim_text,
+    deployment_slot_ids_for_evidence,
     draft_claim_statement,
     is_answer_relevant_score,
     is_claimable_statement,
+    is_deployment_evidence_statement,
+    iter_deployment_evidence_spans,
     iter_supporting_spans,
     normalize_claim_identity,
     normalized_excerpt_hash,
@@ -47,6 +52,7 @@ from services.orchestrator.app.claims import (
 from services.orchestrator.app.indexing import ChunkIndexBackend, IndexedChunkRecord
 from services.orchestrator.app.research_quality import (
     EvidenceCandidate,
+    answer_slots_for_query,
     classify_source_intent,
     evidence_candidate_id,
     slot_ids_for_candidate_category,
@@ -123,6 +129,8 @@ class DraftClaimCandidate:
     draft_mode: str = "strict"
     fallback_reason: str | None = None
     original_rejected_reason: str | None = None
+    evidence_kind: str = "sentence"
+    evidence_slot_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -244,11 +252,16 @@ class ClaimDraftingService:
         if query is None and source_chunk_ids is None:
             raise ClaimDraftingInputError()
 
-        effective_limit = self.max_candidates_per_request
-        if limit is not None:
-            effective_limit = min(limit, self.max_candidates_per_request)
-
         effective_query = (query or task.query).strip()
+        effective_limit = self.max_candidates_per_request
+        if classify_query_intent(effective_query).intent_name == "deployment":
+            effective_limit = max(
+                effective_limit,
+                _deployment_claim_limit_for_query(effective_query),
+            )
+        if limit is not None:
+            effective_limit = min(limit, effective_limit)
+
         chunk_selection = self._select_chunks_for_drafting(
             task.id,
             query=effective_query,
@@ -433,8 +446,10 @@ class ClaimDraftingService:
             raise ClaimVerificationConflictError(task.id, task.status)
 
         effective_limit = self.verification_max_claims_per_request
+        if classify_query_intent(task.query).intent_name == "deployment":
+            effective_limit = max(effective_limit, _deployment_claim_limit_for_query(task.query))
         if limit is not None:
-            effective_limit = min(limit, self.verification_max_claims_per_request)
+            effective_limit = min(limit, effective_limit)
 
         claims = self._select_claims(task.id, claim_ids=claim_ids, limit=effective_limit)
         created_citation_spans = 0
@@ -450,6 +465,7 @@ class ClaimDraftingService:
 
         for claim in claims:
             verification_candidates: list[VerificationEvidenceCandidate] = []
+            seen_verification_spans: set[tuple[UUID, int, int]] = set()
             retrieval_hits = self.index_backend.retrieve_chunks(
                 task_id=task.id,
                 query=claim.statement,
@@ -466,6 +482,13 @@ class ClaimDraftingService:
                     matched_span = select_verification_span(source_chunk.text, claim.statement)
                     if matched_span is None:
                         continue
+                    seen_verification_spans.add(
+                        (
+                            source_chunk.id,
+                            matched_span.start_offset,
+                            matched_span.end_offset,
+                        )
+                    )
                     verification_candidates.append(
                         _verification_evidence_candidate(
                             source_chunk=source_chunk,
@@ -473,6 +496,13 @@ class ClaimDraftingService:
                             retrieval_score=retrieval_score,
                         )
                     )
+            verification_candidates.extend(
+                self._deployment_candidate_support_verification_candidates(
+                    task=task,
+                    claim=claim,
+                    seen_spans=seen_verification_spans,
+                )
+            )
 
             selected_candidates = _select_verification_evidence(
                 verification_candidates,
@@ -708,6 +738,7 @@ class ClaimDraftingService:
         limit: int,
     ) -> tuple[list[DraftClaimCandidate], dict[str, Any]]:
         candidates: list[DraftClaimCandidate] = []
+        deployment_query = classify_query_intent(query).intent_name == "deployment"
         for source_chunk, retrieval_score in chunks_seen:
             content_quality_score = _chunk_content_quality_score(source_chunk)
             source_quality_score = _source_quality_score(source_chunk)
@@ -720,6 +751,39 @@ class ClaimDraftingService:
                     statement=statement,
                     query=query,
                     content_quality_score=content_quality_score,
+                    source_quality_score=source_quality_score,
+                )
+                evidence_slot_ids: tuple[str, ...] = ()
+                if deployment_query:
+                    evidence_slot_ids = deployment_slot_ids_for_claim_text(
+                        statement,
+                        supporting_span.excerpt,
+                    )
+                rejected_rules = _strict_rejected_rules(source_chunk, statement, query, score)
+                candidates.append(
+                    DraftClaimCandidate(
+                        source_chunk=source_chunk,
+                        supporting_span=supporting_span,
+                        statement=statement,
+                        score=score,
+                        retrieval_score=retrieval_score,
+                        paragraph_key=(
+                            source_chunk.id,
+                            _paragraph_index(source_chunk.text, supporting_span.start_offset),
+                        ),
+                        rejected_rules=tuple(rejected_rules),
+                        original_rejected_reason=_first_rejection_reason(rejected_rules, score),
+                        evidence_slot_ids=evidence_slot_ids,
+                    )
+                )
+            if not deployment_query:
+                continue
+            for supporting_span in iter_deployment_evidence_spans(source_chunk.text):
+                statement = deployment_evidence_statement(supporting_span.excerpt)
+                score = score_claim_statement(
+                    statement=statement,
+                    query=query,
+                    content_quality_score=max(content_quality_score or 0.0, 0.58),
                     source_quality_score=source_quality_score,
                 )
                 rejected_rules = _strict_rejected_rules(source_chunk, statement, query, score)
@@ -736,6 +800,11 @@ class ClaimDraftingService:
                         ),
                         rejected_rules=tuple(rejected_rules),
                         original_rejected_reason=_first_rejection_reason(rejected_rules, score),
+                        evidence_kind="deployment_code_or_config",
+                        evidence_slot_ids=deployment_slot_ids_for_evidence(
+                            statement,
+                            supporting_span.excerpt,
+                        ),
                     )
                 )
 
@@ -874,6 +943,65 @@ class ClaimDraftingService:
             used_paragraphs.add(candidate.paragraph_key)
             return True
 
+        if intent.intent_name == "deployment":
+            deployment_slot_order = _deployment_slot_order_for_query(query)
+            covered_slots: set[str] = set()
+            candidate_positions = {
+                id(candidate): index for index, candidate in enumerate(candidates)
+            }
+            while len(selected) < limit:
+                remaining_slots = set(deployment_slot_order) - covered_slots
+                if not remaining_slots:
+                    break
+                progress = False
+                slot_candidates = sorted(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate_key(candidate) not in selected_keys
+                        and set(candidate.evidence_slot_ids) & remaining_slots
+                    ),
+                    key=lambda candidate: _deployment_slot_candidate_sort_key(
+                        candidate,
+                        remaining_slots=remaining_slots,
+                        slot_order=deployment_slot_order,
+                        candidate_position=candidate_positions[id(candidate)],
+                    ),
+                )
+                for candidate in slot_candidates:
+                    if add_candidate(candidate, enforce_paragraph_diversity=False):
+                        covered_slots.update(candidate.evidence_slot_ids)
+                        progress = True
+                        break
+                if not progress:
+                    break
+
+            for marker_group in _deployment_required_marker_groups_for_query(query):
+                if len(selected) >= limit:
+                    break
+                if any(
+                    _candidate_matches_deployment_marker_group(candidate, marker_group)
+                    for candidate in selected
+                ):
+                    continue
+                marker_candidates = sorted(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate_key(candidate) not in selected_keys
+                        and _candidate_matches_deployment_marker_group(candidate, marker_group)
+                    ),
+                    key=lambda candidate: _deployment_marker_candidate_sort_key(
+                        candidate,
+                        marker_group=marker_group,
+                        candidate_position=candidate_positions[id(candidate)],
+                    ),
+                )
+                for candidate in marker_candidates:
+                    if add_candidate(candidate, enforce_paragraph_diversity=False):
+                        covered_slots.update(candidate.evidence_slot_ids)
+                        break
+
         for category in intent.expected_claim_types:
             for candidate in candidates:
                 if candidate.score.claim_category == category and add_candidate(
@@ -919,6 +1047,7 @@ class ClaimDraftingService:
             "slot_ids": slot_ids,
             "source_intent": evidence_candidate.get("source_intent"),
             "evidence_candidate_id": evidence_candidate.get("evidence_candidate_id"),
+            "evidence_kind": candidate.evidence_kind,
             "evidence_quality_score": evidence_candidate.get("quality_score"),
             "evidence_salience_score": evidence_candidate.get("salience_score"),
             "evidence_rejection_reasons": evidence_candidate.get("rejection_reasons", []),
@@ -936,6 +1065,53 @@ class ClaimDraftingService:
         if existing_score is not None and new_score is not None and existing_score >= new_score:
             return existing_notes
         return {**existing_notes, **new_notes}
+
+    def _deployment_candidate_support_verification_candidates(
+        self,
+        *,
+        task: ResearchTask,
+        claim: Claim,
+        seen_spans: set[tuple[UUID, int, int]],
+    ) -> list[VerificationEvidenceCandidate]:
+        if classify_query_intent(task.query).intent_name != "deployment":
+            return []
+        notes = claim.notes_json or {}
+        slot_ids = tuple(item for item in notes.get("slot_ids", []) if isinstance(item, str))
+        deployment_claim = notes.get("evidence_kind") == "deployment_code_or_config" or any(
+            slot_id.startswith("deployment_") for slot_id in slot_ids
+        )
+        if not deployment_claim:
+            return []
+
+        candidates: list[VerificationEvidenceCandidate] = []
+        for evidence in self.claim_evidence_repository.list_for_claim(claim.id):
+            if evidence.relation_type != CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT:
+                continue
+            citation_span = evidence.citation_span
+            source_chunk = citation_span.source_chunk
+            if source_chunk.source_document.task_id != task.id:
+                continue
+            if not _source_chunk_eligible_for_claims(source_chunk):
+                continue
+            matched_span = select_verification_span(source_chunk.text, claim.statement)
+            if matched_span is None:
+                continue
+            span_key = (
+                source_chunk.id,
+                matched_span.start_offset,
+                matched_span.end_offset,
+            )
+            if span_key in seen_spans:
+                continue
+            seen_spans.add(span_key)
+            candidates.append(
+                _verification_evidence_candidate(
+                    source_chunk=source_chunk,
+                    matched_span=matched_span,
+                    retrieval_score=evidence.score,
+                )
+            )
+        return candidates
 
     def _load_retrieved_chunks(
         self,
@@ -1407,6 +1583,10 @@ def _verification_relation_sort_key(relation_type: str) -> int:
 
 def _source_chunk_eligible_for_claims(source_chunk: SourceChunk) -> bool:
     metadata = source_chunk.metadata_json or {}
+    quality_reasons = metadata.get("quality_reasons")
+    deployment_code_or_config = (
+        isinstance(quality_reasons, list) and "deployment_code_or_config" in quality_reasons
+    )
     if metadata.get("eligible_for_claims") is False:
         return False
     if metadata.get("should_generate_claims") is False:
@@ -1415,7 +1595,7 @@ def _source_chunk_eligible_for_claims(source_chunk: SourceChunk) -> bool:
         return False
     if metadata.get("is_navigation_noise") is True:
         return False
-    if metadata.get("is_diagram_or_config_section") is True:
+    if metadata.get("is_diagram_or_config_section") is True and not deployment_code_or_config:
         return False
     if metadata.get("reason") == "redirect_stub":
         return False
@@ -1430,11 +1610,15 @@ def _source_chunk_eligible_for_claims(source_chunk: SourceChunk) -> bool:
 
 def _source_chunk_hard_excluded_for_claims(source_chunk: SourceChunk) -> bool:
     metadata = source_chunk.metadata_json or {}
+    quality_reasons = metadata.get("quality_reasons")
+    deployment_code_or_config = (
+        isinstance(quality_reasons, list) and "deployment_code_or_config" in quality_reasons
+    )
     if metadata.get("is_reference_section") is True:
         return True
     if metadata.get("is_navigation_noise") is True:
         return True
-    if metadata.get("is_diagram_or_config_section") is True:
+    if metadata.get("is_diagram_or_config_section") is True and not deployment_code_or_config:
         return True
     if metadata.get("reason") == "redirect_stub":
         return True
@@ -1449,7 +1633,8 @@ def _strict_rejected_rules(
     score: ClaimCandidateScore,
 ) -> list[str]:
     rejected_rules: list[str] = []
-    if not _source_chunk_eligible_for_claims(source_chunk):
+    deployment_evidence_statement = is_deployment_evidence_statement(statement)
+    if not _source_chunk_eligible_for_claims(source_chunk) and not deployment_evidence_statement:
         rejected_rules.append("chunk_ineligible")
     if score.rejected_reason is not None:
         rejected_rules.append(score.rejected_reason)
@@ -1478,6 +1663,87 @@ def _candidate_selection_sort_key(
         candidate.source_chunk.chunk_no,
         candidate.supporting_span.start_offset,
     )
+
+
+def _deployment_slot_order_for_query(query: str) -> dict[str, int]:
+    return {
+        slot.slot_id: index
+        for index, slot in enumerate(answer_slots_for_query(query))
+        if slot.slot_id.startswith("deployment_")
+    }
+
+
+def _deployment_claim_limit_for_query(query: str) -> int:
+    deployment_slot_count = sum(
+        1 for slot in answer_slots_for_query(query) if slot.slot_id.startswith("deployment_")
+    )
+    marker_group_count = len(_deployment_required_marker_groups_for_query(query))
+    return max(deployment_slot_count + 8, marker_group_count + 4)
+
+
+def _deployment_required_marker_groups_for_query(query: str) -> tuple[tuple[str, ...], ...]:
+    if classify_query_intent(query).intent_name != "deployment":
+        return ()
+    return (
+        ("docker or podman", "docker/podman"),
+        ("sudo usermod -ag docker", "sudo usermod -aG docker"),
+        ("docker compose pull",),
+        ("settings.yml",),
+        (".env.example", ".env"),
+        ("searxng_*", "searxng_"),
+        ("reverse proxy",),
+        ("limiter", "bot protection"),
+        ("certificates", "update-ca-certificates"),
+        ("docker run --name searxng",),
+        ("docker container logs -f searxng",),
+        ("docker container exec -it --user root searxng /bin/sh -l",),
+    )
+
+
+def _candidate_matches_deployment_marker_group(
+    candidate: DraftClaimCandidate,
+    marker_group: tuple[str, ...],
+) -> bool:
+    searchable = _deployment_marker_search_text(candidate)
+    return any(marker.lower() in searchable for marker in marker_group)
+
+
+def _deployment_marker_candidate_sort_key(
+    candidate: DraftClaimCandidate,
+    *,
+    marker_group: tuple[str, ...],
+    candidate_position: int,
+) -> tuple[int, int, float, float, int]:
+    exact_excerpt_match = any(
+        marker.lower() in candidate.supporting_span.excerpt.lower() for marker in marker_group
+    )
+    return (
+        0 if exact_excerpt_match else 1,
+        0 if candidate.evidence_kind == "deployment_code_or_config" else 1,
+        -candidate.score.source_quality_score,
+        -candidate.score.final_score,
+        candidate_position,
+    )
+
+
+def _deployment_marker_search_text(candidate: DraftClaimCandidate) -> str:
+    return f"{candidate.statement}\n{candidate.supporting_span.excerpt}".lower()
+
+
+def _deployment_slot_candidate_sort_key(
+    candidate: DraftClaimCandidate,
+    *,
+    remaining_slots: set[str],
+    slot_order: dict[str, int],
+    candidate_position: int,
+) -> tuple[int, int, int]:
+    candidate_slots = [slot_id for slot_id in candidate.evidence_slot_ids if slot_id in slot_order]
+    new_slots = [slot_id for slot_id in candidate_slots if slot_id in remaining_slots]
+    if not new_slots:
+        first_slot_order = len(slot_order)
+    else:
+        first_slot_order = min(slot_order.get(slot_id, len(slot_order)) for slot_id in new_slots)
+    return (-len(set(new_slots)), first_slot_order, candidate_position)
 
 
 def _fallback_candidate_allowed(
@@ -1663,7 +1929,10 @@ def _evidence_candidate_payload(
         source_document_id=str(source_document.id),
         source_chunk_id=str(source_chunk.id),
         citation_span_id=None,
-        slot_ids=slot_ids_for_candidate_category(candidate.score.claim_category, query=query),
+        slot_ids=(
+            candidate.evidence_slot_ids
+            or slot_ids_for_candidate_category(candidate.score.claim_category, query=query)
+        ),
         source_intent=source_intent,
         excerpt=candidate.supporting_span.excerpt,
         start_offset=candidate.supporting_span.start_offset,
@@ -1685,6 +1954,7 @@ def _evidence_candidate_payload(
             "claim_selection_score": candidate.score.final_score,
             "retrieval_score": candidate.retrieval_score,
             "draft_mode": candidate.draft_mode,
+            "evidence_kind": candidate.evidence_kind,
             "fallback_reason": candidate.fallback_reason,
             "original_rejected_reason": candidate.original_rejected_reason,
             "source_url": source_document.canonical_url,

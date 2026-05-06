@@ -43,6 +43,7 @@ from services.orchestrator.app.research_quality import (
     SourceYieldSummary,
     analyze_required_slot_gaps,
     answer_slot_coverage,
+    answer_slots_for_query,
     build_slot_coverage_summary,
     classify_source_intent,
     contribution_level_for_counts,
@@ -786,6 +787,9 @@ class DebugRealPipelineRunner:
                 6,
             )
             fetch_limit = max(fetch_limit, 6)
+        elif self._is_deployment_run(task_id):
+            target_successful_snapshots = max(target_successful_snapshots, 4)
+            fetch_limit = max(fetch_limit, 5)
         result = self.acquisition_service.acquire_candidates(
             task_id,
             candidate_url_ids=None,
@@ -848,17 +852,18 @@ class DebugRealPipelineRunner:
 
     def _run_draft_claims(self, task_id: UUID) -> dict[str, Any]:
         task = self._get_task(task_id)
+        claim_limit = _claim_limit_for_query(task.query, self.claim_limit)
         source_chunk_ids = _select_claim_drafting_chunk_ids(
             self.session,
             task_id,
             query=task.query,
-            limit=max(self.claim_limit, 8),
+            limit=max(claim_limit * 2, 8),
         )
         result: Any = self.claims_service.draft_claims(
             task_id,
             query=task.query,
             source_chunk_ids=source_chunk_ids,
-            limit=self.claim_limit,
+            limit=claim_limit,
         )
         supplemental_result: dict[str, Any] = {
             "triggered": False,
@@ -878,13 +883,13 @@ class DebugRealPipelineRunner:
                     self.session,
                     task_id,
                     query=task.query,
-                    limit=max(self.claim_limit, 8),
+                    limit=max(claim_limit * 2, 8),
                 )
                 second_result = self.claims_service.draft_claims(
                     task_id,
                     query=task.query,
                     source_chunk_ids=refreshed_chunk_ids,
-                    limit=self.claim_limit,
+                    limit=claim_limit,
                 )
                 result = _merge_draft_results(result, second_result)
 
@@ -1043,15 +1048,16 @@ class DebugRealPipelineRunner:
         return supplemental_result
 
     def _run_verify_claims(self, task_id: UUID) -> dict[str, Any]:
+        task = self._get_task(task_id)
+        claim_limit = _claim_limit_for_query(task.query, self.claim_limit)
         result = self.claims_service.verify_claims(
             task_id,
             claim_ids=None,
-            limit=self.claim_limit,
+            limit=claim_limit,
         )
         if not result.entries:
             raise DebugPipelinePreconditionError("claim verification found no draft claims")
         verification_summary = _build_verification_summary(result.entries)
-        task = self._get_task(task_id)
         slot_coverage_summary = build_slot_coverage_summary(
             task.query,
             evidence_candidates=_evidence_candidates_from_claims(self.session, task_id),
@@ -1411,6 +1417,15 @@ class DebugRealPipelineRunner:
             self.research_plan is not None
             and self.research_plan.intent_classification == "overview_definition_intent"
         )
+
+    def _is_deployment_run(self, task_id: UUID) -> bool:
+        if self.research_plan is not None:
+            if self.research_plan.intent == "deployment":
+                return True
+            if self.research_plan.intent_classification == "deployment_intent":
+                return True
+        task = self._get_task(task_id)
+        return classify_query_intent(task.query).intent_name == "deployment"
 
 
 def collect_debug_pipeline_counts(
@@ -1780,10 +1795,12 @@ def _select_claim_drafting_chunk_ids(
     limit: int,
 ) -> list[UUID]:
     chunks = SourceChunkRepository(session).list_for_task(task_id)
+    deployment_query = classify_query_intent(query).intent_name == "deployment"
     ordered_chunks = sorted(
         chunks,
         key=lambda chunk: (
             _source_document_category_priority(chunk.source_document, query=query),
+            -_deployment_chunk_signal_score(chunk.text) if deployment_query else 0,
             0 if _chunk_metadata_eligible_for_claims(chunk.metadata_json or {}) else 1,
             -_numeric_metadata_score(chunk.metadata_json or {}, "content_quality_score"),
             chunk.source_document.fetched_at,
@@ -1792,6 +1809,43 @@ def _select_claim_drafting_chunk_ids(
         ),
     )
     return [chunk.id for chunk in ordered_chunks[:limit]]
+
+
+def _claim_limit_for_query(query: str, default_limit: int) -> int:
+    if classify_query_intent(query).intent_name != "deployment":
+        return default_limit
+    deployment_slot_count = sum(
+        1 for slot in answer_slots_for_query(query) if slot.slot_id.startswith("deployment_")
+    )
+    return max(default_limit, deployment_slot_count + 8)
+
+
+def _deployment_chunk_signal_score(text: str) -> int:
+    lower = text.lower()
+    markers = (
+        "docker or podman",
+        "usermod",
+        "docker compose pull",
+        "docker run",
+        "docker compose",
+        "docker-compose",
+        "settings.yml",
+        ".env.example",
+        "searxng_",
+        "reverse proxy",
+        "limiter",
+        "bot protection",
+        "certificate",
+        "certificates",
+        "update-ca-certificates",
+        "logs",
+        "exec ",
+        "ports:",
+        "volumes:",
+        "/etc/searxng",
+        "/var/cache/searxng",
+    )
+    return sum(1 for marker in markers if marker in lower)
 
 
 def _source_document_category_priority(source_document: SourceDocument, *, query: str) -> int:
@@ -1877,6 +1931,7 @@ def _select_supplemental_candidates(
         "official_about",
         "wikipedia_reference",
         "official_home",
+        "official_repository",
         "github_readme_or_repo",
         "official_docs_reference",
     }
@@ -1950,6 +2005,7 @@ def _select_gap_search_candidate_ids(
         "official_about",
         "official_home",
         "official_docs_reference",
+        "official_repository",
         "wikipedia_reference",
         "github_readme_or_repo",
     }

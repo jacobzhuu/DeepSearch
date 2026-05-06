@@ -306,6 +306,26 @@ python scripts/smoke_deepseek_planner.py
 The script reads `.env`, calls only the planner/provider layer, and does not create a task or
 run the full pipeline.
 
+Live SearXNG Docker deployment acceptance:
+
+```bash
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate deepsearch311
+cd /share/zhuzy/projects/DeepSearch
+DEV_ENV_FILE=.env.deepseek.local DEV_SKIP_FRONTEND=true DEV_BACKEND_RELOAD=false ./dev.sh restart
+python scripts/live_deployment_acceptance.py \
+  --base-url http://127.0.0.1:8000 \
+  --artifact-dir /tmp/deepsearch-live-deployment-acceptance
+```
+
+This script creates a fresh `How to deploy SearXNG with Docker?` task with
+`report_language=zh-CN`, queues the real worker pipeline, waits for a terminal state, exports
+`source_chunks`, `claims`, `claim_evidence`, and report Markdown, then validates the deployment
+evidence terms across those layers. It exits `0` only when the fresh run completes through
+`real-search+opensearch+planner+report-LLM`, produces a grounded Chinese report, preserves
+expected Docker deployment evidence through downstream claim/evidence/report layers, and includes
+claim / claim_evidence / citation traceability.
+
 Phase benchmark commands:
 
 ```bash

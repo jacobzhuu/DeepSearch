@@ -156,6 +156,15 @@ The real DeepSeek planner plus grounded report writer path can complete a Docker
     - fresh live task `ea2fdc97-e4f3-411c-acc7-f068010b988d` completed with real SearXNG search, OpenSearch, DeepSeek planner, and DeepSeek grounded report writer.
     - the live four-layer acceptance check passed for all required terms across `source_chunks`, `claims`, `claim_evidence`, and report Markdown, with no downstream gaps.
   - next: run focused pytest, ruff, black --check, and git diff --check after the live-pass patch.
+- 2026-05-06 / reusable acceptance script:
+  - changes: added `scripts/live_deployment_acceptance.py` as a reusable API-level live acceptance command for the SearXNG Docker deployment report path.
+  - implementation:
+    - the script creates a fresh zh-CN deployment task, queues the real worker pipeline, waits for a terminal status, exports `source_chunks`, `claims`, `claim_evidence`, report, events, and task detail, and evaluates the same four-layer deployment evidence contract used in the live debugging loop.
+    - the runbook now documents the host-local command and artifact directory usage.
+  - validation:
+    - script syntax/help/lint/format checks passed.
+    - a fresh script-created live task `ca475e0a-cc39-4e3b-905d-72c977af59fe` completed and the script returned `passed=true`.
+  - next: use the script for future deployment-report live acceptance instead of ad hoc one-off snippets.
 
 ## 8. Validation
 
@@ -189,6 +198,11 @@ The real DeepSeek planner plus grounded report writer path can complete a Docker
 - Passed: `python -m ruff check services/orchestrator/app/services/claims.py services/orchestrator/app/services/debug_pipeline.py tests/unit/orchestrator/test_report_synthesis_service.py`
 - Passed: `python -m black --check services/orchestrator/app/services/claims.py services/orchestrator/app/services/debug_pipeline.py tests/unit/orchestrator/test_report_synthesis_service.py`
 - Passed: `git diff --check`
+- Passed: `python -m py_compile scripts/live_deployment_acceptance.py`
+- Passed: `python scripts/live_deployment_acceptance.py --help`
+- Passed: `python -m ruff check scripts/live_deployment_acceptance.py`
+- Passed: `python -m black --check scripts/live_deployment_acceptance.py`
+- Passed live: `python scripts/live_deployment_acceptance.py --base-url http://127.0.0.1:8000 --artifact-dir /tmp/deepsearch-live-deployment-acceptance-script-final` created fresh task `ca475e0a-cc39-4e3b-905d-72c977af59fe` and returned `passed=true`.
 
 ## 9. Risks and unknowns
 

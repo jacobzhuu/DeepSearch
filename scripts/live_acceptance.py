@@ -2,19 +2,16 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import urllib.error
 from pathlib import Path
-from typing import Any
 
 try:
     from live_acceptance_framework import (
         DEFAULT_BASE_URL,
         AcceptanceError,
         ApiError,
-        evaluate_deployment_acceptance,
         get_profiles,
         print_json,
         run_live_acceptance,
@@ -25,7 +22,6 @@ except ModuleNotFoundError:
         DEFAULT_BASE_URL,
         AcceptanceError,
         ApiError,
-        evaluate_deployment_acceptance,
         get_profiles,
         print_json,
         run_live_acceptance,
@@ -35,9 +31,15 @@ except ModuleNotFoundError:
 
 def main() -> int:
     args = parse_args()
+    profiles = get_profiles()
+    profile = profiles[args.profile]
     base_url = args.base_url.rstrip("/")
     try:
-        result = run_acceptance(base_url=base_url, wait_seconds=args.wait_seconds)
+        result = run_live_acceptance(
+            base_url=base_url,
+            profile=profile,
+            wait_seconds=args.wait_seconds,
+        )
     except urllib.error.URLError as error:
         print(f"Service unavailable: {error.reason}", file=sys.stderr)
         return 2
@@ -56,7 +58,7 @@ def main() -> int:
         write_artifacts(Path(args.artifact_dir), result)
     if args.json_output:
         Path(args.json_output).write_text(
-            json.dumps(result["acceptance"], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            print_json_string(result["acceptance"]),
             encoding="utf-8",
         )
 
@@ -65,11 +67,18 @@ def main() -> int:
 
 
 def parse_args() -> argparse.Namespace:
+    profiles = get_profiles()
     parser = argparse.ArgumentParser(
         description=(
-            "Create and run a fresh live SearXNG Docker deployment research task, then "
-            "validate source_chunks -> claims -> claim_evidence -> report coverage."
+            "Run a fresh live DeepSearch research task through the real worker pipeline "
+            "and validate it with a reusable acceptance profile."
         ),
+    )
+    parser.add_argument(
+        "--profile",
+        choices=sorted(profiles),
+        default="langgraph-technical-explanation",
+        help="Acceptance profile to run.",
     )
     parser.add_argument(
         "--base-url",
@@ -80,8 +89,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--wait-seconds",
+        "--timeout-seconds",
+        dest="wait_seconds",
         type=float,
-        default=float(os.environ.get("DEEPSEARCH_DEPLOYMENT_ACCEPTANCE_WAIT", "900")),
+        default=float(os.environ.get("DEEPSEARCH_LIVE_ACCEPTANCE_WAIT", "900")),
         help="Maximum seconds to wait for the fresh task to reach a terminal status.",
     )
     parser.add_argument(
@@ -95,21 +106,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_acceptance(*, base_url: str, wait_seconds: float) -> dict[str, Any]:
-    return run_live_acceptance(
-        base_url=base_url,
-        profile=get_profiles()["searxng-docker-deployment"],
-        wait_seconds=wait_seconds,
-    )
+def print_json_string(value: object) -> str:
+    import json
 
-
-def evaluate_acceptance(
-    *,
-    task_id: str,
-    run_payload: dict[str, Any],
-    payloads: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    return evaluate_deployment_acceptance(task_id, run_payload, payloads)
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 if __name__ == "__main__":

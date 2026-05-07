@@ -28,6 +28,7 @@ export interface ResearchTaskProgress {
     selected_sources_from_search: Array<Record<string, any>>;
     selected_sources: Array<Record<string, any>>;
     source_judgments?: Array<Record<string, any>>;
+    llm_assistance?: Record<string, any>;
     fetch_succeeded: number | null;
     fetch_failed: number | null;
     attempted_sources: Array<Record<string, any>>;
@@ -48,6 +49,7 @@ export interface ResearchTaskProgress {
     gap_analysis?: Record<string, any> | null;
     gap_rounds?: Array<Record<string, any>>;
     failure_diagnostics?: Record<string, any> | null;
+    pipeline_counts?: Partial<PipelineCounts>;
     warnings: string[];
   } | null;
 }

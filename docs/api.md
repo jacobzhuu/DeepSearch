@@ -98,6 +98,10 @@ Request:
 `report_language` may be sent either as a top-level create/revise field or inside
 `constraints.report_language`. The report renderer falls back to `constraints.language`,
 then to `en-US` for older tasks. The web workspace sends `zh-CN` by default.
+On task creation, a top-level `report_language` also seeds `constraints.language` when no
+explicit constraint language is present, so search/planning defaults and report output remain
+aligned. On revise, top-level `report_language` changes only `constraints.report_language`
+unless the caller also sends a new `constraints.language`.
 
 Response `201 Created`:
 
@@ -253,17 +257,25 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 - planner status/source fields: `planner_status`, `planner_mode`, and `plan_source`, where planner failures use deterministic fallback instead of blocking the task
 - planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`; for LangGraph overview planner-LLM runs, deterministic owned-source domain corrections are also visible under `research_plan.source_preferences.secondary_preferred_domains` and `research_plan.source_preferences.planner_domain_corrections`
 - `search_result_count`
-- `search_queries`, including provider, per-query result counts, candidate counts, unresponsive engines, and known-path fallback diagnostics when main search recovered from a provider outage
+- `search_queries`, including provider, per-query result counts, candidate counts, selected counts,
+  rejected/noisy counts, fallback-used flags, unresponsive engines, authoritative-source resolver
+  diagnostics, and known-path fallback diagnostics when main search recovered from a provider outage
+- `pipeline_counts`, the latest authoritative ledger counts recorded by worker/debug pipeline events; Task Detail uses this instead of the stale `/run` enqueue response after a task reaches a terminal status
+- `llm_assistance`, when configured, with per-stage query-rewriter/source-judge/evidence-reranker/claim-review status, fallback reason, validation error details, active-vs-shadow flags, and accepted/downranked/rejected/reranked/reviewed counts. Evidence-reranker diagnostics include whether output had usable `answer_slot_ids`, rationales, score distribution, invalid chunk-id counts, and `low_quality_rerank` fallback status when the model returns score-only or otherwise weak rankings.
+  Claim-review diagnostics may report `low_quality_review`; those decisions remain visible in
+  observability but are not persisted as claim-note exclusions unless they pass structured quality
+  validation.
 - `known_path_fallback`, summarizing whether deterministic known-path candidates were injected, how many were added, duplicates/filtered counts, and the provider error classification that triggered the fallback
-- `selected_sources`, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` metadata when applicable
+- `selected_sources`, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` metadata when applicable; deployment queries may include `official_repository` for verified upstream Docker repositories such as `github.com/searxng/searxng-docker`
 - `fetch_succeeded`
 - `fetch_failed`
 - `failed_sources` with URL, HTTP status, error code, and error reason when available
 - `parse_decisions` with per-snapshot parsing outcome details when parsing has run or failed
 - multiformat parser diagnostics, including source format, parser status/kind, parser warnings,
   MIME policy, page range, slide range, sheet names, cell ranges, and locator fallback reasons
-- `source_judgments` when optional shadow LLM source judge is enabled; these are advisory
-  diagnostics only and do not participate in final ranking in this MVP
+- `source_judgments` when optional LLM source judge is enabled; in shadow mode these are advisory
+  diagnostics only, while active mode records `used_in_final_ranking`, bounded priority deltas, and
+  guardrail reasons when a judgment cannot affect final ordering
 - `answer_yield` per source document, including extracted text length, chunk counts, candidate sentence counts, answer-relevant candidate counts, accepted claim candidate counts, category coverage, and low-yield reasons
 - `answer_coverage` for definition, mechanism, privacy, and feature coverage
 - `answer_slots` and `report_slot_coverage`, derived from the query-specific deterministic answer-slot contract
@@ -358,6 +370,8 @@ Revision semantics:
 - `query`, if present, replaces the stored query
 - `constraints`, if present, is a shallow top-level merge into the stored `constraints`
 - top-level `report_language`, if present, is normalized into `constraints.report_language`
+  only; send `constraints.language` explicitly when the revision should also change search or
+  planning language
 - constraint deletion and deep merge are not supported in the current phase
 
 Request:
@@ -535,12 +549,16 @@ Response `200 OK`:
 - task-scoped dedupe is applied in the service layer before insert, so the same canonical URL is persisted at most once per task in the current implementation
 - `search_query.provider` stores the provider id, currently `searxng`
 - per-result `source_engine` and provider metadata are stored in `candidate_url.metadata_json`
-- `search_query.raw_response_json` currently stores `task_revision_no`, expansion metadata, discovered source engines, provider response metadata, and `result_count`
+- `search_query.raw_response_json` currently stores `task_revision_no`, expansion metadata,
+  discovered source engines, provider response metadata, `result_count`,
+  `provider_result_diagnostics`, and authoritative-source resolver diagnostics when applicable
 - the SearXNG provider validates endpoint responses before they enter the ledger:
   - HTML responses are rejected as `searxng_html_response`
   - HTTP 403 is rejected as `searxng_http_forbidden`
   - invalid JSON is rejected as `searxng_invalid_json`
   - empty results with `unresponsive_engines` are rejected as `searxng_empty_results_with_unresponsive_engines`
+  - request timeouts and transport failures are rejected as `searxng_timeout` or
+    `searxng_request_error`
 - SearXNG diagnostics are logged with `SEARCH_PROVIDER`, `SEARXNG_BASE_URL`, response status, content type, body preview, and `unresponsive_engines`
 - no fetch jobs, fetch attempts, crawler calls, parser calls, OpenSearch writes, claim drafting, verification, or report generation are triggered by `POST /searches`
 - paused or cancelled tasks return `409 Conflict` from `POST /searches`
@@ -773,7 +791,9 @@ Response `200 OK`:
 Command contract:
 
 - allowed only when the task status is `PLANNED`
-- currently supports only `text/html` and `text/plain`
+- currently supports `text/html`, `text/plain`, safe raw text formats such as Markdown/YAML/env,
+  and the documented multiformat parser MIME types; YAML/env text is parsed without executing
+  content and preserves indentation needed for configuration evidence
 - parse entry `reason` uses this stable enum when present:
   - `fetch_not_succeeded`
   - `already_parsed`
@@ -925,6 +945,7 @@ Response `200 OK`:
 - supported extractors are currently:
   - `html_text_v1` for `text/html`
   - `plain_text_v1` for `text/plain`
+  - `plain_text_v1` for safe raw text formats such as Markdown, YAML, and env files
 - HTML extraction keeps `<title>` for `source_document.title` but excludes it from body chunks
 - Wikipedia/MediaWiki-like HTML is extracted from content regions first (`main`, `article`, `#content`, `#bodyContent`, `#mw-content-text`, `.mw-parser-output`) and then falls back to readable paragraphs from `.mw-parser-output p`, `#mw-content-text p`, or body paragraphs when strict extraction would otherwise produce empty text
 - HTML boilerplate cleanup removes navigation, sidebars, table-of-contents blocks, edit labels, reference blocks, navboxes, footers, scripts, styles, and SVG/button/form/header noise while preserving article paragraphs
@@ -1309,7 +1330,10 @@ Command contract:
   - `source_quality_score`
 - for definition/mechanism questions such as `What is X and how does it work?`, the draft selector prefers definition, mechanism, privacy/design-goal, and feature claims, and penalizes setup instructions, contribution/community text, slogans, references, and navigation material
 - for technical library/framework questions, mechanism and feature matching includes graph/state/nodes/edges/workflow/orchestration/routing, durable execution, streaming, memory, checkpointing, human-in-the-loop, integrations, APIs, and limitations
+- for deployment questions such as `How to deploy SearXNG with Docker?`, the draft selector can extract Docker commands, Docker Compose YAML, port mappings, volume mounts, prerequisites, `settings.yml`, `SEARXNG_SECRET` and other `SEARXNG_*` environment settings, reverse proxy / limiter / secret / custom-certificate guidance, troubleshooting text, and update/maintenance commands as deployment evidence statements when they are present in source chunks
 - persisted draft claims store the scoring metadata in `claim.notes`, including `claim_category`, `claim_quality_score`, `query_answer_score`, `claim_selection_score`, and `rejected_reason` when available
+- deployment evidence statements store `evidence_kind = "deployment_code_or_config"` plus deployment `slot_ids` in `claim.notes`; multiline shell/YAML/env fenced blocks are kept as complete citation spans when possible; verification still requires a matching citation span and a selected `support` claim-evidence row before the report can render the snippet, and rendered command/config snippets use fenced code blocks with claim/evidence/citation ids
+- deployment security slot coverage is narrow: reverse proxy, limiter/bot protection, secrets, certificates, and public instance exposure count as security evidence; `docker exec ... root` is troubleshooting only, and `FORCE_OWNERSHIP` is volume/configuration evidence only
 - if strict filters produce no claims, drafting may run a narrow deterministic `fallback_relaxed` pass over explanatory definition, mechanism, privacy, or feature sentences only; fallback still rejects slogans, calls-to-action, community/contribution text, redirect stubs, navigation, references, and setup-only instructions unless the query asks for them
 - fallback-created claims record `draft_mode = "fallback_relaxed"`, `fallback_reason = "strict_filters_produced_no_claims"`, and `original_rejected_reason` in `claim.notes`
 - claim drafting now filters weak deterministic candidates before persistence:
@@ -1342,7 +1366,7 @@ Request semantics:
 - report generation does not run new retrieval, verification, or claim-drafting logic
 - report generation may be invoked for any existing task because it synthesizes from persisted ledger state only
 - report language resolves from `constraints.report_language`, then `constraints.language`, then `en-US`
-- when `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`, report generation attempts the grounded LLM writer; invalid or failed LLM output falls back to deterministic Markdown
+- when `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`, report generation attempts the grounded LLM writer; invalid, wrong-language, or failed LLM output falls back to deterministic Markdown
 
 Response `200 OK`:
 
@@ -1380,6 +1404,13 @@ Command contract:
 - `supported` claims may appear as settled conclusions
 - `mixed`, `contradicted`, `unsupported`, and `draft` claims must remain explicitly labeled in the report body
 - LLM-written report prose is allowed only from a structured claim/evidence/citation-span bundle; every rendered LLM item must carry valid claim/evidence/citation ids
+- deployment reports may render dedicated prerequisites, Docker run/compose, volumes, ports,
+  configuration, security, troubleshooting, and update/maintenance sections; each rendered
+  command/config item must still originate from verified claim evidence, and missing sections are
+  shown as coverage gaps
+- main Markdown narratives omit internal claim/evidence/citation/source UUIDs by default; the
+  operator can enable `REPORT_INCLUDE_LEDGER_DEBUG_APPENDIX=true` to include the internal mapping
+  appendix in generated artifacts
 - repeated calls reuse the latest artifact when the newly rendered Markdown bytes are identical
 - repeated calls create a new Markdown artifact version only when the rendered content changes
 - does not emit new `task_event` rows and does not change `research_task.status`
@@ -1440,6 +1471,8 @@ Response `200 OK`:
   - `mixed`, `contradicted`, and `unsupported` claims are rendered only inside uncertainty-aware sections with explicit status labels
 - grounded LLM report synthesis is constrained by ids:
   - the LLM prompt receives only verified claim rows and their claim-evidence / citation-span excerpts
+  - the LLM prompt receives the resolved `report_language`; `zh-*` requests are rejected if the
+    structured output contains no Chinese text
   - the LLM must return structured JSON, not free-form Markdown
   - rendered LLM items are dropped unless their `claim_ids`, `claim_evidence_ids`, and `citation_span_ids` validate against the prepared report bundle
   - invalid LLM JSON, ungrounded ids, provider errors, or missing verified evidence fall back to the deterministic renderer
@@ -1452,7 +1485,12 @@ Response `200 OK`:
   - non-claimable title/question/fragment statements are skipped
   - citation excerpts below the minimum claimable threshold are not rendered as support evidence
   - supported claims below the persisted or recomputed `claim_quality_score` and `query_answer_score` thresholds are excluded from the report instead of being promoted into the Executive Summary
+  - every prepared claim receives optional `claim.notes_json.report_eligible` and `claim.notes_json.report_eligibility` diagnostics; main-report eligibility requires persisted evidence, a verified/non-draft status, answer-slot coverage, query/main-subject relevance, and no reviewer `reject`, `downrank`, `duplicate`, `vague`, or `split_needed` decision
+  - weak reviewer `accept` decisions with missing reasons, missing covered slots, low confidence, or reviewer quality flags are not treated as normal report-eligible conclusions
   - for definition/mechanism queries, supported claims outside the expected definition, mechanism, privacy, or feature categories are excluded unless their answer score is very high
+  - for deployment queries, command/config excerpts marked as deployment evidence are allowed even
+    when they would otherwise look like diagram/config fragments; slot coverage is derived from
+    persisted `slot_ids` and verified support evidence
   - the Source Scope and Limitations section reports answer-relevant included claim count and excluded low-quality/off-query claim count
   - when category coverage is thin, the report explicitly states `Coverage is limited because no ... claims were generated.`
   - claims marked `supported` or `mixed` without remaining support evidence are downgraded to `unsupported` in the rendered report
@@ -1483,11 +1521,15 @@ Execution contract:
 - never uses an LLM to draft claims or verify evidence; final report writing may use the optional grounded LLM writer only when explicitly enabled and only from verified claim/evidence/citation-span bundles
 - the worker reuses the existing service-layer seams:
   - optional research planning
+  - optional LLM query rewriting through the configured OpenAI-compatible provider
   - search discovery
+  - optional LLM source judging over persisted candidate URLs
   - HTTP acquisition
   - parsing and chunking
   - indexing and retrieval
+  - optional LLM evidence reranking over existing source chunks
   - claim drafting
+  - optional LLM claim quality review over existing draft claims
   - claim verification
   - Markdown report generation
 - worker execution transitions `research_task.status` through:
@@ -1507,6 +1549,7 @@ Execution contract:
 - `pipeline.stage_completed` and `pipeline.failed` payloads include operator observability details for search, acquisition, parsing, claim drafting, and supplemental acquisition:
   - planner intent, subquestion count, search-query count, raw/final planner query lists, downweighted planner queries, preferred/avoided domains, intent classification, extracted entity, and planner guardrail warnings when a plan exists
   - main-search known-path fallback metadata when SearXNG reports empty results with unresponsive engines for a known technical project; fallback candidates include `candidate_source`, `fallback_reason`, and `original_search_provider`
+  - DeepSeek/OpenAI-compatible assistance diagnostics when enabled; DeepSeek is never a search provider and does not create source URLs, chunks, claims, citation spans, or report artifacts directly
   - search result count and selected candidate source summaries, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` when source-selection guardrails classify official about/home/reference, Wikipedia, GitHub, admin architecture, installation, API/developer, forum/social/video, generic, or low-quality pages
   - fetch success/failure counts
   - failed fetch URL summaries with HTTP status, error code, and error reason

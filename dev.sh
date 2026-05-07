@@ -503,6 +503,19 @@ start_frontend() {
     wait_for_http "$FRONTEND_URL" "Frontend" "$FRONTEND_LOG"
 }
 
+start_worker() {
+    if is_truthy "${DEV_SKIP_WORKER:-false}"; then
+        note "Skipping worker start because DEV_SKIP_WORKER=true."
+        return 0
+    fi
+
+    local worker_args=(
+        "$PYTHON_BIN" "scripts/research_worker.py"
+    )
+
+    (cd "$PROJECT_ROOT" && start_background "Worker" "$WORKER_PID_FILE" "$WORKER_LOG" "${worker_args[@]}")
+}
+
 start_all() {
     setup_dirs
     load_env_file
@@ -515,6 +528,7 @@ start_all() {
     start_mock_search_if_requested
     run_init_steps
     start_backend
+    start_worker
     start_frontend
     STARTUP_CLEANUP_ON_ERROR=false
 
@@ -550,6 +564,7 @@ print_status() {
     echo "DeepSearch local services"
     echo "-------------------------"
     print_process_status "backend" "$BACKEND_PID_FILE" "uvicorn|services\.orchestrator\.app\.main:app"
+    print_process_status "worker" "$WORKER_PID_FILE" "research_worker\.py"
     print_process_status "frontend" "$FRONTEND_PID_FILE" "vite|node|npm"
     print_process_status "mock-searxng" "$MOCK_SEARCH_PID_FILE" "mock_searxng\.py"
     echo ""
@@ -562,6 +577,7 @@ print_status() {
     echo ""
     echo "Logs:"
     echo "  backend:  $BACKEND_LOG"
+    echo "  worker:   $WORKER_LOG"
     echo "  frontend: $FRONTEND_LOG"
     echo "  search:   $MOCK_SEARCH_LOG"
     echo ""
@@ -635,8 +651,9 @@ logs_command() {
     case "$target" in
         backend) files=("$BACKEND_LOG") ;;
         frontend) files=("$FRONTEND_LOG") ;;
+        worker) files=("$WORKER_LOG") ;;
         search|mock|mock-searxng) files=("$MOCK_SEARCH_LOG") ;;
-        all) files=("$BACKEND_LOG" "$FRONTEND_LOG" "$MOCK_SEARCH_LOG") ;;
+        all) files=("$BACKEND_LOG" "$WORKER_LOG" "$FRONTEND_LOG" "$MOCK_SEARCH_LOG") ;;
         *) fail "Unknown log target: $target" ;;
     esac
 
@@ -704,14 +721,14 @@ Usage: ./dev.sh [COMMAND] [ARGS]
 Commands:
   start       Start or converge local services. This stops only processes from this script first.
   restart     Same as start; provided for operator clarity.
-  stop        Stop backend, frontend, and optional mock search processes started by this script.
+  stop        Stop backend, worker, frontend, and optional mock search processes started by this script.
   status      Show process, URL, log, and port diagnostics.
   doctor      Check dependencies, config, and common service reachability.
-  init        Run migration, bucket, and index initialization without starting the UI/API.
+  init        Run migration, bucket, and index initialization without starting the UI/API/worker.
   smoke [URL] [ARGS]
               Run scripts/smoke_test.py against URL, defaulting to the configured backend.
               Extra ARGS are passed through to scripts/smoke_test.py.
-  logs [name] Tail logs: backend, frontend, search, or all.
+  logs [name] Tail logs: backend, worker, frontend, search, or all.
   help        Show this help.
 
 Useful environment controls:
@@ -722,7 +739,8 @@ Useful environment controls:
   DEV_BACKEND_HOST=0.0.0.0            Bind backend beyond loopback intentionally.
   DEV_FRONTEND_HOST=0.0.0.0           Bind frontend beyond loopback intentionally.
   DEV_RUN_INIT=false                  Skip migrations, bucket init, and index init.
-  DEV_SKIP_FRONTEND=true              Start backend only.
+  DEV_SKIP_FRONTEND=true              Start backend and worker only.
+  DEV_SKIP_WORKER=true                Start backend and frontend without the worker.
   DEV_BACKEND_RELOAD=false            Start uvicorn without --reload.
   DEV_START_MOCK_SEARXNG=true         Start scripts/mock_searxng.py and point SEARXNG_BASE_URL at it.
   SEARCH_PROVIDER=smoke INDEX_BACKEND=local

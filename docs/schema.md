@@ -20,17 +20,31 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 
 ## Phase 11 schema note
 
-- P1 evidence credibility adds no new relational fields, tables, or indexes
+- P1 evidence credibility and the DeepSeek-assisted quality layer add no new relational fields,
+  tables, or indexes
 - Research Planner v1 stores its output in existing `task_event.payload_json` rows with event types `research_plan.created` and `research_plan.failed`; no `research_plan` table or migration exists
 - pre-run planner confirmation also uses `research_plan.created` with `stage = "PLANNING"` while leaving `research_task.status = PLANNED`; the latest matching plan event for the current `revision_no` is reused by the worker pipeline instead of creating a hidden duplicate plan
 - product run queueing uses existing `research_task.status = QUEUED`; the host-local worker writes runtime progress to existing `task_event` rows and `research_run.checkpoint_json`
 - task listing is an API/query-layer addition over existing `research_task` and `task_event` rows; it adds no relational schema
-- planner guardrail, source-selection, answer-slot coverage, source-yield, evidence-yield, dropped-source, verifier-detail, supplemental-acquisition, gap-analysis, and failure-diagnostic fields are stored in existing `task_event.payload_json`, `search_query.raw_response_json`, `candidate_url.metadata_json`, `claim.notes_json`, `research_run.checkpoint_json`, `report_artifact.manifest_json`, and API observability payloads; gap supplemental query metadata such as `query_source = "gap_analyzer"`, `gap_round_no`, and `slot_ids` stays in existing search metadata; no new planner, source-quality, answer-slot, evidence-candidate, gap-analyzer, worker-queue, or acquisition-retry table exists
+- planner guardrail, LLM query-rewrite, source-selection, LLM source-judge, answer-slot coverage,
+  LLM evidence-rerank, LLM claim-review, source-yield, evidence-yield, dropped-source,
+  verifier-detail, supplemental-acquisition, gap-analysis, deployment-evidence, and
+  failure-diagnostic fields are stored in existing `task_event.payload_json`,
+  `search_query.raw_response_json`, `candidate_url.metadata_json`, `source_chunk.metadata_json`,
+  `claim.notes_json`, `research_run.checkpoint_json`, `report_artifact.manifest_json`, and API
+  observability payloads; gap supplemental query metadata such as
+  `query_source = "gap_analyzer"`, `gap_round_no`, and `slot_ids` stays in existing search
+  metadata; no new planner, source-quality, answer-slot, evidence-candidate, deployment-step,
+  gap-analyzer, worker-queue, source-judge, LLM-assistance, or acquisition-retry table exists
 - query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `answer_role`, `answer_relevant`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`
-- claim drafting now also stores code-contract lineage fields in `claim.notes_json`, including `slot_ids`, `source_document_id`, `source_chunk_id`, `citation_span_id`, `claim_evidence_id`, `source_intent`, `evidence_candidate_id`, `evidence_quality_score`, `evidence_salience_score`, `evidence_rejection_reasons`, and a serialized `evidence_candidate` payload
-- source quality uses existing `source_document` score columns and `source_chunk.metadata_json`; current metadata records final source score, authority, relevance, crawlability, information density, safety, explicit `freshness_state`, chunk content quality, query relevance, boilerplate score, and quality reasons
+- claim drafting now also stores code-contract lineage fields in `claim.notes_json`, including `slot_ids`, `source_document_id`, `source_chunk_id`, `citation_span_id`, `claim_evidence_id`, `source_intent`, `evidence_kind`, `evidence_candidate_id`, `evidence_quality_score`, `evidence_salience_score`, `evidence_rejection_reasons`, and a serialized `evidence_candidate` payload; deployment command/config records use `evidence_kind = "deployment_code_or_config"` and deployment-specific `slot_ids`, preserve the full drafted evidence excerpt in that existing payload for rendering, while archived/superseded official-repository caveats use ordinary verified claim metadata and a deployment maintenance slot
+- source quality uses existing `source_document` score columns and `source_chunk.metadata_json`; current metadata records final source score, authority, relevance, crawlability, information density, safety, explicit `freshness_state`, chunk content quality, query relevance, boilerplate score, and quality reasons such as `deployment_code_or_config`
 - verification stores deterministic lexical verifier metadata in `claim.notes_json["verification"]`, including `verifier_method`, strong and weak support counts, contradiction counts, insufficient-evidence count, selected/dropped evidence counts, evidence rank scores, relation details, citation precision, shallow-overlap flags, numeric/date mismatch flags, and scope-mismatch flags
-- report language and optional grounded LLM writer provenance are stored in existing `report_artifact.manifest_json` keys: `report_language`, `report_writer.mode`, `report_writer.status`, and sanitized provider/model/usage/error metadata when the LLM writer is attempted
+- report language and optional grounded LLM writer provenance are stored in existing `report_artifact.manifest_json` keys: `report_language`, `report_writer.mode`, `report_writer.status`, `report_writer.report_language`, and sanitized provider/model/usage/error metadata when the LLM writer is attempted
+- LLM-assisted quality diagnostics use existing JSON seams only: query-rewriter and
+  evidence-reranker summaries live in task events/checkpoints, source-judge decisions live in
+  `candidate_url.metadata_json`, claim-review decisions live in `claim.notes_json`, and report
+  readability/debug-appendix settings live in report writer metadata/configuration
 - host-local operational closeout, optional compose wiring, init scripts, and smoke validation all reuse the existing Phase 10 schema as-is
 - `services/orchestrator/app/research_quality/` provides the current code-level source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, slot-coverage, and gap-analysis contracts; these are not relational schema entities yet
 - the stable code-level diagnostics field names are `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, `evidence_yield_summary`, `slot_coverage_summary`, `gap_analysis`, `gap_rounds`, and `verification_summary`; older rows that lack these fields are interpreted as empty summaries rather than requiring a data migration
@@ -149,6 +163,10 @@ if these JSON contracts become too large for operator review.
   - `source_engines`
   - `response_metadata`
   - `result_count`
+  - `provider_result_diagnostics` with provider status, selected count, duplicate count,
+    filtered count, rejected/noisy count, fallback-used flag, and capped rejected-result details
+  - `known_source_resolver` when the deterministic authoritative-source resolver injected
+    official/reference/repository/package/academic candidates before generic search
 - `candidate_url` intake is Phase 3 task-scoped and service-level:
   - canonicalize URL
   - evaluate allow or deny domain rules
@@ -165,6 +183,8 @@ if these JSON contracts become too large for operator review.
   - `expansion_kind`
   - `expansion_metadata`
   - `query_text`
+  - optional resolver/fallback provenance such as `candidate_source`, `known_path_candidate`,
+    `original_search_provider`, `source_selection_reason`, and `fallback_reason`
 - explicit provenance TODO:
   - a future phase may need a `search_query_candidate_url` association table, or an equivalent relation, to model one canonical URL being surfaced by multiple `search_query` rows without overloading the current minimum Phase 3 shape
 
@@ -189,6 +209,8 @@ if these JSON contracts become too large for operator review.
 - supported MIME types are currently:
   - `text/html`
   - `text/plain`
+  - safe raw text formats such as Markdown, YAML, and env files
+  - PDF and OpenXML document formats documented in the P2/P3 no-migration note
 - unsupported MIME types are skipped explicitly at service and API level; no `source_document` row is created for them in the current phase
 - Phase 5 parsing does not add a new parse-job ledger table; skip and failure reasons are returned by the parse command response only
 - parse responses currently use this stable `reason` enum:
@@ -201,7 +223,7 @@ if these JSON contracts become too large for operator review.
   - when a later parse targets the same canonical URL for the same task, the current minimum behavior is to update the existing `source_document`, move its `content_snapshot_id` to the new snapshot, and rebuild `source_chunk` rows
 - `source_document.source_type` currently uses the minimum parser-facing values:
   - `web_page` for `text/html`
-  - `plain_text` for `text/plain`
+  - `plain_text` for `text/plain` and safe raw text formats such as Markdown/YAML/env
 - `source_chunk.token_count` is currently a stable approximate token count derived from character length
 - `source_chunk.metadata_json` currently stores:
   - `strategy`
@@ -331,6 +353,8 @@ if these JSON contracts become too large for operator review.
   - mixed, contradicted, and unsupported claims are rendered only with explicit status labels and uncertainty sections
   - no new claims, verification decisions, or retrieval operations are introduced during report generation
   - low-quality or off-query supported claims are filtered using persisted or recomputed claim-quality and query-answer scores before they can appear in the Executive Summary, Answer sections, Evidence Table, or claim evidence mapping
+  - report synthesis records optional `claim.notes_json.report_eligible` and `claim.notes_json.report_eligibility` keys for each prepared claim; these keys are diagnostics only and do not require a migration
+  - reviewer-rejected, reviewer-downranked, adjacent/off-topic, missing-slot, missing-evidence, low-confidence, or weak structured-review claims can remain in the ledger but are not passed to deterministic or grounded LLM main-report rendering as normal conclusions
   - definition/mechanism reports also apply an answer-category gate so supported `other`, setup, community, slogan, reference, or navigation claims do not appear as conclusions by status alone
   - the rendered Source Scope and Limitations section reports answer-relevant included claims and excluded low-quality/off-query claims
 - when explicitly enabled, the grounded LLM report writer uses the same prepared report claim/evidence bundle:

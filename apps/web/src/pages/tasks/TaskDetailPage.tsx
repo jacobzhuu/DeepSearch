@@ -17,7 +17,7 @@ export const TaskDetailPage: React.FC = () => {
   const { mutateTask, isMutating, error: actionError } = useTaskAction();
   const { createTask, isCreating, error: createError } = useCreateTask();
   const initialPipelineResult = (location.state as { pipelineResult?: PipelineRunResponse } | null)?.pipelineResult || null;
-  const pipelineResult = runResult || initialPipelineResult;
+  const queuedPipelineResult = runResult || initialPipelineResult;
 
   useEffect(() => {
     if (!taskId || !task || !activeTaskStatuses.has(task.status)) return;
@@ -83,6 +83,9 @@ export const TaskDetailPage: React.FC = () => {
     : canCreateReplacement
       ? '该任务已失败并保留在审计账本中，不能原地重跑。可以用相同查询创建一个新任务重新运行。'
       : '只有处于 PLANNED 状态的任务才能运行。请在运行前创建一个新任务或修改该任务。';
+  const observability = task.progress?.observability || null;
+  const authoritativePipelineResult = pipelineResultFromTaskDetail(task, observability, eventsData?.events || []);
+  const pipelineResult = authoritativePipelineResult || queuedPipelineResult;
   const latestPipelineFailure = pipelineResult?.failure || latestFailureFromEvents(eventsData?.events || []);
   const primaryActionLabel = canCreateReplacement
     ? isCreating || isRunning
@@ -93,7 +96,6 @@ export const TaskDetailPage: React.FC = () => {
       : '运行 DeepSearch';
   const primaryActionDisabled = actionBusy || (!canRun && !canCreateReplacement);
   const handlePrimaryAction = canCreateReplacement ? handleCreateReplacementAndRun : handleRun;
-  const observability = task.progress?.observability || null;
 
   return (
     <PageLayout 
@@ -237,6 +239,60 @@ const latestFailureFromEvents = (events: TaskEvent[]): PipelineFailure | null =>
   };
 };
 
+const pipelineResultFromTaskDetail = (
+  task: ResearchTask,
+  observability: TaskObservability | null,
+  events: TaskEvent[],
+): PipelineRunResponse | null => {
+  const terminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
+  const latestCountEvent = events
+    .slice()
+    .reverse()
+    .find((event) => event.payload?.counts && typeof event.payload.counts === 'object');
+  const rawCounts = observability?.pipeline_counts || latestCountEvent?.payload?.counts;
+  if (!terminal && !rawCounts) return null;
+  const completedEvent = events
+    .slice()
+    .reverse()
+    .find((event) => event.event_type === 'pipeline.completed' || event.event_type === 'debug.pipeline.completed');
+  const reportingEvent = events
+    .slice()
+    .reverse()
+    .find((event) => event.payload?.stage === 'REPORTING' && event.payload?.result && typeof event.payload.result === 'object');
+  const reportingResult = reportingEvent?.payload?.result || {};
+  return {
+    task_id: task.task_id,
+    status: task.status,
+    completed: task.status === 'COMPLETED',
+    running_mode: observability?.running_mode || latestCountEvent?.payload?.running_mode || 'unknown-search+unknown-index+unknown-llm',
+    stages_completed: completedEvent ? ['SEARCHING', 'ACQUIRING', 'PARSING', 'INDEXING', 'DRAFTING_CLAIMS', 'VERIFYING', 'REPORTING'] : [],
+    counts: asPipelineCounts(rawCounts),
+    report_artifact_id: typeof reportingResult.report_artifact_id === 'string' ? reportingResult.report_artifact_id : null,
+    report_version: typeof reportingResult.report_version === 'number' ? reportingResult.report_version : null,
+    report_markdown_preview: typeof reportingResult.report_markdown_preview === 'string' ? reportingResult.report_markdown_preview : null,
+    failure: task.status === 'FAILED' ? latestFailureFromEvents(events) : null,
+    dependencies: observability?.dependencies || latestCountEvent?.payload?.dependencies || {},
+  };
+};
+
+const asPipelineCounts = (value: unknown): PipelineCounts => {
+  const source = value && typeof value === 'object' ? value as Partial<PipelineCounts> : {};
+  return {
+    search_queries: numberOrZero(source.search_queries),
+    candidate_urls: numberOrZero(source.candidate_urls),
+    fetch_attempts: numberOrZero(source.fetch_attempts),
+    content_snapshots: numberOrZero(source.content_snapshots),
+    source_documents: numberOrZero(source.source_documents),
+    source_chunks: numberOrZero(source.source_chunks),
+    indexed_chunks: numberOrZero(source.indexed_chunks),
+    claims: numberOrZero(source.claims),
+    claim_evidence: numberOrZero(source.claim_evidence),
+    report_artifacts: numberOrZero(source.report_artifacts),
+  };
+};
+
+const numberOrZero = (value: unknown): number => typeof value === 'number' ? value : 0;
+
 const PipelineFailureHelp: React.FC<{ failure: PipelineFailure | null; dependencies: Record<string, any> | null }> = ({ failure, dependencies }) => {
   if (!failure) return null;
 
@@ -278,6 +334,7 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
 
   const selectedSources = Array.isArray(observability.selected_sources) ? observability.selected_sources : [];
   const sourceJudgments = asObjectArray(observability.source_judgments);
+  const llmAssistance = observability.llm_assistance || null;
   const attemptedSources = Array.isArray(observability.attempted_sources) ? observability.attempted_sources : [];
   const unattemptedSources = Array.isArray(observability.unattempted_sources) ? observability.unattempted_sources : [];
   const failedSources = Array.isArray(observability.failed_sources) ? observability.failed_sources : [];
@@ -444,6 +501,7 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
           </ul>
         </div>
       )}
+      <LLMAssistancePanel assistance={llmAssistance} />
       <SourceYieldSummaryPanel rows={sourceYieldSummary} />
       <DroppedSourcesPanel rows={droppedSources} />
       <AnswerSlotCoveragePanel rows={answerSlots} />
@@ -502,6 +560,7 @@ const SourceSelectionTable: React.FC<{ rows: any[] }> = ({ rows }) => {
               <th style={thStyle}>类别</th>
               <th style={thStyle}>状态</th>
               <th style={thStyle}>原因</th>
+              <th style={thStyle}>LLM 审阅</th>
               <th style={thStyle}>质量</th>
               <th style={thStyle}>最终 URL</th>
               <th style={thStyle}>来源产出</th>
@@ -515,6 +574,7 @@ const SourceSelectionTable: React.FC<{ rows: any[] }> = ({ rows }) => {
                 <td style={tdStyle}>{source.category || '无'}</td>
                 <td style={tdStyle}>{source.state}</td>
                 <td style={tdStyle}>{source.reason || source.downrank_reason || '无'}</td>
+                <td style={tdStyle}>{formatSourceJudge(source)}</td>
                 <td style={tdStyle}>{formatOptionalNumber(source.quality)}</td>
                 <td style={tdStyle}>
                   {source.final_url ? (
@@ -564,6 +624,45 @@ const SourceYieldSummaryPanel: React.FC<{ rows: any[] }> = ({ rows }) => {
           </li>
         ))}
       </ul>
+    </div>
+  );
+};
+
+const LLMAssistancePanel: React.FC<{ assistance: Record<string, any> | null }> = ({ assistance }) => {
+  if (!assistance || Object.keys(assistance).length === 0) return null;
+  const rows = Object.entries(assistance)
+    .filter(([, value]) => value && typeof value === 'object')
+    .map(([stage, value]) => ({ stage, ...(value as Record<string, any>) }));
+
+  if (rows.length === 0) return null;
+
+  return (
+    <div style={{ marginTop: '0.75rem' }}>
+      <strong>LLM 辅助阶段</strong>
+      <div style={{ marginTop: '0.5rem', overflowX: 'auto' }}>
+        <table style={tableStyle}>
+          <thead>
+            <tr>
+              <th style={thStyle}>阶段</th>
+              <th style={thStyle}>状态</th>
+              <th style={thStyle}>使用</th>
+              <th style={thStyle}>计数</th>
+              <th style={thStyle}>回退</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row: any) => (
+              <tr key={row.stage}>
+                <td style={tdStyle}>{formatLLMStage(row.stage)}</td>
+                <td style={tdStyle}>{row.status || '未知'}</td>
+                <td style={tdStyle}>{row.used ? '是' : row.enabled === false ? '禁用' : '否'}</td>
+                <td style={tdStyle}>{formatLLMAssistanceCounts(row)}</td>
+                <td style={tdStyle}>{formatLLMFallback(row)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 };
@@ -839,6 +938,8 @@ const normalizeSourceRow = (source: any) => {
     reason: source.source_selection_reason || source.selected_reason || source.fetch_priority_reason || source.reason,
     downrank_reason: source.downrank_reason,
     quality: source.source_quality_score || source.final_source_score || source.quality_score,
+    source_judge: source.source_judge || source.llm_source_judge || null,
+    source_judge_delta: source.llm_source_judge_priority_delta,
     source_yield: sourceYield,
   };
 };
@@ -866,6 +967,65 @@ const formatSourceYield = (value: any): string => {
   const accepted = value.accepted_claim_candidate_count ?? '无';
   const lowYield = value.low_yield_reason ? ` / ${value.low_yield_reason}` : '';
   return `分块 ${chunks}, 符合条件 ${eligible}, 句子 ${candidates}, 答案相关 ${answerRelevant}, 已接受 ${accepted}${lowYield}`;
+};
+
+const formatSourceJudge = (source: any): string => {
+  const judgment = source.source_judge;
+  if (!judgment || typeof judgment !== 'object') return '无';
+  const output = judgment.output_judgment && typeof judgment.output_judgment === 'object' ? judgment.output_judgment : {};
+  const label = output.label || 'uncertain';
+  const fallback = judgment.fallback_status || 'none';
+  const used = judgment.used_in_final_ranking ? '参与排序' : '未参与排序';
+  const delta = typeof source.source_judge_delta === 'number' ? ` / Δ ${source.source_judge_delta}` : '';
+  return `${label} / ${fallback} / ${used}${delta}`;
+};
+
+const formatLLMStage = (value: string): string => {
+  const labels: Record<string, string> = {
+    query_rewriter: '查询改写',
+    source_judge: '来源审阅',
+    evidence_reranker: '证据重排',
+    claim_reviewer: '结论审阅',
+  };
+  return labels[value] || value;
+};
+
+const formatLLMAssistanceCounts = (row: Record<string, any>): string => {
+  const counts: string[] = [];
+  const countMap: Array<[string, string]> = [
+    ['added_query_count', '新增查询'],
+    ['judged_candidate_count', '审阅来源'],
+    ['used_in_final_ranking_count', '参与排序'],
+    ['reranked_chunk_count', '重排分块'],
+    ['candidate_chunk_count', '候选分块'],
+    ['reviewed_claim_count', '审阅结论'],
+    ['accepted_count', '接受'],
+    ['rejected_count', '拒绝'],
+  ];
+  countMap.forEach(([key, label]) => {
+    if (typeof row[key] === 'number') counts.push(`${label} ${row[key]}`);
+  });
+  return counts.join(', ') || '无';
+};
+
+const formatLLMFallbackCounts = (row: Record<string, any>): string | null => {
+  const fallbackCounts = row.fallback_counts;
+  if (!fallbackCounts || typeof fallbackCounts !== 'object') return null;
+  const entries = Object.entries(fallbackCounts)
+    .filter(([, value]) => typeof value === 'number')
+    .map(([key, value]) => `${key}: ${value}`);
+  return entries.length > 0 ? entries.join(', ') : null;
+};
+
+const formatLLMFallback = (row: Record<string, any>): string => {
+  const parts = [
+    row.fallback_reason,
+    row.error_type,
+    row.message,
+    row.active_rerank_reason,
+    formatLLMFallbackCounts(row),
+  ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  return parts.length > 0 ? parts.join(' / ') : '无';
 };
 
 const PipelineResultPanel: React.FC<{ result: PipelineRunResponse | null }> = ({ result }) => {

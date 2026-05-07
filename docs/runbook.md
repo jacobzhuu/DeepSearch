@@ -20,6 +20,7 @@ Run the system directly on a Linux host with:
   - filesystem backend for simplest local operation
   - MinIO when S3-like object storage is preferred
 - SearXNG-compatible endpoint or the repository-local search mock for smoke validation
+- optional YaCy endpoint when the operator wants another free/self-hosted search source
 
 Optional tooling still present in the repo:
 
@@ -47,10 +48,12 @@ The current v1 path supports:
 - optional grounded LLM report writing that receives only verified claim/evidence/citation-span bundles and falls back to deterministic Markdown on invalid output or provider failure
 - PDF, DOCX, PPTX, and XLSX text extraction through the same source/chunk/index/evidence/report path as HTML/plain text, with parser metadata and locator fallbacks exposed in APIs
 - deterministic retrieval/rerank diagnostics in retrieved chunk metadata
-- optional shadow LLM source judging; disabled by default and never used for final ranking in this MVP
+- optional DeepSeek/OpenAI-compatible assistance for query rewriting, source judging, evidence
+  reranking, claim review, and grounded report writing; disabled by default and never allowed to
+  bypass fetched/persisted evidence
 - shared deterministic source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, slot-coverage, and gap-analysis contracts for source selection, diagnostics, verification, and report coverage
 - deterministic source/chunk quality scoring for prioritization and diagnostics, including authority, relevance, crawlability, information density, safety, and explicit unknown freshness
-- task-event and task-detail observability for planner guardrails, final search queries, search-query diagnostics, known-path fallback injection, source selection, answer slots, source yield, evidence yield, slot coverage, gap rounds, answer yield, answer coverage, verifier strong/weak support counts, supplemental acquisition, fetch success/failure counts, failed fetch reasons, parse decisions, and actionable failure diagnostics
+- task-event and task-detail observability for planner guardrails, final search queries, search-query diagnostics, authoritative-source resolver injection, noisy-result rejection counts, known-path fallback injection, source selection, answer slots, source yield, evidence yield, slot coverage, gap rounds, answer yield, answer coverage, verifier strong/weak support counts, supplemental acquisition, fetch success/failure counts, failed fetch reasons, parse decisions, and actionable failure diagnostics
 - pre-run research planning from the web workspace: create a `research_task`, generate a bounded plan, optionally edit its JSON, then confirm and queue the worker pipeline
 - status-aware web controls for Run, Pause, Resume, and Cancel; pause/cancel are observed by the worker at pipeline stage boundaries
 - visible runtime-mode warnings when `SEARCH_PROVIDER=smoke`, `INDEX_BACKEND=local`, or no LLM planner is active
@@ -94,6 +97,10 @@ The current v1 path supports:
 | `SEARCH_PROVIDER` | `searxng` for real search or `smoke` for explicit development smoke mode | `searxng` |
 | `SEARXNG_BASE_URL` | SearXNG-compatible search endpoint | `http://127.0.0.1:8080` |
 | `SEARXNG_TIMEOUT_SECONDS` | Search timeout | `10` |
+| `YACY_BASE_URL` | Optional YaCy endpoint when `SEARCH_PROVIDER=yacy` | `http://127.0.0.1:8090` |
+| `YACY_TIMEOUT_SECONDS` | YaCy search timeout | `10` |
+| `YACY_RESOURCE` | YaCy resource mode passed to `/yacysearch.json` | `local` |
+| `YACY_VERIFY` | YaCy verify parameter | `false` |
 | `SEARCH_MAX_RESULTS_PER_QUERY` | Max raw results per expanded query | `10` |
 | `QUERY_EXPANSION_MAX_DOMAINS` | Max `site:` expansions | `3` |
 | `ACQUISITION_TIMEOUT_SECONDS` | HTTP fetch timeout | `10` |
@@ -152,6 +159,7 @@ Parser support in this MVP:
 Development-only note:
 
 - `SEARCH_PROVIDER=smoke` returns clearly marked synthetic `deepsearch-smoke.local` fixture sources and uses a network-free smoke acquisition client; it is not real search
+- `SEARCH_PROVIDER=yacy` uses a free/self-hosted YaCy server through `/yacysearch.json`; it is optional and does not replace SearXNG as the default baseline
 - `INDEX_BACKEND=local` uses an in-process deterministic index; it is not durable and is not a replacement for OpenSearch
 - together these report `running_mode=smoke-search+deterministic-local+no-LLM`
 - the web UI now surfaces this as a connectivity-test mode before research starts; do not evaluate product-quality report output from smoke fixtures
@@ -163,7 +171,7 @@ Development-only note:
 | `CLAIM_DRAFTING_MAX_CANDIDATES_PER_REQUEST` | Max retrieval candidates for drafting | `5` |
 | `CLAIM_VERIFICATION_MAX_CLAIMS_PER_REQUEST` | Max claims per verification request | `5` |
 
-Claim drafting is deterministic and no-LLM. For definition/mechanism queries such as `What is SearXNG and how does it work?`, the selector now assigns an `answer_role` and prefers definition, mechanism, privacy/design-goal, feature, and low-priority deployment/self-hosting sentences. It rejects contribution calls-to-action, community logistics, documentation pointers, promotional slogans, lowercase fragments, setup/getting-started instructions, diagram/config fragments, and broken-link residue such as `listed at .` before claim persistence. Scoring metadata is stored in `claim.notes_json` and regenerated reports use that metadata to exclude low-quality, setup, unsupported-category, or off-query supported claims from the report body.
+Claim drafting is deterministic and no-LLM. For definition/mechanism queries such as `What is SearXNG and how does it work?`, the selector now assigns an `answer_role` and prefers definition, mechanism, privacy/design-goal, feature, and low-priority deployment/self-hosting sentences. It rejects contribution calls-to-action, community logistics, documentation pointers, promotional slogans, lowercase fragments, setup/getting-started instructions, diagram/config fragments, and broken-link residue such as `listed at .` before claim persistence. Scoring metadata is stored in `claim.notes_json` and regenerated reports use that metadata plus optional reviewer diagnostics to exclude low-quality, setup, unsupported-category, off-query, adjacent-entity, or reviewer-downranked supported claims from the main report body. Report synthesis writes optional `claim.notes_json.report_eligible` and `claim.notes_json.report_eligibility` keys so excluded claims remain inspectable without being promoted as normal conclusions.
 
 Deployment queries such as `How to deploy SearXNG with Docker?` use a separate evidence path for commands and configuration. SearXNG Docker tasks can inject the official installation docs, `github.com/searxng/searxng-docker`, raw GitHub README candidates for repository pages, and raw compose/env example candidates; the `searxng/searxng-docker` repository is classified as `official_repository`, and archived/superseded repository status can be reported as a limitation/maintenance caveat. Docker commands, Compose YAML, ports, volumes, prerequisites, `settings.yml`, `SEARXNG_SECRET` / other `SEARXNG_*` values, reverse proxy / limiter / secret / custom-certificate guidance, troubleshooting text, and update/maintenance commands may be drafted as `deployment_code_or_config` evidence with deployment `slot_ids`, then verified against exact citation spans before any report renders them. Deployment drafting uses a deployment-specific cap above the generic claim limit and applies both slot-diverse and marker-diverse selection so exact snippets such as `sudo usermod -aG docker`, `docker compose pull`, `.env`, `SEARXNG_*`, reverse proxy, limiter/bot protection, certificates, and troubleshooting commands survive when they are already present in parsed chunks. Security slot coverage is intentionally strict: reverse proxy, limiter/bot protection, secrets, certificates, and public instance exposure count; `docker exec ... root` is troubleshooting only, and `FORCE_OWNERSHIP` is volume/configuration evidence only. Command/config evidence is rendered as fenced Markdown code blocks with claim/evidence/citation traceability, preferring the complete claim statement or persisted full evidence excerpt over a shortened citation excerpt. If a required deployment slot has no verified command/config evidence, the report should show a coverage gap rather than a generic deployment answer.
 
@@ -177,7 +185,7 @@ If strict claim filters produce no claims, the service runs a narrow determinist
 
 The pipeline also computes answer-yield metrics per `source_document`, separating raw `candidate_sentence_count` from `answer_relevant_candidate_count` and final accepted claim counts. If claim drafting creates zero claims, or a what/how query produces only one claim without required definition/mechanism coverage, it runs at most one supplemental acquisition pass over unattempted high-value candidates such as official about pages, Wikipedia references, official home pages, upstream GitHub README/repo pages, or generic articles. Developer, API, architecture, installation, social, forum, and video pages stay downranked unless the query explicitly asks for them.
 
-For technical library/framework overview queries such as `What is LangGraph and how does it work?`, deterministic source selection now requires owned project-domain or upstream repository evidence before classifying a result as `official_about`, `official_docs_reference`, or `github_readme_or_repo`. For LangGraph, `docs.langchain.com`, `reference.langchain.com`, `langchain.com`, and `github.com/langchain-ai/langgraph` are high-value owned sources; `github.langchain.ac.cn`, `langgraph.com.cn`, `langchain-doc.cn`, and third-party GitHub tutorial repositories are secondary references, not official-owned sources. If main `SEARCHING` gets `searxng_empty_results_with_unresponsive_engines` for LangGraph before any candidate URLs exist, the runner injects bounded known-path candidates for Python docs, JavaScript docs, reference docs, state-graph reference docs, upstream GitHub, and the official product page, then continues to acquisition. Injected candidates are marked with `candidate_source=known_path_fallback`, `fallback_reason`, and `original_search_provider`. The product page remains available but is ranked behind docs/reference/upstream GitHub for how-it-works acquisition. Job boards, freelance sites, job-search URLs, SEO repost pages, and obvious unrelated listings are low quality for overview queries. If gap rounds still find missing required slots and search returns duplicates or low-value results, the runner falls back to existing unattempted high-value candidates and LangGraph gap analysis emits bounded targeted searches for LangChain docs/reference/GitHub. No-LLM planning and claim scoring use framework-oriented mechanism and feature terms such as graph/state/nodes/edges/workflow/orchestration/routing, durable execution, streaming, memory, checkpointing, human-in-the-loop, integrations, APIs, and limitations.
+For technical library/framework overview queries such as `What is LangGraph and how does it work?`, deterministic source selection now requires owned project-domain or upstream repository evidence before classifying a result as `official_about`, `official_docs_reference`, or `github_readme_or_repo`. Standalone search discovery can inject bounded official docs, project homepages, upstream repositories, package registries, Wikipedia/reference pages, and academic/tutorial sources for recognized technical projects and research concepts before generic SearXNG results are used. These candidates are persisted through normal `search_query` and `candidate_url` rows with `candidate_source=authoritative_source_resolver`, so acquisition, parsing, indexing, claims, and reports still use the ledger. The worker/debug pipeline disables that authoritative resolver in the main `SEARCHING` loop and relies on planner guardrails plus known-path fallback, keeping the first acquisition budget provider/plan driven and preventing repeated resolver queries during gap rounds. For comparison queries, acquisition interleaves authoritative candidates by recognized entity so one entity's docs do not consume all early fetch slots. For LangGraph, `docs.langchain.com`, `reference.langchain.com`, `langchain.com`, and `github.com/langchain-ai/langgraph` are high-value owned sources; `github.langchain.ac.cn`, `langgraph.com.cn`, `langchain-doc.cn`, and third-party GitHub tutorial repositories are secondary references, not official-owned sources. If main `SEARCHING` gets `searxng_empty_results_with_unresponsive_engines` for LangGraph before any candidate URLs exist, the runner injects bounded known-path candidates for Python docs, JavaScript docs, reference docs, state-graph reference docs, upstream GitHub, and the official product page, then continues to acquisition. Injected candidates are marked with `candidate_source=known_path_fallback`, `fallback_reason`, and `original_search_provider`. The product page remains available but is ranked behind docs/reference/upstream GitHub for how-it-works acquisition. Job boards, freelance sites, job-search URLs, SEO repost pages, obvious unrelated listings, and off-entity specialty-engine results are low quality for overview queries. If gap rounds still find missing required slots and search returns duplicates or low-value results, the runner falls back to existing unattempted high-value candidates and LangGraph gap analysis emits bounded targeted searches for LangChain docs/reference/GitHub. No-LLM planning and claim scoring use framework-oriented mechanism and feature terms such as graph/state/nodes/edges/workflow/orchestration/routing, durable execution, streaming, memory, checkpointing, human-in-the-loop, integrations, APIs, and limitations.
 
 ### Optional LLM planner
 
@@ -194,8 +202,16 @@ For technical library/framework overview queries such as `What is LangGraph and 
 | `LLM_REPORT_WRITER_ENABLED` | Enable grounded LLM report writer for final Markdown synthesis | `false` |
 | `LLM_REPORT_MAX_OUTPUT_TOKENS` | Grounded report-writer response token cap | `2400` |
 | `LLM_SOURCE_JUDGE_ENABLED` | Enable shadow source-judge diagnostics | `false` |
-| `LLM_SOURCE_JUDGE_ACTIVE_RERANK` | Reserved active rerank flag; remains disabled in this MVP | `false` |
+| `LLM_SOURCE_JUDGE_ACTIVE_RERANK` | Allow bounded source-judge priority adjustments after deterministic guardrails | `false` |
 | `LLM_SOURCE_JUDGE_MAX_CANDIDATES` | Max source candidates judged per search stage | `5` |
+| `LLM_QUERY_REWRITER_ENABLED` | Enable LLM-assisted structured search-query rewrites | `false` |
+| `LLM_QUERY_REWRITER_MAX_QUERIES` | Max LLM query rewrites per task | `8` |
+| `LLM_EVIDENCE_RERANKER_ENABLED` | Enable LLM reranking over already persisted source chunks | `false` |
+| `LLM_EVIDENCE_RERANKER_MAX_CHUNKS` | Max chunks sent to the reranker | `40` |
+| `LLM_CLAIM_REVIEWER_ENABLED` | Enable LLM review over already persisted draft claims | `false` |
+| `LLM_CLAIM_REVIEWER_MAX_CLAIMS` | Max draft claims reviewed per verification pass | `12` |
+| `LLM_ASSISTANCE_INPUT_MAX_CHARS` | Prompt payload cap for LLM-assisted quality stages | `24000` |
+| `REPORT_INCLUDE_LEDGER_DEBUG_APPENDIX` | Include internal claim/evidence/citation UUID appendix in Markdown reports | `false` |
 | `RESEARCH_PLANNER_ENABLED` | Run planner before search when `LLM_ENABLED=true` | `false` |
 | `RESEARCH_PLANNER_MAX_SUBQUESTIONS` | Planner subquestion cap | `5` |
 | `RESEARCH_PLANNER_MAX_SEARCH_QUERIES` | Planner search-query cap | `8` |
@@ -222,17 +238,32 @@ corrections in `final_search_queries`, `dropped_or_downweighted_planner_queries`
 Source selection prioritizes official about/reference pages over admin architecture,
 installation, API, or developer pages unless the user explicitly asks about those topics.
 
-The planner never writes claims. Claim drafting, evidence binding, and verification remain deterministic and source-backed. Markdown report synthesis is deterministic by default; when `LLM_REPORT_WRITER_ENABLED=true`, the grounded report writer may write report prose but receives only verified claims, claim-evidence ids, and citation-span excerpts. Rendered LLM items are dropped unless their claim/evidence/citation ids validate against the prepared report bundle, and failures fall back to deterministic Markdown.
+The planner and query rewriter never write claims or source rows. Source judging can downrank or
+reject noisy candidates only within deterministic guardrails; it cannot override blocklists,
+SSRF/acquisition policy, or deterministic ownership evidence. Evidence reranking ranks only
+existing `source_chunk` ids. Claim review can mark draft claims as vague/duplicate/rejected but
+cannot create claims or evidence. Markdown report synthesis is deterministic by default; when
+`LLM_REPORT_WRITER_ENABLED=true`, the grounded report writer may write report prose but receives
+only verified claims, claim-evidence ids, and citation-span excerpts. Rendered LLM items are
+dropped unless their claim/evidence/citation ids validate against the prepared report bundle, and
+failures fall back to deterministic Markdown. Main reports hide internal UUIDs by default; enable
+`REPORT_INCLUDE_LEDGER_DEBUG_APPENDIX=true` only when an operator needs the internal mapping in the
+artifact body.
 
-Planned LLM-assisted source-quality work is tracked in `plans/llm-assisted-source-judge-and-planner.md`. The rollout order is:
+Planned LLM-assisted source-quality work is tracked in
+`plans/llm-assisted-source-judge-and-planner.md`. The implemented LLM assistance layer is additive:
+planner/query rewriting, source judging, evidence reranking, claim review, and grounded report
+writing can be enabled independently. LLM gap reasoning remains deferred; current gap analysis and
+gap search are deterministic.
 
-1. LLM planner only, with deterministic guardrails final.
-2. LLM source judge in shadow mode, adding diagnostics but no ranking changes.
-3. LLM source judge active reranking behind a separate flag, with bounded score adjustments.
-4. LLM gap reasoner, with deterministic max rounds, dedupe, and fetch limits final.
-5. Grounded report writer hardening, with deterministic Markdown fallback.
-
-The source judge is now available in shadow mode through `LLM_SOURCE_JUDGE_ENABLED=true`. It receives only bounded candidate URL metadata, search snippets, deterministic source-intent results, low-value signals, and ownership evidence. It returns strict structured JSON with an allowed label, confidence, reasons, and a bounded priority adjustment. It cannot mark a source official unless deterministic ownership evidence already supports that conclusion. It cannot override job/freelance/listing filters, blocklists, SSRF/acquisition policy, MIME policy, or official-owned source priority. In this MVP it records additive diagnostics only and always sets `used_in_final_ranking=false`.
+The source judge is available through `LLM_SOURCE_JUDGE_ENABLED=true`. It receives only bounded
+candidate URL metadata, search snippets, deterministic source-intent results, low-value signals, and
+ownership evidence. It returns strict structured JSON with an allowed label, confidence, reasons,
+source type, and a bounded priority adjustment. It cannot mark a source official unless
+deterministic ownership evidence already supports that conclusion. It cannot override
+job/freelance/listing filters, blocklists, SSRF/acquisition policy, MIME policy, or official-owned
+source priority. It remains diagnostic-only unless `LLM_SOURCE_JUDGE_ACTIVE_RERANK=true`; active
+mode records whether an adjustment was used and is still bounded by deterministic guardrails.
 
 Noop planner validation:
 
@@ -252,21 +283,48 @@ OpenAI-compatible planner configuration uses placeholders only:
 ```bash
 LLM_ENABLED=true
 LLM_PROVIDER=openai_compatible
-LLM_API_KEY=sk-...
+LLM_API_KEY=<your-api-key>
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-chat
 RESEARCH_PLANNER_ENABLED=true
 LLM_REPORT_WRITER_ENABLED=false
+LLM_QUERY_REWRITER_ENABLED=true
+LLM_SOURCE_JUDGE_ENABLED=true
+LLM_SOURCE_JUDGE_ACTIVE_RERANK=true
+LLM_EVIDENCE_RERANKER_ENABLED=true
+LLM_CLAIM_REVIEWER_ENABLED=true
 ```
 
-Planner-only mode leaves claim drafting, verification, gap analysis, and report writing deterministic. Use `progress.observability.planner_status`, `progress.observability.plan_source`, `progress.observability.research_plan.planner_diagnostics`, and `research_plan.created` / `research_plan.failed` events to confirm whether a task used an LLM plan or deterministic fallback. For successful DeepSeek planner acceptance, expect `planner_status=success`, `plan_source=llm_planner`, and `research_plan.planner_diagnostics.schema_validated=true`. If the planner still falls back, inspect `planner_diagnostics.validation_errors`, `planner_diagnostics.raw_output_preview`, and `planner_diagnostics.json_extraction_error` to identify the exact failure. Do not enable source judge, gap reasoner, or grounded report-writer flags for Phase 1 validation.
+Planner-only mode leaves query rewriting, source judging, evidence reranking, claim review, gap
+analysis, and report writing deterministic. Use `progress.observability.planner_status`,
+`progress.observability.plan_source`, `progress.observability.research_plan.planner_diagnostics`,
+`progress.observability.llm_assistance`, and `research_plan.created` / `research_plan.failed`
+events to confirm which LLM stages were used or fell back. For successful DeepSeek planner
+acceptance, expect `planner_status=success`, `plan_source=llm_planner`, and
+`research_plan.planner_diagnostics.schema_validated=true`. If any LLM stage falls back, inspect the
+stage-specific diagnostics under `llm_assistance` plus validation fields such as
+`validation_errors`, `raw_output_preview`, `raw_output_hash`, `planner_diagnostics.validation_errors`,
+and `planner_diagnostics.json_extraction_error`. The query rewriter, evidence reranker, and claim
+reviewer accept direct JSON objects, fenced JSON objects, and common DeepSeek field aliases, but
+they still fall back when normalization cannot produce existing query/chunk/claim ids and the
+strict stage schema.
+
+Evidence reranker success now requires more than numeric scores. A ranking that lacks meaningful
+`answer_slot_ids` or rationales, has invalid chunk ids, or is effectively flat score-only is marked
+`low_quality_rerank` or falls back to deterministic ordering with `produced_answer_slot_ids`,
+`produced_rationales`, `score_distribution`, and `low_quality_reasons` in diagnostics. Claim review
+is similarly conservative: empty reasons, missing covered slots, missing confidence, malformed
+structured output, or low-confidence `accept` decisions become downrank/fallback diagnostics rather
+than report-eligible conclusions. When all reviewer decisions fail quality validation, the stage is
+reported as `low_quality_review`; those weak decisions are kept in task diagnostics but are not
+persisted as claim-note vetoes over deterministic evidence-backed report eligibility.
 
 Grounded report-writer configuration uses the same provider, but is controlled independently:
 
 ```bash
 LLM_ENABLED=true
 LLM_PROVIDER=openai_compatible
-LLM_API_KEY=sk-...
+LLM_API_KEY=<your-api-key>
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-chat
 LLM_REPORT_WRITER_ENABLED=true
@@ -325,6 +383,50 @@ evidence terms across those layers. It exits `0` only when the fresh run complet
 `real-search+opensearch+planner+report-LLM`, produces a grounded Chinese report, preserves
 expected Docker deployment evidence through downstream claim/evidence/report layers, and includes
 claim / claim_evidence / citation traceability.
+
+Reusable live acceptance profiles:
+
+```bash
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate deepsearch311
+cd /share/zhuzy/projects/DeepSearch
+DEV_ENV_FILE=.env.deepseek.local DEV_SKIP_FRONTEND=true DEV_BACKEND_RELOAD=false ./dev.sh restart
+
+python scripts/live_acceptance.py \
+  --profile langgraph-technical-explanation \
+  --base-url http://127.0.0.1:8000 \
+  --artifact-dir /tmp/deepsearch-live-langgraph-acceptance \
+  --json-output /tmp/deepsearch-live-langgraph-acceptance.json \
+  --timeout-seconds 600
+```
+
+`scripts/live_acceptance.py` creates a fresh task for the selected profile, queues `/run`, waits
+for a terminal status, fetches task detail, `source_documents`, `source_chunks`, `claims`,
+`claim_evidence`, report, events, search queries, and candidate URLs, writes the raw payloads to
+the artifact directory, and prints a pass/fail JSON summary. The
+`langgraph-technical-explanation` profile uses the query
+`What is LangGraph and how does it work?` with `report_language=en-US`. It checks completion
+through `real-search+opensearch+planner+report-LLM`, explicit planner/report LLM use or grounded
+fallback diagnostics, report claim/evidence/citation traceability, non-empty technical explanation
+sections, and official or high-authority LangGraph sources such as LangChain docs/reference pages
+or the upstream `langchain-ai/langgraph` repository. Deployment-specific Docker evidence checks
+remain isolated to the `searxng-docker-deployment` profile and are not applied to the LangGraph
+query.
+
+SEARCHING-stage partial failures are expected to be bounded: if a later search query fails after
+usable candidate URLs have already been persisted, the pipeline records the search diagnostic and
+continues to acquisition with the available candidates. If no usable candidates exist after search
+and known-path fallback attempts, the task should move to `FAILED` with a diagnostic event rather
+than remain in `SEARCHING`.
+
+The legacy deployment command remains supported and is equivalent to:
+
+```bash
+python scripts/live_acceptance.py \
+  --profile searxng-docker-deployment \
+  --base-url http://127.0.0.1:8000 \
+  --artifact-dir /tmp/deepsearch-live-deployment-acceptance
+```
 
 Phase benchmark commands:
 
@@ -806,6 +908,7 @@ The SearXNG client validates endpoint responses before storing search ledger row
 - `searxng_http_forbidden`: the endpoint returned HTTP 403, often due to access rules, CAPTCHA, or rate limiting
 - `searxng_invalid_json`: the endpoint returned a non-JSON body
 - `searxng_empty_results_with_unresponsive_engines`: SearXNG returned no results and reported unavailable engines
+- `searxng_timeout` / `searxng_request_error`: the SearXNG HTTP request timed out or failed before a valid response was received
 
 For each SearXNG response, logs include `SEARCH_PROVIDER`, `SEARXNG_BASE_URL`, status, content type, the first 300 response characters, and `unresponsive_engines`.
 
@@ -998,8 +1101,21 @@ At minimum, that route would still need:
 - if a planner-enabled overview task only attempted low-yield home/developer pages, inspect `progress.observability.final_search_queries`, the Source Selection Table in Task Detail, and candidate metadata `source_category` / `downrank_reason`; official about and Wikipedia candidates should outrank `dev/index`, API, install, and architecture pages unless the query asks for those topics
 - if a technical concept task attempts generic tutorial domains before official docs/reference/GitHub, inspect `progress.observability.selected_sources_from_search` and `unattempted_sources`; generic `What is ...` pages should now stay `generic_article`, localized mirrors should stay `secondary_reference`, third-party GitHub repositories should not be `github_readme_or_repo`, off-subject official docs should show `off_subject_source_downranked_for_query`, and gap rounds should fall back to unattempted high-value candidates when new search results are low-value or duplicates
 - if planner-LLM mode reaches `RESEARCHING_MORE` and SearXNG reports empty results with unresponsive engines, inspect `progress.observability.gap_rounds`; tasks with existing usable documents/chunks/claims should continue to reporting with `gap_search_unavailable` / `supplemental_search_failed` warnings, while tasks with no usable evidence should still fail at the main failing stage
+- if one planned SearXNG query fails with `searxng_empty_results_with_unresponsive_engines`,
+  `searxng_timeout`, or `searxng_request_error`, main search persists that failed-query diagnostic
+  and continues to later planned queries when possible. If authoritative-source or existing
+  candidates are already available, the failure is tolerated and visible rather than aborting the
+  whole run immediately. If every planned query fails and no known-path or existing candidates are
+  available, the task still fails in `SEARCHING`.
+- when an unconstrained SearXNG general search returns no results only because general engines are unavailable, the provider retries once through a bounded free-engine set such as Wikipedia, GitHub, arXiv, PyPI, and Semantic Scholar. Diagnostics include `fallback_after_provider_error` and `fallback_source_engines`; task constraints with explicit `source_engines` are respected and are not overridden. MDN and Stack Overflow are not part of this resilient fallback set because they dominated unrelated framework overview searches.
+- if SearXNG returns specialty-engine results that do not mention the query entity in the URL, title,
+  or snippet, inspect `progress.observability.search_queries[].provider_result_diagnostics`;
+  `rejected_noisy_count` and capped `rejected_results` explain which results were filtered before
+  acquisition.
 - if planner-LLM mode fails in main `SEARCHING` with `searxng_empty_results_with_unresponsive_engines`, inspect `progress.observability.search_queries`, `progress.observability.known_path_fallback`, and the `SEARCHING` stage event; known LangGraph overview tasks should show fallback injection and proceed to acquisition, while unknown entities should fail clearly with query count, empty-query count, provider error type, and the first sanitized failed query
 - if task detail appears to show `fetch_succeeded = 0` while source summaries show fetched/parsed sources, inspect `progress.observability.gap_rounds`; task-level `fetch_succeeded` and `fetch_failed` are cumulative over initial acquisition plus gap-round acquisition, while each gap round still carries its own per-round acquisition counters
+- if Task Detail shows task status `COMPLETED` but the flow-result card still looks queued, inspect `progress.observability.pipeline_counts` and the latest `pipeline.completed` event `counts`; the UI should prefer those authoritative event counts over the original `/run` enqueue response
+- if `LLM_SOURCE_JUDGE_ACTIVE_RERANK=true` but `used_in_final_ranking_count=0`, inspect `progress.observability.llm_assistance.source_judge.active_rerank_reason` plus each source row's LLM review; expected reasons include disabled active mode, all judgments falling back, or no judgment passing bounded active-rerank guardrails
 - query the intermediate resources:
   - `GET /candidate-urls`
   - `GET /content-snapshots`

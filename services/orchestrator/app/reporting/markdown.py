@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
@@ -76,6 +77,8 @@ class ReportClaimItem:
     query_answer_score: float | None = None
     claim_category: str | None = None
     slot_ids: tuple[str, ...] = ()
+    evidence_kind: str | None = None
+    deployment_evidence_excerpt: str | None = None
     verifier_method: str | None = None
     support_level: str | None = None
 
@@ -119,6 +122,7 @@ def render_markdown_report(
     report_language: str = DEFAULT_REPORT_LANGUAGE,
     answer_relevant_claim_count: int | None = None,
     excluded_low_quality_claim_count: int = 0,
+    include_ledger_debug_appendix: bool = False,
 ) -> RenderedMarkdownReport:
     normalized_language = normalize_report_language(report_language)
     labels = _report_labels(normalized_language)
@@ -150,14 +154,17 @@ def render_markdown_report(
         evidence_candidates=[],
         claim_rows=_claim_rows_for_slot_summary(ordered_claims, query=research_question),
     )
+    slot_coverage_for_counts = _effective_slot_coverage_rows(
+        slot_coverage,
+        slot_coverage_summary,
+    )
     missing_required_slots = [
-        slot for slot in slot_coverage if slot["required"] and not slot["covered"]
+        slot for slot in slot_coverage_for_counts if slot["required"] and not slot["covered"]
     ]
-    missing_core_categories = [
-        category
-        for category in ("definition", "mechanism", "privacy", "feature")
-        if not supported_by_category.get(category)
-    ]
+    missing_core_categories = _missing_core_categories_for_query(
+        research_question,
+        supported_by_category,
+    )
     source_domains = _format_domains(sources)
     lines = [
         f"# {title}",
@@ -216,7 +223,7 @@ def render_markdown_report(
         ]
         if section_claims:
             for claim in section_claims:
-                lines.append(f"- {_normalize_inline(claim.statement)}")
+                lines.extend(_render_claim_answer_lines(claim, bullet_prefix="- "))
         else:
             lines.append("- " + labels["slot_coverage_limited"].format(slot=slot_label.lower()))
         lines.append("")
@@ -283,8 +290,8 @@ def render_markdown_report(
     lines.append(
         "- "
         + labels["answer_slot_count"].format(
-            covered=sum(1 for slot in slot_coverage if slot["covered"]),
-            total=len(slot_coverage),
+            covered=sum(1 for slot in slot_coverage_for_counts if slot["covered"]),
+            total=len(slot_coverage_for_counts),
         )
     )
     lines.append(
@@ -337,12 +344,13 @@ def render_markdown_report(
     elif not missing_core_categories:
         lines.append(f"- {labels['no_extra_unresolved']}")
 
-    lines.extend(["", f"## {labels['claim_mapping']}", ""])
-    if ordered_claims:
-        for claim in ordered_claims:
-            lines.extend(_render_claim_mapping(claim, report_language=normalized_language))
-    else:
-        lines.append(labels["no_mappings"])
+    if include_ledger_debug_appendix:
+        lines.extend(["", f"## {labels['claim_mapping']}", ""])
+        if ordered_claims:
+            for claim in ordered_claims:
+                lines.extend(_render_claim_mapping(claim, report_language=normalized_language))
+        else:
+            lines.append(labels["no_mappings"])
 
     markdown = "\n".join(lines).strip() + "\n"
     return RenderedMarkdownReport(
@@ -390,6 +398,27 @@ def _claims_by_category(claims: list[ReportClaimItem]) -> dict[str, list[ReportC
     return grouped
 
 
+def _missing_core_categories_for_query(
+    research_question: str,
+    supported_by_category: dict[str, list[ReportClaimItem]],
+) -> list[str]:
+    lower = research_question.lower()
+    if any(
+        term in lower
+        for term in ("deploy", "deployment", "docker", "compose", "container", "install")
+    ):
+        return [
+            category
+            for category in ("deployment/self_hosting",)
+            if not supported_by_category.get(category)
+        ]
+    return [
+        category
+        for category in ("definition", "mechanism", "privacy", "feature")
+        if not supported_by_category.get(category)
+    ]
+
+
 def _evidence_rows(
     claims: list[ReportClaimItem],
 ) -> list[tuple[ReportClaimItem, ReportEvidenceItem]]:
@@ -398,6 +427,38 @@ def _evidence_rows(
         for evidence in claim.support_evidence[:2]:
             rows.append((claim, evidence))
     return rows
+
+
+def _effective_slot_coverage_rows(
+    category_rows: list[dict[str, object]],
+    slot_summary_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if not any(str(row.get("slot_id", "")).startswith("deployment_") for row in slot_summary_rows):
+        return category_rows
+    rows_by_slot_id = {
+        str(row.get("slot_id")): row
+        for row in slot_summary_rows
+        if isinstance(row.get("slot_id"), str)
+    }
+    effective_rows: list[dict[str, object]] = []
+    for row in category_rows:
+        slot_id = str(row.get("slot_id", ""))
+        summary_row = rows_by_slot_id.get(slot_id)
+        if summary_row is None:
+            effective_rows.append(row)
+            continue
+        effective_rows.append(
+            {
+                **row,
+                "covered": summary_row.get("status") == "covered",
+                "matched_claim_categories": (
+                    list(row.get("matched_claim_categories", []))
+                    if isinstance(row.get("matched_claim_categories"), list)
+                    else []
+                ),
+            }
+        )
+    return effective_rows
 
 
 def _render_claim_section(index: int, claim: ReportClaimItem) -> list[str]:
@@ -469,6 +530,80 @@ def _render_claim_mapping(
             f' | {labels["excerpt"]}: "{_normalize_inline(evidence.excerpt)}"'
         )
     return lines
+
+
+def _render_claim_answer_lines(
+    claim: ReportClaimItem,
+    *,
+    bullet_prefix: str,
+) -> list[str]:
+    code_block = _deployment_code_block_for_claim(claim)
+    if code_block is None:
+        return [f"{bullet_prefix}{_normalize_inline(claim.statement)}"]
+    intro = _deployment_statement_intro(claim.statement, code_block=code_block)
+    trace = _deployment_claim_trace(claim)
+    return [
+        f"{bullet_prefix}{_normalize_inline(intro)} {trace}",
+        "",
+        "```",
+        code_block,
+        "```",
+    ]
+
+
+def _deployment_code_block_for_claim(claim: ReportClaimItem) -> str | None:
+    if claim.evidence_kind != "deployment_code_or_config":
+        return None
+    candidates = [
+        _deployment_code_block_from_statement(claim.statement),
+        claim.deployment_evidence_excerpt,
+        *(evidence.excerpt for evidence in claim.support_evidence),
+    ]
+    code_blocks = [
+        _strip_markdown_code_fence(candidate).strip()
+        for candidate in candidates
+        if candidate and candidate.strip()
+    ]
+    if code_blocks:
+        return max(code_blocks, key=lambda item: len(_normalize_inline(item)))
+    return None
+
+
+def _deployment_code_block_from_statement(statement: str) -> str | None:
+    match = re.search(r":\s*`(.+)`\.$", statement, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _strip_markdown_code_fence(value: str) -> str:
+    lines = value.strip().splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith(("```", "~~~")):
+        fence = lines[0].strip()[:3]
+        if lines[-1].strip().startswith(fence):
+            return "\n".join(lines[1:-1]).strip()
+    return value.strip()
+
+
+def _deployment_statement_intro(statement: str, *, code_block: str | None = None) -> str:
+    normalized_statement = _normalize_inline(statement)
+    if code_block and len(normalized_statement) <= 320:
+        return normalized_statement
+    code_from_statement = _deployment_code_block_from_statement(statement)
+    if (
+        code_from_statement
+        and code_block
+        and _normalize_inline(code_from_statement) == _normalize_inline(code_block)
+    ):
+        return normalized_statement
+    return statement.split(":", 1)[0].strip() + ":"
+
+
+def _deployment_claim_trace(claim: ReportClaimItem) -> str:
+    source_urls = list(dict.fromkeys(item.canonical_url for item in claim.support_evidence[:2]))
+    if not source_urls:
+        return ""
+    return f"({_normalize_inline('; '.join(source_urls))})"
 
 
 def _render_evidence_bullet(evidence: ReportEvidenceItem) -> list[str]:
@@ -547,6 +682,14 @@ def _slot_label(label: str, *, report_language: str) -> str:
         "Deployment steps": "部署步骤",
         "Configuration / operations": "配置 / 运维",
         "Evidence quality": "证据质量",
+        "Prerequisites": "前置条件",
+        "Docker run / Docker Compose": "Docker run / Docker Compose",
+        "Volumes": "卷挂载",
+        "Ports": "端口",
+        "Configuration": "配置",
+        "Security": "安全",
+        "Troubleshooting": "故障排查",
+        "Update / maintenance": "更新 / 维护",
     }
     return mapping.get(label, label)
 
@@ -578,7 +721,7 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "excluded_claims": "已排除低质量或偏离问题的 claim：{count}。",
             "excerpt": "摘录",
             "executive_summary": "执行摘要",
-            "generated": "_由 research_task `{task_id}` revision `{revision_no}` 生成。_",
+            "generated": "_由已持久化证据在 revision `{revision_no}` 生成。_",
             "missing_answer_coverage": "缺失答案覆盖：{categories}。",
             "missing_required_slots": "缺失必需答案槽位：{slots}。",
             "no_citation_spans": "未记录 citation span。",
@@ -640,7 +783,7 @@ def _report_labels(report_language: str) -> dict[str, str]:
         "excluded_claims": "Excluded low-quality or off-query claims: {count}.",
         "excerpt": "excerpt",
         "executive_summary": "Executive Summary",
-        "generated": "_Generated from research task `{task_id}` at revision `{revision_no}`._",
+        "generated": "_Generated from persisted evidence at revision `{revision_no}`._",
         "missing_answer_coverage": "Missing answer coverage: {categories}.",
         "missing_required_slots": "Missing required answer slots: {slots}.",
         "no_citation_spans": "No citation spans recorded.",

@@ -130,6 +130,7 @@ class ResearchTaskObservabilityResponse(BaseModel):
     selected_sources_from_search: list[dict[str, Any]] = Field(default_factory=list)
     selected_sources: list[dict[str, Any]] = Field(default_factory=list)
     source_judgments: list[dict[str, Any]] = Field(default_factory=list)
+    llm_assistance: dict[str, Any] = Field(default_factory=dict)
     fetch_succeeded: int | None = None
     fetch_failed: int | None = None
     attempted_sources: list[dict[str, Any]] = Field(default_factory=list)
@@ -150,6 +151,7 @@ class ResearchTaskObservabilityResponse(BaseModel):
     gap_analysis: dict[str, Any] | None = None
     gap_rounds: list[dict[str, Any]] = Field(default_factory=list)
     failure_diagnostics: dict[str, Any] | None = None
+    pipeline_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 

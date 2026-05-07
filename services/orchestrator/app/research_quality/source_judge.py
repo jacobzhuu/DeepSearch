@@ -11,8 +11,11 @@ from services.orchestrator.app.research_quality.source_intent import source_inte
 
 SOURCE_JUDGE_PROMPT_VERSION = "source_judge_shadow_v1"
 SOURCE_JUDGE_ALLOWED_LABELS = {
+    "accept",
     "authoritative",
+    "downrank",
     "relevant",
+    "reject",
     "stale",
     "low_quality",
     "marketing",
@@ -102,7 +105,11 @@ class SourceJudgeService:
         return results
 
     def _judge_one(self, candidate: CandidateUrl, *, query: str) -> SourceJudgeResult:
-        input_summary = _candidate_input_summary(candidate, query=query)
+        input_summary = _candidate_input_summary(
+            candidate,
+            query=query,
+            active_rerank=self.active_rerank,
+        )
         provider = self.provider
         if provider is None:
             return self._fallback_result(
@@ -145,7 +152,7 @@ class SourceJudgeService:
             confidence=float(parsed["confidence"]),
             reasons=list(parsed["reasons"]),
             fallback_status="none",
-            used_in_final_ranking=False,
+            used_in_final_ranking=self.active_rerank and _judgment_can_affect_ranking(parsed),
         )
 
     def _fallback_result(
@@ -156,12 +163,17 @@ class SourceJudgeService:
         fallback_status: str,
         reason: str,
     ) -> SourceJudgeResult:
-        input_summary = _candidate_input_summary(candidate, query=query)
+        input_summary = _candidate_input_summary(
+            candidate,
+            query=query,
+            active_rerank=self.active_rerank,
+        )
         output_judgment = {
             "label": "uncertain",
             "confidence": 0.0,
             "reasons": [reason],
             "priority_adjustment": 0.0,
+            "source_type": "unknown",
         }
         return SourceJudgeResult(
             candidate_url_id=str(candidate.id),
@@ -178,7 +190,12 @@ class SourceJudgeService:
         )
 
 
-def _candidate_input_summary(candidate: CandidateUrl, *, query: str) -> dict[str, Any]:
+def _candidate_input_summary(
+    candidate: CandidateUrl,
+    *,
+    query: str,
+    active_rerank: bool = False,
+) -> dict[str, Any]:
     metadata = candidate.metadata_json or {}
     intent = source_intent_metadata(
         canonical_url=candidate.canonical_url,
@@ -198,7 +215,7 @@ def _candidate_input_summary(candidate: CandidateUrl, *, query: str) -> dict[str
         "safety_constraints": {
             "cannot_override_ssrf_or_mime_policy": True,
             "cannot_mark_official_without_deterministic_ownership": True,
-            "shadow_mode_only": True,
+            "active_rerank_enabled": active_rerank,
         },
     }
 
@@ -219,18 +236,48 @@ def _parse_source_judge_output(text: str) -> dict[str, Any]:
     adjustment = payload.get("priority_adjustment", 0.0)
     if not isinstance(adjustment, int | float):
         raise ValueError("source judge priority_adjustment must be numeric")
+    source_type = payload.get("source_type", "unknown")
+    if not isinstance(source_type, str) or not source_type.strip():
+        source_type = "unknown"
     return {
         "label": label,
         "confidence": round(max(0.0, min(1.0, float(confidence))), 4),
         "reasons": [item[:240] for item in reasons[:5]],
-        "priority_adjustment": round(max(-0.2, min(0.2, float(adjustment))), 4),
+        "priority_adjustment": round(max(-20.0, min(20.0, float(adjustment))), 4),
+        "source_type": source_type.strip()[:80],
     }
+
+
+def _judgment_can_affect_ranking(judgment: dict[str, Any]) -> bool:
+    label = str(judgment.get("label") or "")
+    confidence = judgment.get("confidence")
+    confidence_value = float(confidence) if isinstance(confidence, int | float) else 0.0
+    adjustment = judgment.get("priority_adjustment")
+    adjustment_value = float(adjustment) if isinstance(adjustment, int | float) else 0.0
+    labels_with_rank_effect = {
+        "accept",
+        "authoritative",
+        "relevant",
+        "downrank",
+        "reject",
+        "low_quality",
+        "stale",
+        "marketing",
+        "duplicate",
+        "unsafe",
+    }
+    if abs(adjustment_value) >= 0.5:
+        return confidence_value >= 0.35
+    return label in labels_with_rank_effect and confidence_value >= 0.35
 
 
 _SOURCE_JUDGE_SYSTEM_PROMPT = (
     "You are an advisory source-quality judge for an evidence-first OSINT pipeline. "
-    "Return only JSON with keys label, confidence, reasons, priority_adjustment. "
+    "Return only JSON with keys label, confidence, reasons, priority_adjustment, source_type. "
+    "Use label accept, downrank, reject, or uncertain when possible. "
     "Use only the provided URL/title/snippet/deterministic signals. Do not infer facts "
     "about the research answer. Do not mark a source authoritative unless deterministic "
-    "ownership signals already support that label."
+    "ownership signals already support that label. Prefer downrank or reject for social profiles, "
+    "job pages, unrelated listings, SEO mirrors, and weak entity matches when better official "
+    "sources are likely."
 )

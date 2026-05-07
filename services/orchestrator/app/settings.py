@@ -27,6 +27,10 @@ class Settings(BaseSettings):
         default=10.0,
         validation_alias="SEARXNG_TIMEOUT_SECONDS",
     )
+    yacy_base_url: str = Field(default="http://127.0.0.1:8090", validation_alias="YACY_BASE_URL")
+    yacy_timeout_seconds: float = Field(default=10.0, validation_alias="YACY_TIMEOUT_SECONDS")
+    yacy_resource: str = Field(default="local", validation_alias="YACY_RESOURCE")
+    yacy_verify: str = Field(default="false", validation_alias="YACY_VERIFY")
     search_max_results_per_query: int = Field(
         default=10,
         validation_alias="SEARCH_MAX_RESULTS_PER_QUERY",
@@ -174,9 +178,41 @@ class Settings(BaseSettings):
         default=5,
         validation_alias="LLM_SOURCE_JUDGE_MAX_CANDIDATES",
     )
+    llm_query_rewriter_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_QUERY_REWRITER_ENABLED",
+    )
+    llm_query_rewriter_max_queries: int = Field(
+        default=8,
+        validation_alias="LLM_QUERY_REWRITER_MAX_QUERIES",
+    )
+    llm_evidence_reranker_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_EVIDENCE_RERANKER_ENABLED",
+    )
+    llm_evidence_reranker_max_chunks: int = Field(
+        default=40,
+        validation_alias="LLM_EVIDENCE_RERANKER_MAX_CHUNKS",
+    )
+    llm_claim_reviewer_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_CLAIM_REVIEWER_ENABLED",
+    )
+    llm_claim_reviewer_max_claims: int = Field(
+        default=12,
+        validation_alias="LLM_CLAIM_REVIEWER_MAX_CLAIMS",
+    )
+    llm_assistance_input_max_chars: int = Field(
+        default=24_000,
+        validation_alias="LLM_ASSISTANCE_INPUT_MAX_CHARS",
+    )
     llm_report_max_output_tokens: int = Field(
         default=2400,
         validation_alias="LLM_REPORT_MAX_OUTPUT_TOKENS",
+    )
+    report_include_ledger_debug_appendix: bool = Field(
+        default=False,
+        validation_alias="REPORT_INCLUDE_LEDGER_DEBUG_APPENDIX",
     )
     research_planner_enabled: bool = Field(
         default=False,
@@ -209,9 +245,17 @@ class Settings(BaseSettings):
             "llm_source_judge_enabled": self.llm_source_judge_enabled,
             "llm_source_judge_active_rerank": self.llm_source_judge_active_rerank,
             "llm_source_judge_max_candidates": self.llm_source_judge_max_candidates,
+            "llm_query_rewriter_enabled": self.llm_query_rewriter_enabled,
+            "llm_query_rewriter_max_queries": self.llm_query_rewriter_max_queries,
+            "llm_evidence_reranker_enabled": self.llm_evidence_reranker_enabled,
+            "llm_evidence_reranker_max_chunks": self.llm_evidence_reranker_max_chunks,
+            "llm_claim_reviewer_enabled": self.llm_claim_reviewer_enabled,
+            "llm_claim_reviewer_max_claims": self.llm_claim_reviewer_max_claims,
+            "llm_assistance_input_max_chars": self.llm_assistance_input_max_chars,
             "research_planner_enabled": self.research_planner_enabled,
             "research_planner_max_subquestions": self.research_planner_max_subquestions,
             "research_planner_max_search_queries": self.research_planner_max_search_queries,
+            "report_include_ledger_debug_appendix": self.report_include_ledger_debug_appendix,
             "research_gap_max_rounds": self.research_gap_max_rounds,
             "research_gap_max_queries_per_round": self.research_gap_max_queries_per_round,
             "acquisition_min_answer_sources": self.acquisition_min_answer_sources,

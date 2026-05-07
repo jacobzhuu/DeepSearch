@@ -91,6 +91,26 @@ def test_list_tasks_returns_recent_task_summaries(client: TestClient) -> None:
     assert planned_payload["tasks"][0]["status"] == "PLANNED"
 
 
+def test_create_task_top_level_report_language_updates_constraints_language(
+    client: TestClient,
+) -> None:
+    create_response = client.post(
+        "/api/v1/research/tasks",
+        json={
+            "query": "How to deploy SearXNG with Docker?",
+            "report_language": "zh_CN",
+        },
+    )
+    task_id = create_response.json()["task_id"]
+    detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
+
+    assert create_response.status_code == 201
+    assert detail_response.json()["constraints"] == {
+        "language": "zh-CN",
+        "report_language": "zh-CN",
+    }
+
+
 def test_plan_endpoint_records_visible_pre_run_research_plan(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

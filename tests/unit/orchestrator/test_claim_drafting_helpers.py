@@ -6,13 +6,19 @@ from services.orchestrator.app.claims import (
     CitationSpanValidationError,
     classify_query_intent,
     compute_claim_confidence,
+    deployment_evidence_statement,
+    deployment_slot_ids_for_claim_text,
+    deployment_slot_ids_for_evidence,
     draft_claim_statement,
     is_answer_relevant_score,
     is_claimable_statement,
+    is_deployment_evidence_excerpt,
+    iter_deployment_evidence_spans,
     normalize_claim_identity,
     normalized_excerpt_hash,
     score_claim_statement,
     select_supporting_span,
+    select_verification_span,
     validate_citation_span,
 )
 from services.orchestrator.app.research_quality import answer_slot_coverage
@@ -342,3 +348,116 @@ def test_answer_role_rejects_navigation_project_meta_and_documentation_pointers(
             "navigation_or_documentation_pointer",
             "community_or_contribution",
         }
+
+
+def test_deployment_command_snippet_becomes_claimable_verified_evidence() -> None:
+    query = "How to deploy SearXNG with Docker?"
+    source_text = (
+        "Manual instancing example:\n\n"
+        "$ docker run --name searxng -d \\\n"
+        "    -p 8888:8080 \\\n"
+        '    -v "./config/:/etc/searxng/" \\\n'
+        '    -v "./data/:/var/cache/searxng/" \\\n'
+        "    docker.io/searxng/searxng:latest\n"
+    )
+    spans = list(iter_deployment_evidence_spans(source_text))
+    assert spans
+    span = spans[0]
+    statement = deployment_evidence_statement(span.excerpt)
+    score = score_claim_statement(statement=statement, query=query)
+    verification = select_verification_span(source_text, statement)
+
+    assert is_deployment_evidence_excerpt(span.excerpt)
+    assert is_claimable_statement(statement, query=query)
+    assert score.claim_category == "deployment/self_hosting"
+    assert score.answer_relevant is True
+    assert {
+        "deployment_run_or_compose",
+        "deployment_ports",
+        "deployment_volumes",
+    }.issubset(set(deployment_slot_ids_for_evidence(statement, span.excerpt)))
+    assert verification is not None
+    assert verification.relation_type == "support"
+    assert verification.support_level == "strong"
+
+
+def test_deployment_fenced_yaml_span_covers_complete_block_for_verification() -> None:
+    source_text = (
+        "Compose template:\n\n"
+        "```yaml\n"
+        "services:\n"
+        "  searxng:\n"
+        "    image: docker.io/searxng/searxng:latest\n"
+        "    environment:\n"
+        "      - SEARXNG_SECRET=change-me\n"
+        "      - SEARXNG_BASE_URL=https://example.test/\n"
+        "    volumes:\n"
+        "      - ./searxng:/etc/searxng:rw\n"
+        "    ports:\n"
+        "      - 8888:8080\n"
+        "```\n\n"
+        "After the block, run the stack."
+    )
+
+    spans = list(iter_deployment_evidence_spans(source_text))
+    span = spans[0]
+    statement = deployment_evidence_statement(span.excerpt)
+    verification = select_verification_span(source_text, statement)
+
+    assert span.excerpt.startswith("```yaml")
+    assert span.excerpt.endswith("```")
+    assert "SEARXNG_SECRET=change-me" in span.excerpt
+    assert "8888:8080" in span.excerpt
+    assert source_text[span.start_offset : span.end_offset] == span.excerpt
+    assert verification is not None
+    assert verification.excerpt == span.excerpt
+    assert "SEARXNG_BASE_URL=https://example.test/" in verification.excerpt
+
+
+def test_deployment_claim_text_maps_specific_slots_without_generic_fill() -> None:
+    query = "How to deploy SearXNG with Docker?"
+    advanced = "This section is intended for advanced users."
+    reverse_proxy = (
+        "Use a reverse proxy with certificates and limiter bot protection before exposing a "
+        "public SearXNG instance."
+    )
+    update = "Update SearXNG by running docker compose pull and reviewing new templates."
+    archived = "The searxng-docker repository is archived and superseded by the main repository."
+
+    assert deployment_slot_ids_for_claim_text(advanced, advanced) == ()
+    assert deployment_slot_ids_for_claim_text(reverse_proxy, reverse_proxy) == (
+        "deployment_configuration",
+        "deployment_security",
+    )
+    assert deployment_slot_ids_for_claim_text(update, update) == (
+        "deployment_configuration",
+        "deployment_update_maintenance",
+    )
+    assert deployment_slot_ids_for_claim_text(archived, archived) == (
+        "deployment_update_maintenance",
+    )
+    assert score_claim_statement(statement=archived, query=query).claim_category == (
+        "deployment/self_hosting"
+    )
+
+
+def test_force_ownership_is_not_security_evidence_by_itself() -> None:
+    excerpt = "FORCE_OWNERSHIP=1"
+    statement = deployment_evidence_statement(excerpt)
+
+    slot_ids = deployment_slot_ids_for_evidence(statement, excerpt)
+
+    assert "deployment_configuration" in slot_ids
+    assert "deployment_volumes" in slot_ids
+    assert "deployment_security" not in slot_ids
+
+
+def test_docker_exec_root_is_troubleshooting_not_security() -> None:
+    excerpt = "docker compose exec -u root searxng sh"
+    statement = deployment_evidence_statement(excerpt)
+
+    slot_ids = deployment_slot_ids_for_evidence(statement, excerpt)
+
+    assert slot_ids == ("deployment_troubleshooting",)
+    assert "deployment_troubleshooting" in slot_ids
+    assert "deployment_security" not in slot_ids

@@ -32,6 +32,7 @@ from services.orchestrator.app.planning import (
     build_research_plan_from_payload,
     create_research_planner_service,
 )
+from services.orchestrator.app.reporting import normalize_report_language
 from services.orchestrator.app.services.research_tasks import (
     ResearchTaskService,
     TaskNotFoundError,
@@ -69,6 +70,7 @@ def create_research_task(
         constraints=_constraints_with_report_language(
             request.constraints,
             report_language=request.report_language,
+            include_language_default=True,
         )
         or {},
     )
@@ -272,6 +274,7 @@ def revise_research_task(
             constraints=_constraints_with_report_language(
                 request.constraints,
                 report_language=request.report_language,
+                include_language_default=False,
             ),
         )
     except TaskNotFoundError as error:
@@ -291,11 +294,15 @@ def _constraints_with_report_language(
     constraints: dict[str, Any] | None,
     *,
     report_language: str | None,
+    include_language_default: bool,
 ) -> dict[str, Any] | None:
     if report_language is None:
         return constraints
     normalized_constraints = dict(constraints or {})
-    normalized_constraints["report_language"] = report_language
+    normalized_report_language = normalize_report_language(report_language)
+    normalized_constraints["report_language"] = normalized_report_language
+    if include_language_default:
+        normalized_constraints.setdefault("language", normalized_report_language)
     return normalized_constraints
 
 
@@ -393,6 +400,7 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
         "search_provider": search_mode,
         "search_mode": "smoke-search" if search_mode == "smoke" else "real-search",
         "searxng_base_url": settings.searxng_base_url,
+        "yacy_base_url": settings.yacy_base_url,
         "snapshot_storage_backend": settings.snapshot_storage_backend,
         "snapshot_storage_root": settings.snapshot_storage_root,
         "snapshot_storage_bucket": settings.snapshot_storage_bucket,
@@ -414,6 +422,9 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
         "llm_source_judge_active_rerank": bool(
             settings.llm_source_judge_active_rerank and _llm_source_judge_configured(settings)
         ),
+        "llm_query_rewriter_enabled": _llm_query_rewriter_configured(settings),
+        "llm_evidence_reranker_enabled": _llm_evidence_reranker_configured(settings),
+        "llm_claim_reviewer_enabled": _llm_claim_reviewer_configured(settings),
         "report_writer_mode": (
             "llm-grounded" if _llm_report_writer_configured(settings) else "deterministic"
         ),
@@ -424,16 +435,28 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
 def _llm_mode(settings: Any) -> str:
     planner_configured = bool(settings.research_planner_enabled and settings.llm_enabled)
     report_configured = _llm_report_writer_configured(settings)
+    assistance = [
+        name
+        for name, configured in (
+            ("rewrite", _llm_query_rewriter_configured(settings)),
+            ("judge", _llm_source_judge_configured(settings)),
+            ("rerank", _llm_evidence_reranker_configured(settings)),
+            ("review", _llm_claim_reviewer_configured(settings)),
+        )
+        if configured
+    ]
     if report_configured and planner_configured:
-        return "planner+report-LLM"
-    if report_configured:
-        return "report-LLM"
-    if not planner_configured:
-        return "no-LLM"
-    normalized_provider = settings.llm_provider.strip().lower() or "noop"
-    if normalized_provider == "noop":
-        return "planner-noop"
-    return "planner-LLM"
+        base = "planner+report-LLM"
+    elif report_configured:
+        base = "report-LLM"
+    elif not planner_configured:
+        base = "no-LLM"
+    else:
+        normalized_provider = settings.llm_provider.strip().lower() or "noop"
+        base = "planner-noop" if normalized_provider == "noop" else "planner-LLM"
+    if assistance:
+        return f"{base}+assist-{'-'.join(assistance)}"
+    return base
 
 
 def _uses_llm_api(settings: Any) -> bool:
@@ -444,6 +467,9 @@ def _uses_llm_api(settings: Any) -> bool:
             settings.research_planner_enabled
             or settings.llm_report_writer_enabled
             or settings.llm_source_judge_enabled
+            or settings.llm_query_rewriter_enabled
+            or settings.llm_evidence_reranker_enabled
+            or settings.llm_claim_reviewer_enabled
         )
     )
 
@@ -458,6 +484,18 @@ def _llm_report_writer_configured(settings: Any) -> bool:
 
 def _llm_source_judge_configured(settings: Any) -> bool:
     return bool(settings.llm_enabled and settings.llm_source_judge_enabled)
+
+
+def _llm_query_rewriter_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_query_rewriter_enabled)
+
+
+def _llm_evidence_reranker_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_evidence_reranker_enabled)
+
+
+def _llm_claim_reviewer_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_claim_reviewer_enabled)
 
 
 def _running_mode(dependencies: dict[str, Any]) -> str:
@@ -519,6 +557,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     selected_sources_from_search: list[dict[str, Any]] = []
     selected_sources: list[dict[str, Any]] = []
     source_judgments: list[dict[str, Any]] = []
+    llm_assistance: dict[str, Any] = {}
     fetch_succeeded: int | None = None
     fetch_failed: int | None = None
     fetch_succeeded_total = 0
@@ -542,6 +581,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     gap_analysis: dict[str, Any] | None = None
     gap_rounds: list[dict[str, Any]] = []
     failure_diagnostics: dict[str, Any] | None = None
+    pipeline_counts: dict[str, int] = {}
     warnings: list[str] = []
     runtime_warnings: list[str] = []
     latest_planner_diagnostics: dict[str, Any] = {}
@@ -555,6 +595,13 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             result = {}
 
         stage = payload.get("stage")
+        counts = payload.get("counts")
+        if isinstance(counts, dict):
+            pipeline_counts = {
+                key: value
+                for key, value in counts.items()
+                if isinstance(key, str) and isinstance(value, int)
+            }
         dependency_payload = payload.get("dependencies")
         if isinstance(dependency_payload, dict):
             dependencies = dependency_payload
@@ -643,6 +690,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 known_path_fallback = fallback
             selected_sources = _object_list(result.get("selected_sources"))
             source_judgments = _object_list(result.get("source_judgments")) or source_judgments
+            assistance = result.get("llm_assistance")
+            if isinstance(assistance, dict):
+                llm_assistance.update(assistance)
             raw_planner_queries = (
                 _object_list(result.get("raw_planner_queries")) or raw_planner_queries
             )
@@ -722,10 +772,19 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             supplemental = result.get("supplemental_acquisition")
             if isinstance(supplemental, dict):
                 supplemental_acquisition = supplemental
+            assistance = result.get("llm_assistance")
+            if isinstance(assistance, dict):
+                llm_assistance.update(assistance)
         elif stage == "VERIFYING":
             verification = result.get("verification_summary")
             if isinstance(verification, dict):
                 verification_summary = verification
+            assistance = result.get("llm_assistance")
+            if isinstance(assistance, dict):
+                llm_assistance.update(assistance)
+            assistance = result.get("llm_assistance")
+            if isinstance(assistance, dict):
+                llm_assistance.update(assistance)
             slot_coverage_summary = (
                 _object_list(result.get("slot_coverage_summary")) or slot_coverage_summary
             )
@@ -746,6 +805,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                     known_path_fallback = fallback
                 selected_sources = _object_list(search.get("selected_sources")) or selected_sources
                 source_judgments = _object_list(search.get("source_judgments")) or source_judgments
+                assistance = search.get("llm_assistance")
+                if isinstance(assistance, dict):
+                    llm_assistance.update(assistance)
             acquisition = result.get("acquisition")
             if isinstance(acquisition, dict):
                 succeeded = acquisition.get(
@@ -782,6 +844,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 verification_payload = verification.get("verification_summary")
                 if isinstance(verification_payload, dict):
                     verification_summary = verification_payload
+                assistance = verification.get("llm_assistance")
+                if isinstance(assistance, dict):
+                    llm_assistance.update(assistance)
             slot_coverage_summary = (
                 _object_list(result.get("slot_coverage_summary")) or slot_coverage_summary
             )
@@ -886,6 +951,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and not selected_sources_from_search
         and not selected_sources
         and not source_judgments
+        and not llm_assistance
         and fetch_succeeded is None
         and fetch_failed is None
         and not attempted_sources
@@ -903,6 +969,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and verification_summary is None
         and supplemental_acquisition is None
         and failure_diagnostics is None
+        and not pipeline_counts
         and not deduped_warnings
         and running_mode is None
         and dependencies is None
@@ -932,6 +999,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         selected_sources_from_search=selected_sources_from_search,
         selected_sources=selected_sources,
         source_judgments=source_judgments,
+        llm_assistance=llm_assistance,
         fetch_succeeded=fetch_succeeded,
         fetch_failed=fetch_failed,
         attempted_sources=attempted_sources,
@@ -952,6 +1020,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         gap_analysis=gap_analysis,
         gap_rounds=gap_rounds,
         failure_diagnostics=failure_diagnostics,
+        pipeline_counts=pipeline_counts,
         warnings=deduped_warnings,
     )
 

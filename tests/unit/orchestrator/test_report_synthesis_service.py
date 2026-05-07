@@ -28,7 +28,10 @@ from services.orchestrator.app.indexing import (
 )
 from services.orchestrator.app.llm import LLMRequest, LLMResponse
 from services.orchestrator.app.services.claims import create_claim_drafting_service
-from services.orchestrator.app.services.debug_pipeline import _claim_limit_for_query
+from services.orchestrator.app.services.debug_pipeline import (
+    _claim_limit_for_query,
+    _select_claim_drafting_chunk_ids,
+)
 from services.orchestrator.app.services.reporting import (
     ReportArtifactContentMismatchError,
     create_report_synthesis_service,
@@ -140,12 +143,9 @@ def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
     assert "## Executive Summary" in first_result.markdown
     assert "## Answer" in first_result.markdown
     assert "## Answer Slot Coverage" in first_result.markdown
-    assert "## Appendix: Claim Evidence Mapping" in first_result.markdown
-    assert "[MIXED]: The mixed claim remains under dispute." in first_result.markdown
-    assert (
-        "[UNSUPPORTED]: The unsupported claim currently lacks support evidence."
-        in first_result.markdown
-    )
+    assert "## Appendix: Claim Evidence Mapping" not in first_result.markdown
+    assert "The mixed claim remains under dispute." in first_result.markdown
+    assert "The unsupported claim currently lacks support evidence." in first_result.markdown
     assert stored_bytes.decode("utf-8") == first_result.markdown
 
 
@@ -202,12 +202,57 @@ def test_report_synthesis_service_can_use_grounded_llm_writer(
     assert result.llm_writer_status == "used"
     assert result.title == "Grounded synthesized report"
     assert "The supported position is grounded in the cited ledger evidence." in result.markdown
-    assert str(claim.id) in result.markdown
-    assert str(evidence.id) in result.markdown
-    assert "Appendix: Claim Evidence Mapping" in result.markdown
+    assert str(claim.id) not in result.markdown
+    assert str(evidence.id) not in result.markdown
+    assert "Appendix: Claim Evidence Mapping" not in result.markdown
     manifest = _manifest(result.artifact)
     assert manifest["report_writer"]["mode"] == "llm_grounded"
     assert manifest["report_writer"]["status"] == "used"
+
+
+def test_grounded_llm_writer_honors_ledger_debug_appendix_flag(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    seeded = _seed_verified_claims(db_session)
+    claim, evidence = _first_supported_claim_and_evidence(db_session, seeded.task_id)
+    provider = FakeReportLLMProvider(
+        {
+            "title": "Grounded synthesized report",
+            "executive_summary": [
+                {
+                    "text": "The supported position is grounded in the cited ledger evidence.",
+                    "claim_ids": [str(claim.id)],
+                    "claim_evidence_ids": [str(evidence.id)],
+                    "citation_span_ids": [str(evidence.citation_span_id)],
+                }
+            ],
+            "sections": [],
+            "uncertainties": [],
+            "unresolved": [],
+        }
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    service = create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+        llm_provider=provider,
+        llm_model="fake-report-model",
+        llm_report_writer_enabled=True,
+        include_ledger_debug_appendix=True,
+    )
+
+    result = service.generate_markdown_report(seeded.task_id)
+    manifest = _manifest(result.artifact)
+
+    assert result.writer_mode == "llm_grounded"
+    assert "## Appendix: Claim Evidence Mapping" in result.markdown
+    assert str(claim.id) in result.markdown
+    assert str(evidence.id) in result.markdown
+    assert str(evidence.citation_span_id) in result.markdown
+    assert manifest["report_writer"]["include_ledger_debug_appendix"] is True
 
 
 def test_grounded_llm_writer_uses_selected_chinese_report_language(
@@ -865,6 +910,205 @@ def test_report_synthesis_excludes_supported_other_and_setup_claims(
     assert "Excluded low-quality or off-query claims: 2." in result.markdown
 
 
+def test_report_eligibility_excludes_supported_off_topic_reviewer_claims(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is TensorFlow and how does automatic differentiation work?",
+        constraints={},
+    )
+    good_claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=(
+            "TensorFlow is a machine learning framework whose automatic differentiation "
+            "system records tensor operations to compute gradients."
+        ),
+        canonical_url="https://example.org/tensorflow-autodiff",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "definition",
+            "claim_quality_score": 0.95,
+            "query_answer_score": 0.95,
+            "slot_ids": ["definition", "mechanism"],
+        },
+    )
+    off_topic_claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement="FastAPI uses Python type hints to validate request data.",
+        canonical_url="https://example.org/fastapi",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "definition",
+            "claim_quality_score": 0.92,
+            "query_answer_score": 0.92,
+            "slot_ids": ["definition"],
+            "llm_claim_review": {
+                "decision": "reject",
+                "confidence": 0.9,
+                "reasons": ["The claim answers a different framework question."],
+                "covered_slot_ids": ["definition"],
+            },
+        },
+    )
+    db_session.commit()
+    service = _report_service(db_session, tmp_path)
+
+    result = service.generate_markdown_report(task.id)
+
+    db_session.refresh(good_claim)
+    db_session.refresh(off_topic_claim)
+    assert good_claim.statement in result.markdown
+    assert off_topic_claim.statement not in result.markdown
+    assert good_claim.notes_json["report_eligible"] is True
+    assert off_topic_claim.notes_json["report_eligible"] is False
+    assert "claim_review_reject" in off_topic_claim.notes_json["report_eligibility"]["reasons"]
+    assert "query_focus_mismatch" in off_topic_claim.notes_json["report_eligibility"]["reasons"]
+
+
+def test_adjacent_entity_claims_are_excluded_unless_explicitly_requested(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    overview_task = create_research_task_service(db_session).create_task(
+        query="What is adapter tuning in large language models?",
+        constraints={},
+    )
+    adapter_claim = _add_supported_report_claim(
+        db_session,
+        overview_task,
+        statement=(
+            "Adapter tuning adds small trainable modules to a large language model while "
+            "leaving most base parameters unchanged."
+        ),
+        canonical_url="https://example.org/adapter-tuning",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "definition",
+            "claim_quality_score": 0.95,
+            "query_answer_score": 0.95,
+            "slot_ids": ["definition"],
+        },
+    )
+    adjacent_claim = _add_supported_report_claim(
+        db_session,
+        overview_task,
+        statement=("Representation tuning changes hidden representations during model adaptation."),
+        canonical_url="https://example.org/representation-tuning",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "mechanism",
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.88,
+            "slot_ids": ["mechanism"],
+            "llm_claim_review": {
+                "decision": "downrank",
+                "confidence": 0.86,
+                "reasons": ["Adjacent technique, not the requested main technique."],
+                "covered_slot_ids": ["mechanism"],
+            },
+        },
+    )
+    explicit_task = create_research_task_service(db_session).create_task(
+        query="What is representation tuning in large language models?",
+        constraints={},
+    )
+    explicit_claim = _add_supported_report_claim(
+        db_session,
+        explicit_task,
+        statement=("Representation tuning changes hidden representations during model adaptation."),
+        canonical_url="https://example.org/representation-tuning-explicit",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "definition",
+            "claim_quality_score": 0.94,
+            "query_answer_score": 0.94,
+            "slot_ids": ["definition"],
+        },
+    )
+    db_session.commit()
+    service = _report_service(db_session, tmp_path)
+
+    overview_result = service.generate_markdown_report(overview_task.id)
+    explicit_result = service.generate_markdown_report(explicit_task.id)
+
+    db_session.refresh(adapter_claim)
+    db_session.refresh(adjacent_claim)
+    db_session.refresh(explicit_claim)
+    assert adapter_claim.statement in overview_result.markdown
+    assert adjacent_claim.statement not in overview_result.markdown
+    assert adjacent_claim.notes_json["report_eligible"] is False
+    assert "claim_review_downrank" in adjacent_claim.notes_json["report_eligibility"]["reasons"]
+    assert explicit_claim.statement in explicit_result.markdown
+    assert explicit_claim.notes_json["report_eligible"] is True
+
+
+def test_claim_drafting_chunk_selection_preserves_source_diversity_for_mechanism_questions(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is ExampleFlow and how does routing work?",
+        constraints={},
+    )
+    for source_index in range(3):
+        source_document = SourceDocumentRepository(db_session).add(
+            SourceDocument(
+                task_id=task.id,
+                content_snapshot_id=None,
+                canonical_url=f"https://example.org/source-{source_index}",
+                domain="example.org",
+                title=f"Example source {source_index}",
+                source_type="web_page",
+                published_at=None,
+                fetched_at=datetime(2026, 4, 26, 10, source_index, tzinfo=UTC),
+                authority_score=0.8,
+                freshness_score=None,
+                originality_score=None,
+                consistency_score=None,
+                safety_score=None,
+                final_source_score=0.8,
+            )
+        )
+        for chunk_no in range(2):
+            SourceChunkRepository(db_session).add(
+                SourceChunk(
+                    source_document_id=source_document.id,
+                    chunk_no=chunk_no,
+                    text=(
+                        "ExampleFlow routing sends state between workflow nodes until the "
+                        f"pipeline completes. Source {source_index}, chunk {chunk_no}."
+                    ),
+                    token_count=20,
+                    metadata_json={
+                        "strategy": "paragraph_window_v1",
+                        "content_quality_score": 0.9,
+                        "eligible_for_claims": True,
+                    },
+                )
+            )
+    db_session.commit()
+
+    selected_ids = _select_claim_drafting_chunk_ids(
+        db_session,
+        task.id,
+        query=task.query,
+        limit=3,
+    )
+    selected_chunks = list(
+        db_session.scalars(select(SourceChunk).where(SourceChunk.id.in_(selected_ids)))
+    )
+
+    assert len(selected_ids) == 3
+    assert len({chunk.source_document_id for chunk in selected_chunks}) == 3
+
+
 def test_deployment_report_renders_slot_sections_and_coverage_gaps(
     db_session: Session,
     tmp_path: Path,
@@ -1114,7 +1358,7 @@ def test_deployment_source_chunks_promote_to_supported_claims_and_chinese_report
         '    -v "./data/:/var/cache/searxng/" \\\n'
         "    docker.io/searxng/searxng:latest"
     )
-    compose_commands = "cp .env.example .env\n" "docker compose up -d\n" "docker compose pull"
+    compose_commands = "cp .env.example .env\ndocker compose up -d\ndocker compose pull"
     source_text = (
         f"{docker_run}\n\n"
         f"{compose_commands}\n\n"
@@ -1203,7 +1447,7 @@ def test_deployment_source_chunks_promote_to_supported_claims_and_chinese_report
     assert "### 更新 / 维护" in result.markdown
     assert "```" in result.markdown
     assert docker_run in result.markdown
-    assert "claim_evidence" in result.markdown
+    assert "claim_evidence" not in result.markdown
     for expected in (
         "Docker or Podman",
         "sudo usermod -aG docker",
@@ -1360,8 +1604,8 @@ def test_grounded_deployment_report_renders_all_supported_slot_claims(
     assert "update-ca-certificates" in result.markdown
     assert "docker compose logs" in result.markdown
     assert "docker compose exec searxng sh" in result.markdown
-    assert result.markdown.count("claim_evidence") >= len(supported_claims)
-    assert result.markdown.count("citations") >= len(supported_claims)
+    assert str(first_claim.id) not in result.markdown
+    assert result.markdown.count("claim_evidence") <= 1
 
 
 def test_deployment_report_includes_official_repository_archived_caveat(
@@ -1391,8 +1635,7 @@ def test_deployment_report_includes_official_repository_archived_caveat(
         )
     )
     statement = (
-        "The searxng-docker repository is archived and superseded by the main SearXNG "
-        "repository."
+        "The searxng-docker repository is archived and superseded by the main SearXNG repository."
     )
     source_chunk = SourceChunkRepository(db_session).add(
         SourceChunk(
@@ -1463,6 +1706,165 @@ class SeededReportClaims:
         self.task_id = task_id
 
 
+def _report_service(
+    db_session: Session,
+    tmp_path: Path,
+) -> object:
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path / "objects"))
+    object_store.validate_configuration()
+    return create_report_synthesis_service(
+        db_session,
+        object_store=object_store,
+        report_storage_bucket="reports",
+    )
+
+
+def _add_supported_report_claim(
+    db_session: Session,
+    task: ResearchTask,
+    *,
+    statement: str,
+    canonical_url: str,
+    domain: str,
+    notes: dict[str, object],
+    verification_status: str = "supported",
+    evidence_relation_type: str = "support",
+) -> Claim:
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url=canonical_url,
+            domain=domain,
+            title="Report eligibility source",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.8,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.8,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=statement,
+            token_count=max(8, len(statement.split())),
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.9,
+                "eligible_for_claims": True,
+            },
+        )
+    )
+    claim = Claim(
+        task_id=task.id,
+        statement=statement,
+        claim_type="fact",
+        confidence=0.9,
+        verification_status=verification_status,
+        notes_json=notes,
+    )
+    db_session.add(claim)
+    db_session.flush()
+    span = CitationSpan(
+        source_chunk_id=source_chunk.id,
+        start_offset=0,
+        end_offset=len(statement),
+        excerpt=statement,
+        normalized_excerpt_hash=f"sha256:{sha256(statement.encode()).hexdigest()}",
+    )
+    db_session.add(span)
+    db_session.flush()
+    db_session.add(
+        ClaimEvidence(
+            claim_id=claim.id,
+            citation_span_id=span.id,
+            relation_type=evidence_relation_type,
+            score=0.9,
+        )
+    )
+    return claim
+
+
+def test_supported_verified_claim_without_slot_metadata_remains_reportable(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is ExampleProject?",
+        constraints={},
+    )
+    statement = "ExampleProject is a workflow tool that coordinates verified research tasks."
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://example.com/legacy-source",
+        domain="example.com",
+        notes={
+            "verification": {"rationale": "Persisted support evidence exists."},
+            "claim_category": "legacy_fact",
+            "answer_role": "definition",
+            "answer_relevant": True,
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.9,
+        },
+    )
+    db_session.commit()
+    service = _report_service(db_session, tmp_path)
+
+    result = service.generate_markdown_report(task.id)
+    db_session.refresh(claim)
+    eligibility = claim.notes_json["report_eligibility"]
+
+    assert result.supported_claims == 1
+    assert statement in result.markdown
+    assert claim.notes_json["report_eligible"] is True
+    assert "missing_answer_slot" not in eligibility["reasons"]
+
+
+def test_report_eligible_filter_keeps_generic_contradicted_ledger_claims(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is ExampleProject?",
+        constraints={},
+    )
+    statement = "ExampleProject is a synchronous-only research task runner."
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://example.com/generic-source",
+        domain="example.com",
+        notes={
+            "verification": {"rationale": "Persisted contradictory evidence exists."},
+            "claim_category": "definition",
+            "answer_role": "definition",
+            "answer_relevant": True,
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.9,
+        },
+        verification_status="contradicted",
+        evidence_relation_type="contradict",
+    )
+    db_session.commit()
+    service = _report_service(db_session, tmp_path)
+
+    result = service.generate_markdown_report(task.id)
+    db_session.refresh(claim)
+
+    assert result.contradicted_claims == 1
+    assert statement in result.markdown
+    assert claim.notes_json["report_eligible"] is True
+
+
 def _first_supported_claim_and_evidence(
     db_session: Session,
     task_id: UUID,
@@ -1482,7 +1884,7 @@ def _first_supported_claim_and_evidence(
 
 def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
     task = create_research_task_service(db_session).create_task(
-        query="What is the current verified position?",
+        query="explain verified research positions.",
         constraints={},
     )
     source_document = SourceDocumentRepository(db_session).add(
@@ -1552,6 +1954,7 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
             "claim_category": "definition",
             "claim_quality_score": 0.9,
             "query_answer_score": 0.9,
+            "slot_ids": ["definition"],
         },
     )
     mixed_claim = Claim(
@@ -1565,6 +1968,7 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
             "claim_category": "mechanism",
             "claim_quality_score": 0.82,
             "query_answer_score": 0.8,
+            "slot_ids": ["mechanism"],
         },
     )
     unsupported_claim = Claim(
@@ -1580,6 +1984,7 @@ def _seed_verified_claims(db_session: Session) -> SeededReportClaims:
             "claim_category": "privacy",
             "claim_quality_score": 0.78,
             "query_answer_score": 0.75,
+            "slot_ids": ["limitations"],
         },
     )
     db_session.add_all([supported_claim, mixed_claim, unsupported_claim])

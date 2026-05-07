@@ -212,6 +212,7 @@ _FEATURE_TERMS = (
     "限制",
 )
 _DEPLOYMENT_TERMS = (
+    "archived",
     "container",
     "containers",
     "docker",
@@ -228,6 +229,7 @@ _DEPLOYMENT_TERMS = (
     "persistent storage",
     "reverse-proxy",
     "reverse proxy",
+    "superseded",
 )
 _SETUP_TERMS = (
     "add your instance",
@@ -312,6 +314,61 @@ _DIAGRAM_OR_CONFIG_FRAGMENT_PATTERN = re.compile(
     r"\bsecret_key\s*:"
     r")",
     re.IGNORECASE,
+)
+_DEPLOYMENT_COMMAND_LINE_PATTERN = re.compile(
+    r"^\s*(?:\$|#)?\s*(?:sudo\s+)?(?:docker|docker-compose|podman|curl|mkdir|git|cd|make)\b",
+    re.IGNORECASE,
+)
+_DEPLOYMENT_CONFIG_LINE_PATTERN = re.compile(
+    r"^\s*(?:[-\w./{}$]+:\s*|-\s+['\"]?\d{2,5}:\d{2,5}|-\s+['\"]?\.?/[^:]+:|"
+    r"(?:SEARXNG|GRANIAN|FORCE_OWNERSHIP|BASE_URL)[A-Z0-9_]*=)",
+    re.IGNORECASE,
+)
+_MAX_DEPLOYMENT_EVIDENCE_CHARS = 4000
+_MAX_DEPLOYMENT_EVIDENCE_LINES = 80
+_DEPLOYMENT_EVIDENCE_MARKERS = (
+    ".env",
+    ".env.example",
+    "bot protection",
+    "certificate",
+    "certificates",
+    "custom certificate",
+    "custom certificates",
+    "docker ",
+    "docker-compose",
+    "docker compose",
+    "podman ",
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "docker.io/searxng/searxng",
+    "ghcr.io/searxng/searxng",
+    "searxng/searxng",
+    "/etc/searxng",
+    "/var/cache/searxng",
+    "searxng-valkey",
+    "limiter",
+    "public_instance",
+    "public instance",
+    "public exposure",
+    "publicly accessible",
+    "reverse proxy",
+    "searxng_",
+    "searxng_secret",
+    "settings.yml",
+    "valkey://",
+    "secret_key",
+    "secret key",
+    "base_url",
+    "update-ca-certificates",
+)
+_DEPLOYMENT_STATEMENT_PREFIXES = (
+    "Deployment command evidence:",
+    "Deployment Compose evidence:",
+    "Deployment configuration evidence:",
+    "Deployment maintenance evidence:",
+    "Deployment troubleshooting evidence:",
 )
 _SETUP_ALLOWED_QUERY_TERMS = {
     "add",
@@ -574,6 +631,8 @@ def classify_claim_category(statement: str, *, intent: QueryIntent | None = None
     padded = f" {lower} "
     intent = intent or classify_query_intent(None)
 
+    if is_deployment_evidence_statement(normalized):
+        return "deployment/self_hosting"
     if _looks_like_reference_statement(normalized, query=None):
         return "reference"
     if _contains_any(lower, _SLOGAN_TERMS):
@@ -617,16 +676,34 @@ def _is_deployment_statement(lower_statement: str, *, intent: QueryIntent) -> bo
         for term in (
             "base url",
             "base urls",
+            "bot protection",
+            "certificate",
+            "certificates",
+            "compose pull",
             "configuration",
             "configure",
+            "custom certificate",
+            "custom certificates",
+            "docker group",
+            "docker/podman",
             "health check",
             "health checks",
+            "limiter",
             "mount",
             "network",
             "persistent",
+            "public instance",
+            "public_instance",
+            "publicly accessible",
+            "review new templates",
+            "searxng_",
+            "searxng_secret",
             "secret",
+            "secret key",
             "secrets",
+            "settings.yml",
             "storage",
+            "superseded",
         )
     )
 
@@ -691,7 +768,8 @@ def _claim_rejection_reason(
         return "broken_link_residue"
     if _looks_like_figure_caption(normalized):
         return "figure_caption_or_diagram"
-    if _looks_like_diagram_or_config_fragment(normalized):
+    deployment_evidence_statement = is_deployment_evidence_statement(normalized)
+    if _looks_like_diagram_or_config_fragment(normalized) and not deployment_evidence_statement:
         return "diagram_or_config_fragment"
     if _looks_like_reference_statement(normalized, query=query):
         return "reference_or_citation"
@@ -847,8 +925,343 @@ def iter_supporting_spans(text: str) -> Iterable[SupportingSpan]:
             )
 
 
+def iter_deployment_evidence_spans(text: str) -> Iterable[SupportingSpan]:
+    line_spans = _line_spans(text)
+    if not line_spans:
+        return
+
+    yielded_offsets: set[tuple[int, int]] = set()
+    for fenced_span in _iter_fenced_code_block_spans(text, line_spans):
+        if is_deployment_evidence_excerpt(fenced_span.excerpt):
+            yielded_offsets.add((fenced_span.start_offset, fenced_span.end_offset))
+            yield fenced_span
+
+    index = 0
+    while index < len(line_spans):
+        start, end, line = line_spans[index]
+        if _offset_inside_yielded_span(start, yielded_offsets):
+            index += 1
+            continue
+        if not _deployment_line_candidate(line):
+            index += 1
+            continue
+
+        block_start = start
+        block_end = end
+        block_lines = [line]
+        next_index = index + 1
+        while next_index < len(line_spans) and len(block_lines) < _MAX_DEPLOYMENT_EVIDENCE_LINES:
+            _, next_end, next_line = line_spans[next_index]
+            if not next_line.strip():
+                break
+            candidate_excerpt = text[block_start:next_end].strip()
+            if len(candidate_excerpt) > _MAX_DEPLOYMENT_EVIDENCE_CHARS:
+                break
+            if not (
+                _deployment_line_candidate(next_line)
+                or _looks_like_continuation_line(next_line)
+                or _looks_like_yaml_context_line(next_line)
+            ):
+                break
+            block_end = next_end
+            block_lines.append(next_line)
+            next_index += 1
+
+        excerpt = text[block_start:block_end].strip()
+        if is_deployment_evidence_excerpt(excerpt):
+            block_text = text[block_start:block_end]
+            stripped_start = block_start + len(block_text) - len(block_text.lstrip())
+            stripped_end = block_end - (len(block_text) - len(block_text.rstrip()))
+            key = (stripped_start, stripped_end)
+            if stripped_end > stripped_start and key not in yielded_offsets:
+                yielded_offsets.add(key)
+                yield SupportingSpan(
+                    start_offset=stripped_start,
+                    end_offset=stripped_end,
+                    excerpt=text[stripped_start:stripped_end],
+                )
+        index = max(next_index, index + 1)
+
+
+def deployment_evidence_statement(excerpt: str) -> str:
+    normalized = _normalize_code_excerpt(excerpt)
+    label = "configuration"
+    lower = normalized.lower()
+    if any(term in lower for term in ("logs", "exec ", "container list")):
+        label = "troubleshooting"
+    elif any(term in lower for term in ("pull", "stop", "rm ", "restart", "up -d")):
+        label = "maintenance"
+    elif "docker compose" in lower or "docker-compose" in lower or "compose.y" in lower:
+        label = "Compose"
+    elif "docker " in lower or "podman " in lower:
+        label = "command"
+    prefix = {
+        "command": "Deployment command evidence",
+        "Compose": "Deployment Compose evidence",
+        "maintenance": "Deployment maintenance evidence",
+        "troubleshooting": "Deployment troubleshooting evidence",
+    }.get(label, "Deployment configuration evidence")
+    return f"{prefix}: `{normalized}`."
+
+
+def is_deployment_evidence_statement(statement: str) -> bool:
+    normalized = _normalize_whitespace(statement)
+    return normalized.startswith(_DEPLOYMENT_STATEMENT_PREFIXES)
+
+
+def is_deployment_evidence_excerpt(excerpt: str) -> bool:
+    normalized = _normalize_code_excerpt(excerpt)
+    if len(normalized) < 6 or len(normalized) > _MAX_DEPLOYMENT_EVIDENCE_CHARS:
+        return False
+    lower = normalized.lower()
+    if any(marker in lower for marker in _DEPLOYMENT_EVIDENCE_MARKERS):
+        return True
+    return any(
+        _DEPLOYMENT_COMMAND_LINE_PATTERN.search(line)
+        or _DEPLOYMENT_CONFIG_LINE_PATTERN.search(line)
+        for line in normalized.splitlines()
+    )
+
+
+def deployment_slot_ids_for_evidence(statement: str, excerpt: str) -> tuple[str, ...]:
+    return _deployment_slot_ids_for_text(statement, excerpt, default_to_run_or_compose=True)
+
+
+def deployment_slot_ids_for_claim_text(statement: str, excerpt: str) -> tuple[str, ...]:
+    return _deployment_slot_ids_for_text(statement, excerpt, default_to_run_or_compose=False)
+
+
+def _deployment_slot_ids_for_text(
+    statement: str,
+    excerpt: str,
+    *,
+    default_to_run_or_compose: bool,
+) -> tuple[str, ...]:
+    lower = f"{statement}\n{excerpt}".lower()
+    slot_ids: list[str] = []
+    if any(
+        term in lower
+        for term in (
+            "docker or podman",
+            "working docker",
+            "working podman",
+            "usermod",
+            "docker group",
+            "docker/podman",
+            "install docker",
+            "install podman",
+            "requires docker",
+            "requires podman",
+        )
+    ):
+        slot_ids.append("deployment_prerequisites")
+    if any(
+        term in lower
+        for term in (
+            "docker run",
+            "docker compose up",
+            "docker compose down",
+            "docker-compose up",
+            "docker-compose down",
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.y",
+            "container/docker-compose",
+            "compose up",
+            "compose down",
+            "curl ",
+            "mkdir ",
+            "cp .env",
+            "uses docker compose",
+        )
+    ):
+        slot_ids.append("deployment_run_or_compose")
+    if any(
+        term in lower
+        for term in (
+            "force_ownership",
+            "ownership",
+            "volume",
+            "volumes:",
+            "-v ",
+            "/etc/searxng",
+            "/var/cache",
+        )
+    ):
+        slot_ids.append("deployment_volumes")
+    if any(term in lower for term in ("ports:", "-p ", ":8080", "8888:8080", "localhost:8888")):
+        slot_ids.append("deployment_ports")
+    if any(
+        term in lower
+        for term in (
+            "settings.yml",
+            "core-config",
+            "limiter.toml",
+            "limiter",
+            ".env",
+            ".env.example",
+            "environment:",
+            "searxng_",
+            "searxng_secret",
+            "base_url",
+            "secret_key",
+            "secret key",
+            "valkey://",
+            "force_ownership",
+            "review new templates",
+            "reviewing new templates",
+        )
+    ):
+        slot_ids.append("deployment_configuration")
+    if any(
+        term in lower
+        for term in (
+            "bot protection",
+            "certificate",
+            "certificates",
+            "custom certificate",
+            "custom certificates",
+            "limiter",
+            "public exposure",
+            "public instance",
+            "public_instance",
+            "publicly accessible",
+            "reverse proxy",
+            "searxng_secret",
+            "secret_key",
+            "secret key",
+        )
+    ):
+        slot_ids.append("deployment_security")
+    if any(
+        term in lower
+        for term in ("logs", "exec ", "shell", "troubleshooting", "container list", "health")
+    ):
+        slot_ids.append("deployment_troubleshooting")
+    if any(
+        term in lower
+        for term in (
+            "archived",
+            "compose pull",
+            "pull",
+            "restart",
+            "review new templates",
+            "reviewing new templates",
+            "stop",
+            "superseded",
+            "rm ",
+            "update",
+            "maintenance",
+        )
+    ):
+        slot_ids.append("deployment_update_maintenance")
+    if not slot_ids and default_to_run_or_compose:
+        slot_ids.append("deployment_run_or_compose")
+    return tuple(dict.fromkeys(slot_ids))
+
+
 def _normalize_whitespace(value: str) -> str:
     return _WHITESPACE_PATTERN.sub(" ", value).strip()
+
+
+def _normalize_code_excerpt(value: str) -> str:
+    lines = [line.rstrip() for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _line_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        start = cursor
+        end = cursor + len(line)
+        spans.append((start, end, line.rstrip("\r\n")))
+        cursor = end
+    if text and not text.endswith(("\n", "\r")) and (not spans or spans[-1][1] < len(text)):
+        spans.append((cursor, len(text), text[cursor:]))
+    return spans
+
+
+def _iter_fenced_code_block_spans(
+    text: str,
+    line_spans: list[tuple[int, int, str]],
+) -> Iterable[SupportingSpan]:
+    index = 0
+    while index < len(line_spans):
+        start, _, line = line_spans[index]
+        stripped = line.strip()
+        fence = _opening_code_fence(stripped)
+        if fence is None:
+            index += 1
+            continue
+
+        block_end: int | None = None
+        next_index = index + 1
+        while next_index < len(line_spans):
+            _, next_end, next_line = line_spans[next_index]
+            if next_line.strip().startswith(fence):
+                block_end = next_end
+                break
+            next_index += 1
+
+        if block_end is None:
+            index += 1
+            continue
+
+        excerpt = text[start:block_end].rstrip()
+        if excerpt.strip() and len(excerpt) <= _MAX_DEPLOYMENT_EVIDENCE_CHARS:
+            yield SupportingSpan(
+                start_offset=start,
+                end_offset=start + len(excerpt),
+                excerpt=excerpt,
+            )
+        index = next_index + 1
+
+
+def _opening_code_fence(stripped_line: str) -> str | None:
+    if stripped_line.startswith("```"):
+        return "```"
+    if stripped_line.startswith("~~~"):
+        return "~~~"
+    return None
+
+
+def _offset_inside_yielded_span(
+    offset: int,
+    yielded_offsets: set[tuple[int, int]],
+) -> bool:
+    return any(start <= offset < end for start, end in yielded_offsets)
+
+
+def _deployment_line_candidate(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    if any(marker in lower for marker in _DEPLOYMENT_EVIDENCE_MARKERS):
+        return True
+    return bool(
+        _DEPLOYMENT_COMMAND_LINE_PATTERN.search(stripped)
+        or _DEPLOYMENT_CONFIG_LINE_PATTERN.search(stripped)
+    )
+
+
+def _looks_like_continuation_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return stripped.startswith(("-", "$", "#")) or stripped.endswith("\\")
+
+
+def _looks_like_yaml_context_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return bool(re.match(r"^[A-Za-z0-9_.-]+:\s*(?:$|.+)", stripped))
 
 
 def _normalize_quotes(value: str) -> str:

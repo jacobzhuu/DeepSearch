@@ -19,7 +19,8 @@ class FakeJudgeProvider:
                     "label": "authoritative",
                     "confidence": 0.8,
                     "reasons": ["Official-looking documentation URL."],
-                    "priority_adjustment": 0.1,
+                    "priority_adjustment": -2,
+                    "source_type": "official_docs",
                 }
             ),
             model=request.model,
@@ -41,6 +42,75 @@ def test_source_judge_disabled_returns_audited_fallback() -> None:
     assert result.fallback_status == "disabled"
     assert result.output_judgment["label"] == "uncertain"
     assert result.used_in_final_ranking is False
+
+
+def test_source_judge_active_result_can_affect_ranking() -> None:
+    service = SourceJudgeService(
+        enabled=True,
+        active_rerank=True,
+        provider=FakeJudgeProvider(),
+        model="judge-model",
+        max_candidates=5,
+    )
+
+    result = service.judge_candidates([_candidate()], query="What is SearXNG?")[0]
+
+    assert result.output_judgment["label"] == "authoritative"
+    assert result.used_in_final_ranking is True
+
+
+def test_source_judge_malformed_output_falls_back() -> None:
+    class BadProvider:
+        name = "bad"
+
+        def generate(self, request: LLMRequest) -> LLMResponse:
+            return LLMResponse(text="not json", model=request.model, provider=self.name)
+
+    service = SourceJudgeService(
+        enabled=True,
+        active_rerank=True,
+        provider=BadProvider(),
+        model="judge-model",
+        max_candidates=5,
+    )
+
+    result = service.judge_candidates([_candidate()], query="What is SearXNG?")[0]
+
+    assert result.fallback_status == "llm_failed"
+    assert result.used_in_final_ranking is False
+
+
+def test_source_judge_active_relevant_label_with_adjustment_participates() -> None:
+    class RelevantProvider:
+        name = "relevant"
+
+        def generate(self, request: LLMRequest) -> LLMResponse:
+            return LLMResponse(
+                text=json.dumps(
+                    {
+                        "label": "relevant",
+                        "confidence": 0.7,
+                        "reasons": ["Relevant official source."],
+                        "priority_adjustment": -1,
+                        "source_type": "official_docs",
+                    }
+                ),
+                model=request.model,
+                provider=self.name,
+            )
+
+    service = SourceJudgeService(
+        enabled=True,
+        active_rerank=True,
+        provider=RelevantProvider(),
+        model="judge-model",
+        max_candidates=5,
+    )
+
+    result = service.judge_candidates([_candidate()], query="What is SearXNG?")[0]
+
+    assert result.output_judgment["label"] == "relevant"
+    assert result.used_in_final_ranking is True
 
 
 def test_source_judge_accepts_structured_llm_shadow_result() -> None:

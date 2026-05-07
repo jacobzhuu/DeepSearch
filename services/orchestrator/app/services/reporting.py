@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -19,9 +20,12 @@ from services.orchestrator.app.claims import (
     REPORT_CLAIM_QUALITY_THRESHOLD,
     REPORT_QUERY_ANSWER_THRESHOLD,
     ClaimCandidateScore,
+    classify_query_intent,
     is_answer_relevant_score,
     is_claimable_excerpt,
     is_claimable_statement,
+    is_deployment_evidence_excerpt,
+    is_deployment_evidence_statement,
     score_claim_statement,
 )
 from services.orchestrator.app.llm import LLMError, LLMProvider
@@ -52,6 +56,65 @@ from services.orchestrator.app.storage import SnapshotObjectStore
 
 REPORT_FORMAT_MARKDOWN = "markdown"
 logger = get_logger(__name__)
+_REPORT_REVIEW_EXCLUDE_DECISIONS = {
+    "downrank",
+    "reject",
+    "duplicate",
+    "vague",
+    "split_needed",
+}
+_REPORT_ACCEPT_MIN_CONFIDENCE = 0.65
+_EVENT_OR_ANNOUNCEMENT_MARKERS = {
+    "conference",
+    "conf ",
+    "conf'",
+    "webinar",
+    "meetup",
+    "summit",
+    "happening on",
+    "registration",
+    "call for papers",
+}
+_EVENT_QUERY_MARKERS = {
+    "conference",
+    "event",
+    "webinar",
+    "meetup",
+    "summit",
+    "news",
+    "latest",
+    "recent",
+    "announcement",
+    "release",
+}
+_QUERY_FOCUS_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "compare",
+    "comparison",
+    "differences",
+    "does",
+    "do",
+    "for",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "versus",
+    "vs",
+    "what",
+    "with",
+    "work",
+    "works",
+}
 
 
 class ReportArtifactNotFoundError(Exception):
@@ -120,6 +183,7 @@ class ReportSynthesisService:
         llm_model: str = "",
         llm_report_writer_enabled: bool = False,
         llm_report_max_output_tokens: int = 2400,
+        include_ledger_debug_appendix: bool = False,
     ) -> None:
         self.session = session
         self.task_repository = task_repository
@@ -132,6 +196,7 @@ class ReportSynthesisService:
         self.llm_model = llm_model
         self.llm_report_writer_enabled = llm_report_writer_enabled
         self.llm_report_max_output_tokens = llm_report_max_output_tokens
+        self.include_ledger_debug_appendix = include_ledger_debug_appendix
 
     def generate_markdown_report(self, task_id: UUID) -> ReportSynthesisResult:
         task = self._get_task(task_id)
@@ -301,11 +366,28 @@ class ReportSynthesisService:
         source_items: dict[UUID, ReportSourceItem] = {}
         excluded_low_quality_claim_count = 0
         for claim in claims:
+            notes = claim.notes_json or {}
+            claim_score = _report_claim_score(claim, query=task.query)
+            slot_ids = _report_claim_slot_ids(claim, claim_score=claim_score, query=task.query)
+            review_decision = _claim_review_decision(notes)
             if not is_claimable_statement(claim.statement, query=task.query):
+                _set_report_eligibility(
+                    claim,
+                    eligible=False,
+                    reasons=["not_claimable_statement"],
+                    slot_ids=slot_ids,
+                    review_decision=review_decision,
+                )
                 excluded_low_quality_claim_count += 1
                 continue
-            claim_score = _report_claim_score(claim, query=task.query)
             if not _report_claim_answer_relevant(claim_score, query=task.query):
+                _set_report_eligibility(
+                    claim,
+                    eligible=False,
+                    reasons=["low_quality_or_off_query_score"],
+                    slot_ids=slot_ids,
+                    review_decision=review_decision,
+                )
                 excluded_low_quality_claim_count += 1
                 continue
             support_evidence: list[ReportEvidenceItem] = []
@@ -313,7 +395,9 @@ class ReportSynthesisService:
             relation_metadata_by_span = _relation_metadata_by_citation_span(claim)
             for evidence in evidence_by_claim_id.get(claim.id, []):
                 citation_span = evidence.citation_span
-                if not is_claimable_excerpt(citation_span.excerpt):
+                if not is_claimable_excerpt(
+                    citation_span.excerpt
+                ) and not _claim_uses_deployment_evidence(claim, citation_span.excerpt):
                     continue
                 source_chunk = citation_span.source_chunk
                 if not _source_chunk_eligible_for_report(source_chunk):
@@ -360,26 +444,42 @@ class ReportSynthesisService:
                 )
                 if effective_relation_type in {"support", "weak_support"}:
                     support_evidence.append(report_evidence)
-                    source_items[source_document.id] = ReportSourceItem(
-                        source_document_id=source_document.id,
-                        canonical_url=source_document.canonical_url,
-                        domain=source_document.domain,
-                        title=source_document.title,
-                    )
                 elif effective_relation_type == "contradict":
                     contradict_evidence.append(report_evidence)
-                    source_items[source_document.id] = ReportSourceItem(
-                        source_document_id=source_document.id,
-                        canonical_url=source_document.canonical_url,
-                        domain=source_document.domain,
-                        title=source_document.title,
-                    )
 
             normalized_status = self._normalize_status(claim.verification_status)
             if normalized_status == "supported" and not support_evidence:
                 normalized_status = "unsupported"
             if normalized_status == "mixed" and not (support_evidence and contradict_evidence):
                 normalized_status = "unsupported" if not contradict_evidence else "contradicted"
+
+            eligibility = _report_claim_eligibility(
+                claim=claim,
+                query=task.query,
+                claim_score=claim_score,
+                normalized_status=normalized_status,
+                support_evidence=support_evidence,
+                contradict_evidence=contradict_evidence,
+                slot_ids=slot_ids,
+                review_decision=review_decision,
+            )
+            _set_report_eligibility(
+                claim,
+                eligible=eligibility["eligible"],
+                reasons=cast(list[str], eligibility["reasons"]),
+                slot_ids=slot_ids,
+                review_decision=review_decision,
+            )
+            if not eligibility["eligible"]:
+                excluded_low_quality_claim_count += 1
+                continue
+            for evidence in support_evidence + contradict_evidence:
+                source_items[evidence.source_document_id] = ReportSourceItem(
+                    source_document_id=evidence.source_document_id,
+                    canonical_url=evidence.canonical_url,
+                    domain=evidence.domain,
+                    title=None,
+                )
 
             report_claims.append(
                 ReportClaimItem(
@@ -394,10 +494,10 @@ class ReportSynthesisService:
                     claim_quality_score=claim_score.claim_quality_score,
                     query_answer_score=claim_score.query_answer_score,
                     claim_category=claim_score.claim_category,
-                    slot_ids=tuple(
-                        item
-                        for item in (claim.notes_json or {}).get("slot_ids", [])
-                        if isinstance(item, str)
+                    slot_ids=tuple(slot_ids),
+                    evidence_kind=_string_or_none((claim.notes_json or {}).get("evidence_kind")),
+                    deployment_evidence_excerpt=_deployment_evidence_excerpt_from_notes(
+                        claim.notes_json or {}
                     ),
                     verifier_method=_claim_verifier_method(claim),
                     support_level=_claim_support_level(claim),
@@ -405,6 +505,7 @@ class ReportSynthesisService:
             )
 
         sources = list(source_items.values())
+        self.session.flush()
         deterministic_rendered = render_markdown_report(
             task_id=task.id,
             research_question=task.query,
@@ -414,6 +515,7 @@ class ReportSynthesisService:
             report_language=report_language,
             answer_relevant_claim_count=len(report_claims),
             excluded_low_quality_claim_count=excluded_low_quality_claim_count,
+            include_ledger_debug_appendix=self.include_ledger_debug_appendix,
         )
         rendered = deterministic_rendered
         report_writer: dict[str, object] = {
@@ -435,6 +537,7 @@ class ReportSynthesisService:
                     llm_provider=self.llm_provider,
                     llm_model=self.llm_model,
                     max_output_tokens=self.llm_report_max_output_tokens,
+                    include_ledger_debug_appendix=self.include_ledger_debug_appendix,
                 )
             except LLMError as error:
                 report_writer = {
@@ -556,6 +659,7 @@ def create_report_synthesis_service(
     llm_model: str = "",
     llm_report_writer_enabled: bool = False,
     llm_report_max_output_tokens: int = 2400,
+    include_ledger_debug_appendix: bool = False,
 ) -> ReportSynthesisService:
     return ReportSynthesisService(
         session,
@@ -569,11 +673,16 @@ def create_report_synthesis_service(
         llm_model=llm_model,
         llm_report_writer_enabled=llm_report_writer_enabled,
         llm_report_max_output_tokens=llm_report_max_output_tokens,
+        include_ledger_debug_appendix=include_ledger_debug_appendix,
     )
 
 
 def _source_chunk_eligible_for_report(source_chunk: object) -> bool:
     metadata = getattr(source_chunk, "metadata_json", {}) or {}
+    quality_reasons = metadata.get("quality_reasons")
+    deployment_code_or_config = (
+        isinstance(quality_reasons, list) and "deployment_code_or_config" in quality_reasons
+    )
     if metadata.get("eligible_for_claims") is False:
         return False
     if metadata.get("should_generate_claims") is False:
@@ -582,7 +691,7 @@ def _source_chunk_eligible_for_report(source_chunk: object) -> bool:
         return False
     if metadata.get("is_navigation_noise") is True:
         return False
-    if metadata.get("is_diagram_or_config_section") is True:
+    if metadata.get("is_diagram_or_config_section") is True and not deployment_code_or_config:
         return False
     if metadata.get("reason") == "redirect_stub":
         return False
@@ -590,6 +699,22 @@ def _source_chunk_eligible_for_report(source_chunk: object) -> bool:
     if isinstance(quality_score, int | float) and quality_score < 0.3:
         return False
     return True
+
+
+def _claim_uses_deployment_evidence(claim: Claim, excerpt: str) -> bool:
+    notes = claim.notes_json or {}
+    return (
+        is_deployment_evidence_statement(claim.statement)
+        or notes.get("evidence_kind") == "deployment_code_or_config"
+    ) and is_deployment_evidence_excerpt(excerpt)
+
+
+def _deployment_evidence_excerpt_from_notes(notes: dict[str, object]) -> str | None:
+    evidence_candidate = notes.get("evidence_candidate")
+    if not isinstance(evidence_candidate, dict):
+        return None
+    excerpt = evidence_candidate.get("excerpt")
+    return excerpt if isinstance(excerpt, str) and excerpt.strip() else None
 
 
 def _report_claim_score(claim: Claim, *, query: str) -> ClaimCandidateScore:
@@ -606,6 +731,174 @@ def _report_claim_answer_relevant(score: ClaimCandidateScore, *, query: str) -> 
     if score.query_answer_score < REPORT_QUERY_ANSWER_THRESHOLD:
         return False
     return is_answer_relevant_score(score, query=query)
+
+
+def _report_claim_eligibility(
+    *,
+    claim: Claim,
+    query: str,
+    claim_score: ClaimCandidateScore,
+    normalized_status: str,
+    support_evidence: list[ReportEvidenceItem],
+    contradict_evidence: list[ReportEvidenceItem],
+    slot_ids: list[str],
+    review_decision: dict[str, object],
+) -> dict[str, object]:
+    reasons: list[str] = []
+    if normalized_status == "draft":
+        reasons.append("not_verified")
+    if not support_evidence and not contradict_evidence:
+        reasons.append("missing_persisted_evidence")
+    decision = _string_or_none(review_decision.get("decision"))
+    if decision in _REPORT_REVIEW_EXCLUDE_DECISIONS:
+        reasons.append(f"claim_review_{decision}")
+    if decision == "accept":
+        confidence = _numeric_note(review_decision.get("confidence"))
+        review_reasons = review_decision.get("reasons")
+        covered_slot_ids = review_decision.get("covered_slot_ids")
+        quality_flags = review_decision.get("quality_flags")
+        if confidence is None or confidence < _REPORT_ACCEPT_MIN_CONFIDENCE:
+            reasons.append("claim_review_low_confidence_accept")
+        if not isinstance(review_reasons, list) or not any(
+            isinstance(item, str) and item.strip() for item in review_reasons
+        ):
+            reasons.append("claim_review_missing_reasons")
+        if not isinstance(covered_slot_ids, list) or not any(
+            isinstance(item, str) and item.strip() for item in covered_slot_ids
+        ):
+            reasons.append("claim_review_missing_slot_coverage")
+        if isinstance(quality_flags, list) and quality_flags:
+            reasons.append("claim_review_quality_flags")
+    if _event_or_announcement_noise_claim(claim.statement, query=query):
+        reasons.append("event_or_announcement_noise")
+    if claim_score.rejected_reason:
+        reasons.append(f"claim_score_rejected:{claim_score.rejected_reason}")
+    if _claim_focus_required_for_report(query=query, slot_ids=slot_ids) and not (
+        _claim_focus_matches_query(claim.statement, query=query)
+    ):
+        reasons.append("query_focus_mismatch")
+    return {"eligible": not reasons, "reasons": list(dict.fromkeys(reasons))}
+
+
+def _set_report_eligibility(
+    claim: Claim,
+    *,
+    eligible: bool,
+    reasons: list[str],
+    slot_ids: list[str],
+    review_decision: dict[str, object],
+) -> None:
+    notes = claim.notes_json or {}
+    claim.notes_json = {
+        **notes,
+        "report_eligible": eligible,
+        "report_eligibility": {
+            "eligible": eligible,
+            "reasons": reasons,
+            "slot_ids": slot_ids,
+            "review_decision": review_decision,
+        },
+    }
+
+
+def _report_claim_slot_ids(
+    claim: Claim,
+    *,
+    claim_score: ClaimCandidateScore,
+    query: str,
+) -> list[str]:
+    notes = claim.notes_json or {}
+    noted_slots = [
+        item for item in notes.get("slot_ids", []) if isinstance(item, str) and item.strip()
+    ]
+    if noted_slots:
+        return list(dict.fromkeys(noted_slots))
+    return _slot_ids_from_claim_category(claim_score.claim_category, query=query)
+
+
+def _claim_review_decision(notes: dict[str, object]) -> dict[str, object]:
+    review = notes.get("llm_claim_review")
+    return review if isinstance(review, dict) else {}
+
+
+def _claim_focus_matches_query(statement: str, *, query: str) -> bool:
+    required_terms = _query_required_focus_terms(query)
+    if not required_terms:
+        return True
+    statement_tokens = set(_tokenize_focus(statement))
+    statement_lower = statement.lower()
+    return any(
+        term in statement_tokens or term.replace("-", " ") in statement_lower
+        for term in required_terms
+    )
+
+
+def _claim_focus_required_for_report(*, query: str, slot_ids: list[str]) -> bool:
+    intent = classify_query_intent(query)
+    if intent.intent_name == "deployment" and any(
+        slot_id.startswith("deployment_") for slot_id in slot_ids
+    ):
+        return False
+    return True
+
+
+def _event_or_announcement_noise_claim(statement: str, *, query: str) -> bool:
+    query_lower = query.lower()
+    if any(marker in query_lower for marker in _EVENT_QUERY_MARKERS):
+        return False
+    statement_lower = statement.lower()
+    return any(marker in statement_lower for marker in _EVENT_OR_ANNOUNCEMENT_MARKERS)
+
+
+def _query_required_focus_terms(query: str) -> set[str]:
+    terms: list[str] = []
+    words = re.findall(r"[A-Za-z0-9_.-]+", query)
+    lowered = [word.lower() for word in words]
+    for index, token in enumerate(lowered):
+        if token in {"compare", "comparison"}:
+            terms.extend(_following_focus_terms(words[index + 1 :], stop_at={"for", "in"}))
+            break
+        if token in {"what"} and index + 1 < len(lowered) and lowered[index + 1] in {"is", "are"}:
+            terms.extend(
+                _following_focus_terms(
+                    words[index + 2 :], stop_at={"and", "for", "in", "of", "with"}
+                )
+            )
+        if token == "how" and index + 2 < len(lowered) and lowered[index + 1] in {"does", "do"}:
+            terms.extend(_following_focus_terms(words[index + 2 :], stop_at={"work", "works"}))
+    terms.extend(
+        word.lower()
+        for word in words
+        if (
+            (word[:1].isupper() or any(char.isdigit() for char in word))
+            and word.lower() not in _QUERY_FOCUS_STOPWORDS
+        )
+    )
+    return {
+        term
+        for term in dict.fromkeys(terms)
+        if len(term) >= 3 and term not in _QUERY_FOCUS_STOPWORDS
+    }
+
+
+def _following_focus_terms(words: list[str], *, stop_at: set[str]) -> list[str]:
+    terms: list[str] = []
+    for word in words[:6]:
+        lowered = word.lower()
+        if lowered in stop_at:
+            break
+        if lowered in _QUERY_FOCUS_STOPWORDS:
+            continue
+        terms.append(lowered)
+        if word[:1].isupper() or any(char.isdigit() for char in word):
+            continue
+        if len(terms) >= 1:
+            break
+    return terms
+
+
+def _tokenize_focus(value: str) -> list[str]:
+    return [token.lower() for token in re.findall(r"[A-Za-z0-9_.-]+", value)]
 
 
 def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | None:
@@ -776,6 +1069,7 @@ def _evidence_candidate_from_claim(
             "claim_id": str(claim.claim_id),
             "verification_status": claim.verification_status,
             "support_level": claim.support_level,
+            "evidence_kind": claim.evidence_kind,
         },
     }
 

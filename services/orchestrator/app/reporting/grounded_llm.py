@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any
@@ -18,10 +19,17 @@ from services.orchestrator.app.reporting.markdown import (
     ReportSourceItem,
     build_report_title,
 )
+from services.orchestrator.app.research_quality import (
+    answer_slots_for_query,
+    build_slot_coverage_summary,
+)
 
 
 class GroundedLLMReportValidationError(ValueError):
     pass
+
+
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,7 @@ def render_grounded_llm_report(
     llm_provider: LLMProvider,
     llm_model: str,
     max_output_tokens: int,
+    include_ledger_debug_appendix: bool = False,
 ) -> GroundedLLMReport:
     normalized_language = normalize_report_language(report_language)
     grounded_claims = _grounded_claims(claims)
@@ -93,6 +102,7 @@ def render_grounded_llm_report(
         report_language=normalized_language,
         answer_relevant_claim_count=answer_relevant_claim_count,
         excluded_low_quality_claim_count=excluded_low_quality_claim_count,
+        include_ledger_debug_appendix=include_ledger_debug_appendix,
     )
     metadata: dict[str, object] = {
         "mode": "llm_grounded",
@@ -102,11 +112,13 @@ def render_grounded_llm_report(
         "raw_response_id": response.raw_response_id,
         "finish_reason": response.finish_reason,
         "usage": response.usage or {},
+        "report_language": normalized_language,
         "input_claim_count": len(grounded_claims),
         "input_claim_evidence_count": sum(
             len(claim.support_evidence) + len(claim.contradict_evidence)
             for claim in grounded_claims
         ),
+        "include_ledger_debug_appendix": include_ledger_debug_appendix,
     }
     return GroundedLLMReport(rendered=rendered, metadata=metadata)
 
@@ -150,6 +162,18 @@ def _build_grounding_bundle(
             "Use supported claims as settled findings only when support_level is not weak.",
             "Use mixed or unsupported claims only in uncertainty sections.",
             "Every item must include claim_ids and claim_evidence_ids from this bundle.",
+            "For deployment questions, organize evidence by prerequisites, Docker run or "
+            "Compose, volumes, ports, configuration, security, troubleshooting, and update "
+            "or maintenance when verified claims for those slots exist.",
+            "If a deployment section lacks verified command or configuration evidence, list "
+            "that as a coverage gap instead of inventing commands.",
+        ],
+        "answer_slots": [
+            {
+                **slot.to_payload(),
+                "status": _slot_status_for_bundle(slot.slot_id, claims=claims),
+            }
+            for slot in answer_slots_for_query(research_question)
         ],
         "verified_claims": [_serialize_claim(claim) for claim in claims],
         "sources": [
@@ -170,6 +194,9 @@ def _serialize_claim(claim: ReportClaimItem) -> dict[str, object]:
         "statement": claim.statement,
         "verification_status": claim.verification_status,
         "claim_category": claim.claim_category,
+        "slot_ids": list(claim.slot_ids),
+        "evidence_kind": claim.evidence_kind,
+        "deployment_evidence_excerpt": claim.deployment_evidence_excerpt,
         "support_level": claim.support_level,
         "confidence": claim.confidence,
         "rationale": claim.rationale,
@@ -209,8 +236,13 @@ def _render_validated_llm_payload(
     report_language: str,
     answer_relevant_claim_count: int,
     excluded_low_quality_claim_count: int,
+    include_ledger_debug_appendix: bool,
 ) -> RenderedMarkdownReport:
     labels = _labels(report_language)
+    if is_chinese_report_language(report_language) and not _payload_contains_cjk(payload):
+        raise GroundedLLMReportValidationError(
+            "LLM report response did not follow the requested Chinese report language"
+        )
     evidence_by_id, citation_by_evidence_id, claim_by_id, evidence_claim_id = _allowed_ids(claims)
 
     executive_items = _validated_items(
@@ -271,6 +303,15 @@ def _render_validated_llm_payload(
     else:
         lines.append(f"- {labels['no_section_items']}")
 
+    deployment_slot_lines = _render_deployment_slot_sections(
+        claims,
+        research_question=research_question,
+        labels=labels,
+    )
+    if deployment_slot_lines:
+        lines.extend(["", f"## {labels['deployment_evidence']}", ""])
+        lines.extend(deployment_slot_lines)
+
     lines.extend(["", f"## {labels['uncertainty']}", ""])
     if uncertainty_items:
         lines.extend(_render_grounded_items(uncertainty_items, labels=labels))
@@ -282,6 +323,8 @@ def _render_validated_llm_payload(
         for item in payload.get("unresolved", [])
         if isinstance(item, str) and item.strip()
     ]
+    unresolved.extend(_coverage_gap_unresolved_items(claims, research_question, labels=labels))
+    unresolved = list(dict.fromkeys(unresolved))
     lines.extend(["", f"## {labels['unresolved']}", ""])
     if unresolved:
         for item in unresolved[:8]:
@@ -312,8 +355,9 @@ def _render_validated_llm_payload(
     lines.append("- " + labels["answer_relevant"].format(count=answer_relevant_claim_count))
     lines.append("- " + labels["excluded_claims"].format(count=excluded_low_quality_claim_count))
 
-    lines.extend(["", f"## {labels['claim_mapping']}", ""])
-    lines.extend(_render_claim_mapping(claims, labels=labels))
+    if include_ledger_debug_appendix:
+        lines.extend(["", f"## {labels['claim_mapping']}", ""])
+        lines.extend(_render_claim_mapping(claims, labels=labels))
 
     markdown = "\n".join(lines).strip() + "\n"
     return RenderedMarkdownReport(
@@ -440,17 +484,179 @@ def _allowed_ids(
     return evidence_by_id, citation_by_evidence_id, claim_by_id, evidence_claim_id
 
 
+def _render_deployment_slot_sections(
+    claims: list[ReportClaimItem],
+    *,
+    research_question: str,
+    labels: dict[str, Any],
+) -> list[str]:
+    slot_rows = _slot_coverage_rows(claims, research_question)
+    if not any(str(row.get("slot_id", "")).startswith("deployment_") for row in slot_rows):
+        return []
+
+    lines: list[str] = []
+    strong_claims = [
+        claim
+        for claim in claims
+        if claim.verification_status == "supported" and claim.support_level != "weak"
+    ]
+    for slot in answer_slots_for_query(research_question):
+        if not slot.slot_id.startswith("deployment_"):
+            continue
+        slot_label = _localized_slot_label(slot.label, labels=labels)
+        lines.extend([f"### {slot_label}", ""])
+        slot_claims = [claim for claim in strong_claims if slot.slot_id in set(claim.slot_ids)]
+        if slot_claims:
+            for claim in slot_claims:
+                lines.extend(_render_deployment_claim_lines(claim, labels=labels))
+        else:
+            lines.append("- " + labels["deployment_slot_gap"].format(slot=slot_label))
+        lines.append("")
+    return lines
+
+
+def _coverage_gap_unresolved_items(
+    claims: list[ReportClaimItem],
+    research_question: str,
+    *,
+    labels: dict[str, Any],
+) -> list[str]:
+    gaps: list[str] = []
+    for row in _slot_coverage_rows(claims, research_question):
+        slot_id = str(row.get("slot_id", ""))
+        if not slot_id.startswith("deployment_"):
+            continue
+        if row.get("status") in {"missing", "weak"}:
+            gaps.append(
+                labels["deployment_coverage_gap"].format(
+                    slot=_localized_slot_label(str(row.get("label") or slot_id), labels=labels),
+                    status=row.get("status"),
+                )
+            )
+    return gaps
+
+
+def _slot_coverage_rows(
+    claims: list[ReportClaimItem],
+    research_question: str,
+) -> list[dict[str, Any]]:
+    return build_slot_coverage_summary(
+        research_question,
+        evidence_candidates=[],
+        claim_rows=[
+            {
+                "claim_id": str(claim.claim_id),
+                "verification_status": claim.verification_status,
+                "slot_ids": list(claim.slot_ids),
+                "source_document_id": (
+                    str(claim.support_evidence[0].source_document_id)
+                    if claim.support_evidence
+                    else None
+                ),
+                "support_level": claim.support_level,
+            }
+            for claim in claims
+        ],
+    )
+
+
+def _slot_status_for_bundle(slot_id: str, *, claims: list[ReportClaimItem]) -> str:
+    for claim in claims:
+        if (
+            slot_id in set(claim.slot_ids)
+            and claim.verification_status == "supported"
+            and claim.support_level != "weak"
+        ):
+            return "covered"
+    for claim in claims:
+        if slot_id in set(claim.slot_ids) and claim.verification_status == "supported":
+            return "weak"
+    return "missing"
+
+
+def _localized_slot_label(label: str, *, labels: dict[str, Any]) -> str:
+    mapping = labels.get("slot_label_mapping")
+    if isinstance(mapping, dict):
+        value = mapping.get(label)
+        if isinstance(value, str) and value:
+            return value
+    return label
+
+
+def _render_deployment_claim_lines(
+    claim: ReportClaimItem,
+    *,
+    labels: dict[str, Any],
+) -> list[str]:
+    source_urls = list(
+        dict.fromkeys(evidence.canonical_url for evidence in claim.support_evidence[:2])
+    )
+    trace = f"({'; '.join(source_urls)})" if source_urls else ""
+    code_block = _deployment_code_block_for_claim(claim)
+    if code_block is None:
+        return [f"- {claim.statement} {trace}"]
+    return [
+        f"- {_deployment_statement_intro(claim.statement, code_block=code_block)} {trace}",
+        "",
+        "```",
+        code_block,
+        "```",
+    ]
+
+
+def _deployment_code_block_for_claim(claim: ReportClaimItem) -> str | None:
+    if claim.evidence_kind != "deployment_code_or_config":
+        return None
+    candidates = [
+        _deployment_code_block_from_statement(claim.statement),
+        claim.deployment_evidence_excerpt,
+        *(evidence.excerpt for evidence in claim.support_evidence),
+    ]
+    code_blocks = [
+        _strip_markdown_code_fence(candidate).strip()
+        for candidate in candidates
+        if candidate and candidate.strip()
+    ]
+    if code_blocks:
+        return max(code_blocks, key=lambda item: len(re.sub(r"\s+", " ", item).strip()))
+    return None
+
+
+def _deployment_code_block_from_statement(statement: str) -> str | None:
+    match = re.search(r":\s*`(.+)`\.$", statement, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _strip_markdown_code_fence(value: str) -> str:
+    lines = value.strip().splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith(("```", "~~~")):
+        fence = lines[0].strip()[:3]
+        if lines[-1].strip().startswith(fence):
+            return "\n".join(lines[1:-1]).strip()
+    return value.strip()
+
+
+def _deployment_statement_intro(statement: str, *, code_block: str | None = None) -> str:
+    normalized_statement = re.sub(r"\s+", " ", statement).strip()
+    if code_block and len(normalized_statement) <= 320:
+        return normalized_statement
+    code_from_statement = _deployment_code_block_from_statement(statement)
+    if (
+        code_from_statement
+        and code_block
+        and re.sub(r"\s+", " ", code_from_statement).strip()
+        == re.sub(r"\s+", " ", code_block).strip()
+    ):
+        return normalized_statement
+    return statement.split(":", 1)[0].strip() + ":"
+
+
 def _render_grounded_items(items: list[_GroundedItem], *, labels: dict[str, str]) -> list[str]:
     lines: list[str] = []
     for item in items:
-        lines.append(
-            f"- {item.text} "
-            f"({labels['claims']}: {', '.join(f'`{claim_id}`' for claim_id in item.claim_ids)}; "
-            f"{labels['claim_evidence']}: "
-            f"{', '.join(f'`{evidence_id}`' for evidence_id in item.claim_evidence_ids)}; "
-            f"{labels['citations']}: "
-            f"{', '.join(f'`{citation_id}`' for citation_id in item.citation_span_ids)})"
-        )
+        lines.append(f"- {item.text}")
     return lines
 
 
@@ -487,7 +693,7 @@ def _render_claim_mapping(
                 f" | {labels['chunk']} `{evidence.source_chunk_id}` #{evidence.chunk_no}"
                 f" | {labels['offsets']} `{evidence.start_offset}:{evidence.end_offset}`"
                 f" | {evidence.canonical_url}"
-                f" | {labels['excerpt']}: \"{evidence.excerpt}\""
+                f' | {labels["excerpt"]}: "{evidence.excerpt}"'
             )
     return lines or [labels["no_mappings"]]
 
@@ -516,6 +722,26 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
+def _payload_contains_cjk(payload: dict[str, Any]) -> bool:
+    def iter_strings(value: object) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            strings: list[str] = []
+            for nested_value in value.values():
+                strings.extend(iter_strings(nested_value))
+            return strings
+        if isinstance(value, list):
+            strings = []
+            for item in value:
+                strings.extend(iter_strings(item))
+            return strings
+        return []
+
+    prose = " ".join(iter_strings(payload))
+    return _CJK_PATTERN.search(prose) is not None
+
+
 def _strip_code_fence(text: str) -> str:
     lines = text.splitlines()
     if lines and lines[0].strip().startswith("```"):
@@ -537,7 +763,7 @@ def _string_or_none(value: object) -> str | None:
     return None
 
 
-def _labels(report_language: str) -> dict[str, str]:
+def _labels(report_language: str) -> dict[str, Any]:
     if is_chinese_report_language(report_language):
         return {
             "answer_relevant": "已纳入与问题相关的 claim：{count}。",
@@ -552,17 +778,21 @@ def _labels(report_language: str) -> dict[str, str]:
             "claim_evidence": "claim_evidence",
             "claim_mapping": "附录：claim/evidence/citation 映射",
             "claims": "claims",
+            "deployment_coverage_gap": (
+                "覆盖缺口：`{slot}` 当前为 `{status}`，没有可渲染的强支持证据。"
+            ),
+            "deployment_evidence": "部署证据覆盖",
+            "deployment_slot_gap": "`{slot}` 暂无强支持命令或配置证据。",
             "evidence_sources": "带证据链接的来源文档：{count} 个；域名：{domains}。",
             "excluded_claims": "已排除低质量或偏离问题的 claim：{count}。",
             "excerpt": "摘录",
             "executive_summary": "执行摘要",
             "generated": (
-                "_由 grounded LLM report writer 基于 research_task `{task_id}` "
-                "revision `{revision_no}` 生成。_"
+                "_由 grounded LLM report writer 基于已持久化证据在 revision `{revision_no}` 生成。_"
             ),
             "key_findings": "关键结论",
             "llm_generation": (
-                "LLM 只接收已验证 claim、claim_evidence 和 citation span 摘录；"
+                "LLM 只接收已验证 claim、证据记录和 citation span 摘录；"
                 "所有输出条目均通过 id 校验。"
             ),
             "no_citation_spans": "未记录 citation span。",
@@ -577,8 +807,18 @@ def _labels(report_language: str) -> dict[str, str]:
             "source": "source",
             "source_scope": "来源范围与限制",
             "source_scope_strict": (
-                "本报告严格由已持久化的 claim、evidence 和 citation span 综合，" "不使用外部事实。"
+                "本报告严格由已持久化的 claim、evidence 和 citation span 综合，不使用外部事实。"
             ),
+            "slot_label_mapping": {
+                "Prerequisites": "前置条件",
+                "Docker run / Docker Compose": "Docker run / Docker Compose",
+                "Volumes": "卷挂载",
+                "Ports": "端口",
+                "Configuration": "配置",
+                "Security": "安全",
+                "Troubleshooting": "故障排查",
+                "Update / maintenance": "更新 / 维护",
+            },
             "uncertainty": "冲突 / 不确定性",
             "unresolved": "未解决问题",
         }
@@ -595,17 +835,25 @@ def _labels(report_language: str) -> dict[str, str]:
         "claim_evidence": "claim_evidence",
         "claim_mapping": "Appendix: Claim Evidence Mapping",
         "claims": "claims",
+        "deployment_coverage_gap": (
+            "Coverage gap: `{slot}` is currently `{status}` with no renderable strongly "
+            "supported evidence."
+        ),
+        "deployment_evidence": "Deployment Evidence Coverage",
+        "deployment_slot_gap": (
+            "No strongly supported command or configuration evidence for `{slot}`."
+        ),
         "evidence_sources": "Evidence-linked source documents: {count} across domains: {domains}.",
         "excluded_claims": "Excluded low-quality or off-query claims: {count}.",
         "excerpt": "excerpt",
         "executive_summary": "Executive Summary",
         "generated": (
-            "_Generated by grounded LLM report writer from research task `{task_id}` "
-            "at revision `{revision_no}`._"
+            "_Generated by grounded LLM report writer from persisted evidence at revision "
+            "`{revision_no}`._"
         ),
         "key_findings": "Key Findings",
         "llm_generation": (
-            "The LLM received only verified claims, claim_evidence rows, and citation "
+            "The LLM received only verified claims, claim evidence records, and citation "
             "span excerpts; every output item passed id validation."
         ),
         "no_citation_spans": "No citation spans recorded.",

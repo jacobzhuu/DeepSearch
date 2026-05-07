@@ -57,6 +57,7 @@ def get_report_synthesis_service(
         llm_model=settings.llm_model,
         llm_report_writer_enabled=llm_provider is not None,
         llm_report_max_output_tokens=settings.llm_report_max_output_tokens,
+        include_ledger_debug_appendix=settings.report_include_ledger_debug_appendix,
     )
 
 

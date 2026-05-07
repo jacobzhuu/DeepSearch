@@ -357,6 +357,193 @@ def test_claim_drafting_service_excludes_ineligible_quality_chunks(
     assert claims[0].statement.startswith("SearXNG is a free internet metasearch engine")
 
 
+def test_claim_drafting_service_extracts_specific_deployment_slots_from_docs(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/admin/installation-docker",
+            domain="docs.searxng.org",
+            title="Installation container",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 5, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "This section is intended for advanced users.\n\n"
+                "The host requires Docker or Podman and users may need the docker group.\n\n"
+                "Use a reverse proxy with certificates and limiter bot protection before "
+                "exposing a public SearXNG instance.\n\n"
+                "Configure core-config/settings.yml, .env, SEARXNG_SECRET, and "
+                "SEARXNG_BASE_URL for the container deployment.\n\n"
+                "Install custom certificates before exposing a public_instance through the "
+                "reverse proxy.\n\n"
+                "Update SearXNG by running docker compose pull and reviewing new templates.\n\n"
+                "Use docker compose logs and docker compose exec searxng sh for troubleshooting."
+            ),
+            token_count=80,
+            metadata_json={"eligible_for_claims": True, "content_quality_score": 0.95},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=10,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=10,
+    )
+
+    notes_by_statement = {entry.claim.statement: entry.claim.notes_json for entry in result.entries}
+    combined_slots = {
+        slot_id for notes in notes_by_statement.values() for slot_id in notes.get("slot_ids", [])
+    }
+
+    assert "deployment_prerequisites" in combined_slots
+    assert "deployment_configuration" in combined_slots
+    assert "deployment_security" in combined_slots
+    assert "deployment_update_maintenance" in combined_slots
+    assert "deployment_troubleshooting" in combined_slots
+    assert any("SEARXNG_SECRET" in statement for statement in notes_by_statement)
+    assert any("custom certificates" in statement for statement in notes_by_statement)
+    assert not any(
+        notes.get("slot_ids")
+        for statement, notes in notes_by_statement.items()
+        if "advanced users" in statement.lower()
+    )
+
+
+def test_claim_drafting_service_prioritizes_deployment_slot_coverage_with_product_limit(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/admin/installation-docker",
+            domain="docs.searxng.org",
+            title="Installation container",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 6, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    command_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "$ docker run --name searxng -d \\\n"
+                "    -p 8888:8080 \\\n"
+                '    -v "./config/:/etc/searxng/" \\\n'
+                '    -v "./data/:/var/cache/searxng/" \\\n'
+                "    docker.io/searxng/searxng:latest\n\n"
+                "FORCE_OWNERSHIP=1\n\n"
+                "Use docker compose logs and docker compose exec searxng sh for troubleshooting."
+            ),
+            token_count=52,
+            metadata_json={
+                "eligible_for_claims": True,
+                "content_quality_score": 0.95,
+                "quality_reasons": ["deployment_code_or_config"],
+            },
+        )
+    )
+    operations_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=1,
+            text=(
+                "The host requires Docker or Podman, and operators can run sudo usermod -aG "
+                "docker $USER when they need Docker group access.\n\n"
+                "Configure settings.yml, .env, .env.example, SEARXNG_SECRET, and "
+                "SEARXNG_BASE_URL for the container deployment.\n\n"
+                "Use a reverse proxy with certificates and limiter bot protection before "
+                "exposing a public SearXNG instance.\n\n"
+                "Update SearXNG by running docker compose pull and reviewing new templates."
+            ),
+            token_count=72,
+            metadata_json={
+                "eligible_for_claims": True,
+                "content_quality_score": 0.95,
+                "quality_reasons": ["deployment_code_or_config"],
+            },
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=8,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[command_chunk.id, operations_chunk.id],
+        limit=8,
+    )
+
+    statements = [entry.claim.statement for entry in result.entries]
+    combined_slots = {
+        slot_id
+        for entry in result.entries
+        for slot_id in entry.claim.notes_json.get("slot_ids", [])
+    }
+
+    assert len(result.entries) >= 6
+    assert {
+        "deployment_prerequisites",
+        "deployment_run_or_compose",
+        "deployment_configuration",
+        "deployment_security",
+        "deployment_troubleshooting",
+        "deployment_update_maintenance",
+    }.issubset(combined_slots)
+    assert any("sudo usermod -aG docker" in statement for statement in statements)
+    assert any(
+        "settings.yml" in statement and "SEARXNG_SECRET" in statement for statement in statements
+    )
+    assert any("reverse proxy" in statement and "limiter" in statement for statement in statements)
+    assert any("docker compose pull" in statement for statement in statements)
+    assert not any(
+        "root" in statement.lower() and "deployment_security" in entry.claim.notes_json["slot_ids"]
+        for entry, statement in zip(result.entries, statements, strict=False)
+    )
+
+
 def test_claim_drafting_service_ranks_query_answer_candidates_over_cta_text(
     db_session: Session,
 ) -> None:

@@ -22,6 +22,7 @@ from services.orchestrator.app.claims import (
     CLAIM_VERIFICATION_STATUS_CONTRADICTED,
     CLAIM_VERIFICATION_STATUS_DRAFT,
     CLAIM_VERIFICATION_STATUS_MIXED,
+    CLAIM_VERIFICATION_STATUS_SUPPORTED,
 )
 from services.orchestrator.app.indexing import (
     ChunkIndexDocument,
@@ -340,6 +341,121 @@ def test_claim_verification_service_downranks_reused_chunk_for_later_claim(
     assert (
         refreshed_second.notes_json["verification"]["evidence_diversity"]["unique_chunk_count"] == 1
     )
+
+
+def test_claim_verification_service_supports_deployment_slot_evidence(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://docs.searxng.org/admin/installation-docker",
+            domain="docs.searxng.org",
+            title="Installation container",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 5, 6, 10, 0, tzinfo=UTC),
+            authority_score=0.95,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.95,
+        )
+    )
+    source_text = (
+        "The host requires Docker or Podman, and operators can run sudo usermod -aG docker "
+        "$USER when they need Docker group access.\n\n"
+        "Configure settings.yml, .env, .env.example, SEARXNG_SECRET, and SEARXNG_BASE_URL "
+        "for the container deployment.\n\n"
+        "Use a reverse proxy with certificates and limiter bot protection before exposing a "
+        "public SearXNG instance.\n\n"
+        "Update SearXNG by running docker compose pull and reviewing new templates.\n\n"
+        "Use docker compose logs and docker compose exec searxng sh for troubleshooting."
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=source_text,
+            token_count=92,
+            metadata_json={
+                "strategy": "paragraph_window_v1",
+                "content_quality_score": 0.95,
+                "eligible_for_claims": True,
+                "quality_reasons": ["deployment_code_or_config"],
+            },
+        )
+    )
+    db_session.commit()
+    backend = InMemoryChunkIndexBackend(
+        hits=[
+            _indexed_hit(
+                task_id=task.id,
+                source_document_id=source_document.id,
+                source_chunk_id=source_chunk.id,
+                canonical_url=source_document.canonical_url,
+                domain=source_document.domain,
+                text=source_text,
+                score=1.5,
+            )
+        ]
+    )
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=backend,
+        max_candidates_per_request=5,
+        verification_max_claims_per_request=5,
+        retrieval_max_results_per_request=5,
+    )
+
+    draft_result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+    verify_result = service.verify_claims(task.id, claim_ids=None, limit=5)
+
+    claims = ClaimRepository(db_session).list_for_task(task.id)
+    supported_claims = [
+        claim
+        for claim in claims
+        if claim.verification_status == CLAIM_VERIFICATION_STATUS_SUPPORTED
+    ]
+    supported_text = " ".join(claim.statement for claim in supported_claims)
+    supported_slots = {
+        slot_id for claim in supported_claims for slot_id in claim.notes_json.get("slot_ids", [])
+    }
+    support_evidence = [
+        item
+        for item in ClaimEvidenceRepository(db_session).list_for_task(task.id)
+        if item.relation_type == CLAIM_EVIDENCE_RELATION_SUPPORT
+    ]
+
+    assert len(draft_result.entries) == 5
+    assert verify_result.verified_claims == 5
+    assert len(supported_claims) == 5
+    assert {
+        "deployment_prerequisites",
+        "deployment_configuration",
+        "deployment_security",
+        "deployment_update_maintenance",
+        "deployment_troubleshooting",
+    }.issubset(supported_slots)
+    assert "Docker or Podman" in supported_text
+    assert "sudo usermod -aG docker" in supported_text
+    assert "settings.yml" in supported_text
+    assert "SEARXNG_SECRET" in supported_text
+    assert "reverse proxy" in supported_text
+    assert "docker compose pull" in supported_text
+    assert len(support_evidence) == 5
+    assert all(item.citation_span.excerpt in source_text for item in support_evidence)
 
 
 def test_claim_verification_service_rejects_paused_tasks(db_session: Session) -> None:

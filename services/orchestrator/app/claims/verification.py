@@ -8,6 +8,9 @@ from services.orchestrator.app.claims.drafting import (
     CitationSpanValidationError,
     SupportingSpan,
     is_claimable_excerpt,
+    is_deployment_evidence_excerpt,
+    is_deployment_evidence_statement,
+    iter_deployment_evidence_spans,
     iter_supporting_spans,
     validate_citation_span,
 )
@@ -132,8 +135,15 @@ def select_verification_span(source_text: str, statement: str) -> VerificationSp
         raise CitationSpanValidationError("verification statement must not be blank")
 
     best_match: tuple[tuple[float, ...], VerificationSpanMatch] | None = None
-    for span in _iter_verification_candidate_spans(source_text):
-        if not is_claimable_excerpt(span.excerpt):
+    deployment_evidence_statement = is_deployment_evidence_statement(normalized_statement)
+    for span in _iter_verification_candidate_spans(
+        source_text,
+        include_deployment_evidence=deployment_evidence_statement,
+    ):
+        if deployment_evidence_statement:
+            if not is_deployment_evidence_excerpt(span.excerpt):
+                continue
+        elif not is_claimable_excerpt(span.excerpt):
             continue
         classified = _classify_relation(statement=normalized_statement, excerpt=span.excerpt)
         if classified is None:
@@ -183,15 +193,30 @@ def select_verification_span(source_text: str, statement: str) -> VerificationSp
             excerpt=span.excerpt,
         )
         precision_rank = _citation_precision_rank(citation_precision)
-        candidate_key = (
-            relation_rank,
-            precision_rank,
-            specificity_score,
-            evidence_score,
-            overlap_ratio,
-            -min(len(_normalize_whitespace(span.excerpt)), 720) / 720,
-            -span.start_offset,
-        )
+        if deployment_evidence_statement:
+            deployment_coverage = _deployment_statement_coverage(
+                statement=normalized_statement,
+                excerpt=span.excerpt,
+            )
+            candidate_key = (
+                relation_rank,
+                deployment_coverage,
+                specificity_score,
+                evidence_score,
+                overlap_ratio,
+                min(len(_normalize_whitespace(span.excerpt)), 4000) / 4000,
+                -span.start_offset,
+            )
+        else:
+            candidate_key = (
+                relation_rank,
+                precision_rank,
+                specificity_score,
+                evidence_score,
+                overlap_ratio,
+                -min(len(_normalize_whitespace(span.excerpt)), 720) / 720,
+                -span.start_offset,
+            )
         if best_match is None or candidate_key > best_match[0]:
             best_match = (candidate_key, candidate)
 
@@ -200,13 +225,26 @@ def select_verification_span(source_text: str, statement: str) -> VerificationSp
     return best_match[1]
 
 
-def _iter_verification_candidate_spans(source_text: str) -> tuple[SupportingSpan, ...]:
+def _iter_verification_candidate_spans(
+    source_text: str,
+    *,
+    include_deployment_evidence: bool = False,
+) -> tuple[SupportingSpan, ...]:
     sentence_spans = tuple(iter_supporting_spans(source_text))
-    if len(sentence_spans) <= 1:
+    deployment_spans = (
+        tuple(iter_deployment_evidence_spans(source_text)) if include_deployment_evidence else ()
+    )
+    if len(sentence_spans) <= 1 and not deployment_spans:
         return sentence_spans
 
     candidates: list[SupportingSpan] = list(sentence_spans)
     seen_offsets = {(span.start_offset, span.end_offset) for span in sentence_spans}
+    for span in deployment_spans:
+        key = (span.start_offset, span.end_offset)
+        if key in seen_offsets:
+            continue
+        candidates.append(span)
+        seen_offsets.add(key)
     for left, right in zip(sentence_spans, sentence_spans[1:], strict=False):
         gap = source_text[left.end_offset : right.start_offset]
         if len(gap) > 120:
@@ -458,6 +496,29 @@ def _specificity_score(*, statement: str, excerpt: str) -> float:
         signal_score += 0.12
 
     return round(min(1.0, (token_score * 0.72) + signal_score), 4)
+
+
+def _deployment_statement_coverage(*, statement: str, excerpt: str) -> float:
+    expected_excerpt = _deployment_statement_expected_excerpt(statement)
+    normalized_excerpt = _normalize_whitespace(excerpt).lower()
+    if not expected_excerpt or not normalized_excerpt:
+        return 0.0
+    if normalized_excerpt == expected_excerpt:
+        return 1.0
+    if normalized_excerpt in expected_excerpt:
+        return round(len(normalized_excerpt) / max(len(expected_excerpt), 1), 4)
+    expected_tokens = set(_tokenize(expected_excerpt))
+    excerpt_tokens = set(_tokenize(normalized_excerpt))
+    if not expected_tokens:
+        return 0.0
+    return round(len(expected_tokens & excerpt_tokens) / len(expected_tokens), 4)
+
+
+def _deployment_statement_expected_excerpt(statement: str) -> str:
+    match = re.search(r":\s*`(.+)`\.$", statement, flags=re.DOTALL)
+    if match:
+        return _normalize_whitespace(match.group(1)).lower()
+    return _normalize_whitespace(statement).lower()
 
 
 def _normalize_whitespace(value: str) -> str:

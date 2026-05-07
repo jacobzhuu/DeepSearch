@@ -1002,6 +1002,20 @@ class ClaimDraftingService:
                         covered_slots.update(candidate.evidence_slot_ids)
                         break
 
+        if _query_needs_source_balanced_candidates(query):
+            covered_source_documents = {
+                candidate.source_chunk.source_document_id for candidate in selected
+            }
+            for candidate in candidates:
+                if len(selected) >= limit:
+                    break
+                if candidate.source_chunk.source_document_id in covered_source_documents:
+                    continue
+                if not candidate.score.answer_relevant:
+                    continue
+                if add_candidate(candidate, enforce_paragraph_diversity=True):
+                    covered_source_documents.add(candidate.source_chunk.source_document_id)
+
         for category in intent.expected_claim_types:
             for candidate in candidates:
                 if candidate.score.claim_category == category and add_candidate(
@@ -1142,11 +1156,12 @@ class ClaimDraftingService:
         limit: int,
     ) -> list[Claim]:
         if claim_ids is None:
-            return self.claim_repository.list_for_task(
+            claims = self.claim_repository.list_for_task(
                 task_id,
                 verification_status=CLAIM_VERIFICATION_STATUS_DRAFT,
                 limit=limit,
             )
+            return [claim for claim in claims if not _llm_claim_review_rejected(claim)]
 
         selected = self.claim_repository.list_by_ids_for_task(task_id, claim_ids)
         selected_by_id = {item.id: item for item in selected}
@@ -1158,6 +1173,8 @@ class ClaimDraftingService:
             claim = selected_by_id.get(claim_id)
             if claim is None:
                 raise ClaimNotFoundError(task_id, claim_id)
+            if _llm_claim_review_rejected(claim):
+                continue
             ordered_claims.append(claim)
             seen_ids.add(claim_id)
             if len(ordered_claims) >= limit:
@@ -1679,6 +1696,26 @@ def _deployment_claim_limit_for_query(query: str) -> int:
     )
     marker_group_count = len(_deployment_required_marker_groups_for_query(query))
     return max(deployment_slot_count + 8, marker_group_count + 4)
+
+
+def _query_needs_source_balanced_candidates(query: str) -> bool:
+    lower = query.lower()
+    if any(term in lower for term in ("compare", "comparison", " versus ", " vs ")):
+        return True
+    if "how does" in lower or "how do" in lower:
+        return True
+    return False
+
+
+def _llm_claim_review_rejected(claim: Claim) -> bool:
+    notes = claim.notes_json or {}
+    review = notes.get("llm_claim_review")
+    if not isinstance(review, dict):
+        return False
+    decision = review.get("decision")
+    confidence = review.get("confidence")
+    confidence_value = float(confidence) if isinstance(confidence, int | float) else 0.0
+    return decision in {"reject", "duplicate", "vague"} and confidence_value >= 0.65
 
 
 def _deployment_required_marker_groups_for_query(query: str) -> tuple[tuple[str, ...], ...]:

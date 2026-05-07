@@ -27,6 +27,14 @@ from services.orchestrator.app.research_quality.gap_analyzer import (
     SupplementalSearchQuery,
     analyze_required_slot_gaps,
 )
+from services.orchestrator.app.research_quality.llm_assistance import (
+    ClaimReviewResult,
+    EvidenceRerankResult,
+    LLMClaimReviewService,
+    LLMEvidenceRerankerService,
+    LLMQueryRewriterService,
+    QueryRewriteResult,
+)
 from services.orchestrator.app.research_quality.source_intent import (
     SourceIntentClassification,
     classify_source_intent,
@@ -47,6 +55,11 @@ __all__ = [
     "EvidenceCandidate",
     "EvidenceYieldSummary",
     "GapAnalysisResult",
+    "ClaimReviewResult",
+    "EvidenceRerankResult",
+    "LLMClaimReviewService",
+    "LLMEvidenceRerankerService",
+    "LLMQueryRewriterService",
     "QUALITY_DIAGNOSTIC_FIELDS",
     "SlotCoverageSummary",
     "SourceIntentClassification",
@@ -55,6 +68,7 @@ __all__ = [
     "SourceJudgeService",
     "SourceYieldSummary",
     "SupplementalSearchQuery",
+    "QueryRewriteResult",
     "analyze_required_slot_gaps",
     "answer_slot_coverage",
     "answer_slots_for_query",

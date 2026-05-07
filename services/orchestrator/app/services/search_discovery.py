@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -23,6 +24,10 @@ from services.orchestrator.app.search import (
     SearchRequest,
     canonicalize_url,
     is_domain_allowed,
+)
+from services.orchestrator.app.search.known_sources import (
+    candidate_matches_query_subject,
+    resolve_authoritative_source_candidates,
 )
 from services.orchestrator.app.services.research_tasks import (
     PHASE2_ACTIVE_STATUS,
@@ -95,6 +100,7 @@ class SearchDiscoveryService:
         *,
         planned_search_queries: list[PlannedSearchQuery] | None = None,
         include_default_expansions: bool = True,
+        include_authoritative_source_resolver: bool = True,
     ) -> SearchDiscoveryResult:
         task = self._get_task(task_id)
         if task.status not in self.allowed_statuses:
@@ -111,24 +117,52 @@ class SearchDiscoveryService:
             raise ValueError(f"task {task.id} does not have a valid searchable query")
 
         run = self._get_or_create_current_run(task)
-        existing_candidates = {
-            candidate.canonical_url
-            for candidate in self.candidate_url_repository.list_for_task(task.id)
-        }
+        existing_candidate_rows = self.candidate_url_repository.list_for_task(task.id)
+        existing_candidates = {candidate.canonical_url for candidate in existing_candidate_rows}
         discovered_candidates: list[CandidateUrl] = []
         persisted_queries: list[PersistedSearchQuery] = []
         duplicates_skipped = 0
         filtered_out = 0
-        remaining_slots = _resolve_total_candidate_limit(
-            constraints.get("max_urls"),
-            default_limit=self.max_results_per_query * len(expanded_queries),
+        remaining_slots = _resolve_explicit_candidate_limit(constraints.get("max_urls"))
+        last_provider_error: SearchProviderError | None = None
+
+        resolver_result = (
+            self._inject_authoritative_source_candidates(
+                task=task,
+                run=run,
+                expanded_queries=expanded_queries,
+                existing_candidates=existing_candidates,
+                constraints=constraints,
+                max_candidates=remaining_slots,
+            )
+            if include_authoritative_source_resolver
+            else None
         )
+        if resolver_result is not None:
+            persisted_queries.append(resolver_result)
+            duplicates_skipped += resolver_result.duplicates_skipped
+            filtered_out += resolver_result.filtered_out
+            if remaining_slots is not None:
+                remaining_slots -= resolver_result.candidates_added
+            discovered_candidates.extend(
+                [
+                    candidate
+                    for candidate in self.candidate_url_repository.list_for_task(task.id)
+                    if candidate.search_query_id == resolver_result.search_query.id
+                    and (candidate.metadata_json or {}).get("candidate_source")
+                    == "authoritative_source_resolver"
+                ]
+            )
 
         for query_index, expanded_query in enumerate(expanded_queries, start=1):
-            if remaining_slots <= 0:
+            if remaining_slots is not None and remaining_slots <= 0:
                 break
 
-            request_limit = min(self.max_results_per_query, remaining_slots)
+            request_limit = (
+                self.max_results_per_query
+                if remaining_slots is None
+                else min(self.max_results_per_query, remaining_slots)
+            )
             try:
                 provider_response = self.search_provider.search(
                     SearchRequest(
@@ -139,6 +173,8 @@ class SearchDiscoveryService:
                     )
                 )
             except SearchProviderError as error:
+                last_provider_error = error
+                available_candidate_count = len(existing_candidates)
                 fallback_candidates = (
                     _known_path_candidates_for_query(
                         query=task.query,
@@ -152,14 +188,37 @@ class SearchDiscoveryService:
                     else []
                 )
                 if not fallback_candidates:
-                    error.details = _search_provider_failure_diagnostics(
+                    can_try_later_query = query_index < len(expanded_queries)
+                    diagnostics = _search_provider_failure_diagnostics(
                         expanded_queries=expanded_queries,
                         failed_query=expanded_query,
                         query_count_attempted=query_index,
                         error=error,
                         fallback_applied=False,
                         fallback_candidate_count=0,
+                        available_candidate_count=available_candidate_count,
+                        tolerated=available_candidate_count > 0 or can_try_later_query,
                     )
+                    if available_candidate_count > 0 or can_try_later_query:
+                        search_query = self._persist_failed_search_query(
+                            task=task,
+                            run=run,
+                            expanded_query=expanded_query,
+                            error=error,
+                            diagnostics=diagnostics,
+                        )
+                        persisted_queries.append(
+                            PersistedSearchQuery(
+                                search_query=search_query,
+                                candidates_added=0,
+                                duplicates_skipped=0,
+                                filtered_out=0,
+                            )
+                        )
+                        if can_try_later_query:
+                            continue
+                        break
+                    error.details = diagnostics
                     raise
 
                 search_query = self.search_query_repository.add(
@@ -187,6 +246,8 @@ class SearchDiscoveryService:
                                 error=error,
                                 fallback_applied=True,
                                 fallback_candidate_count=0,
+                                available_candidate_count=available_candidate_count,
+                                tolerated=True,
                             ),
                         },
                     )
@@ -203,8 +264,10 @@ class SearchDiscoveryService:
                     expansion_metadata=expanded_query.metadata,
                     candidate_source="known_path_fallback",
                     fallback_reason=error.reason,
+                    max_added=remaining_slots,
                 )
-                remaining_slots -= known_path_result.added
+                if remaining_slots is not None:
+                    remaining_slots -= known_path_result.added
                 raw_response_json = search_query.raw_response_json or {}
                 known_path_fallback = raw_response_json.get("known_path_fallback")
                 fallback_payload = (
@@ -217,6 +280,8 @@ class SearchDiscoveryService:
                 fallback_payload["known_path_fallback_filtered_out"] = (
                     known_path_result.filtered_out
                 )
+                fallback_payload["available_candidate_count"] = len(existing_candidates)
+                fallback_payload["search_provider_failure_tolerated"] = bool(existing_candidates)
                 search_query.raw_response_json = {
                     **raw_response_json,
                     "known_path_fallback": fallback_payload,
@@ -256,10 +321,32 @@ class SearchDiscoveryService:
             added_for_query = 0
             duplicates_for_query = 0
             filtered_for_query = 0
+            rejected_noisy_for_query = 0
+            accepted_provider_results = 0
+            rejected_provider_results: list[dict[str, object]] = []
             for result in provider_response.results:
                 canonical = canonicalize_url(result.url)
                 if canonical is None:
                     filtered_for_query += 1
+                    continue
+                quality_decision = _provider_result_quality_decision(
+                    result=result,
+                    canonical_url=canonical.canonical_url,
+                    domain=canonical.domain,
+                    query=task.query,
+                )
+                if not quality_decision["accepted"]:
+                    filtered_for_query += 1
+                    rejected_noisy_for_query += 1
+                    if len(rejected_provider_results) < 8:
+                        rejected_provider_results.append(
+                            {
+                                "url": canonical.canonical_url,
+                                "title": result.title,
+                                "source_engine": result.source_engine,
+                                "reason": quality_decision["reason"],
+                            }
+                        )
                     continue
                 if not is_domain_allowed(
                     canonical.domain,
@@ -297,15 +384,23 @@ class SearchDiscoveryService:
                 discovered_candidates.append(candidate)
                 existing_candidates.add(canonical.canonical_url)
                 added_for_query += 1
-                remaining_slots -= 1
-                if remaining_slots <= 0:
+                accepted_provider_results += 1
+                if remaining_slots is not None:
+                    remaining_slots -= 1
+                if remaining_slots is not None and remaining_slots <= 0:
                     break
 
-            known_path_candidates = _known_path_candidates_for_query(
-                query=task.query,
-                provider_results=provider_response.results,
-                constraints=constraints,
-            )
+            known_path_candidates = [
+                *_raw_readme_candidates_for_provider_results(
+                    provider_response.results,
+                    constraints=constraints,
+                ),
+                *_known_path_candidates_for_query(
+                    query=task.query,
+                    provider_results=provider_response.results,
+                    constraints=constraints,
+                ),
+            ]
             known_path_result = _add_known_path_candidates(
                 task=task,
                 search_query=search_query,
@@ -318,14 +413,35 @@ class SearchDiscoveryService:
                 expansion_metadata=expanded_query.metadata,
                 candidate_source="known_path_guardrail",
                 fallback_reason=None,
+                max_added=remaining_slots,
             )
             added_for_query += known_path_result.added
+            if remaining_slots is not None:
+                remaining_slots -= known_path_result.added
             duplicates_for_query += known_path_result.duplicates_skipped
             filtered_for_query += known_path_result.filtered_out
             discovered_candidates.extend(known_path_result.candidates)
 
             duplicates_skipped += duplicates_for_query
             filtered_out += filtered_for_query
+            raw_payload = dict(search_query.raw_response_json or {})
+            raw_payload["provider_result_diagnostics"] = {
+                "status": "completed",
+                "provider": provider_response.provider,
+                "query_text": expanded_query.query_text,
+                "result_count": provider_response.result_count,
+                "selected_count": accepted_provider_results,
+                "candidate_count": added_for_query,
+                "duplicate_count": duplicates_for_query,
+                "filtered_count": filtered_for_query,
+                "rejected_noisy_count": rejected_noisy_for_query,
+                "rejected_results": rejected_provider_results,
+                "known_source_candidates_injected": known_path_result.added,
+                "fallback_used": bool(
+                    (provider_response.metadata or {}).get("fallback_after_provider_error")
+                ),
+            }
+            search_query.raw_response_json = raw_payload
             persisted_queries.append(
                 PersistedSearchQuery(
                     search_query=search_query,
@@ -335,12 +451,25 @@ class SearchDiscoveryService:
                 )
             )
 
+        available_candidates = self.candidate_url_repository.list_for_task(task.id)
         self.session.commit()
+        if not available_candidates and last_provider_error is not None:
+            last_provider_error.details = _search_provider_failure_diagnostics(
+                expanded_queries=expanded_queries,
+                failed_query=expanded_queries[-1],
+                query_count_attempted=len(expanded_queries),
+                error=last_provider_error,
+                fallback_applied=False,
+                fallback_candidate_count=0,
+                available_candidate_count=0,
+                tolerated=False,
+            )
+            raise last_provider_error
         return SearchDiscoveryResult(
             task=task,
             run=run,
             search_queries=persisted_queries,
-            candidate_urls=discovered_candidates,
+            candidate_urls=discovered_candidates or available_candidates,
             duplicates_skipped=duplicates_skipped,
             filtered_out=filtered_out,
         )
@@ -388,6 +517,136 @@ class SearchDiscoveryService:
                     "phase": "search_discovery",
                 },
             )
+        )
+
+    def _persist_failed_search_query(
+        self,
+        *,
+        task: ResearchTask,
+        run: ResearchRun,
+        expanded_query: ExpandedQuery,
+        error: SearchProviderError,
+        diagnostics: dict[str, object],
+    ) -> SearchQuery:
+        return self.search_query_repository.add(
+            SearchQuery(
+                task_id=task.id,
+                run_id=run.id,
+                query_text=expanded_query.query_text,
+                provider=getattr(self.search_provider, "name", "unknown"),
+                round_no=run.round_no,
+                issued_at=datetime.now(UTC),
+                raw_response_json={
+                    "task_revision_no": task.revision_no,
+                    "expansion_kind": expanded_query.expansion_kind,
+                    "expansion_metadata": expanded_query.metadata,
+                    "source_engines": [],
+                    "response_metadata": {
+                        "provider_error": error.to_payload(),
+                        "unresponsive_engines": list(error.unresponsive_engines),
+                    },
+                    "result_count": 0,
+                    "search_provider_failure": diagnostics,
+                },
+            )
+        )
+
+    def _inject_authoritative_source_candidates(
+        self,
+        *,
+        task: ResearchTask,
+        run: ResearchRun,
+        expanded_queries: list[ExpandedQuery],
+        existing_candidates: set[str],
+        constraints: dict[str, Any],
+        max_candidates: int | None,
+    ) -> PersistedSearchQuery | None:
+        known_path_candidates = [
+            candidate.to_known_path()
+            for candidate in resolve_authoritative_source_candidates(task.query)
+        ]
+        if _query_requests_deployment_or_installation(task.query):
+            return None
+        if not known_path_candidates:
+            return None
+
+        search_query = self.search_query_repository.add(
+            SearchQuery(
+                task_id=task.id,
+                run_id=run.id,
+                query_text=f"authoritative-source-resolver: {task.query}",
+                provider="authoritative-source-resolver",
+                round_no=run.round_no,
+                issued_at=datetime.now(UTC),
+                raw_response_json={
+                    "task_revision_no": task.revision_no,
+                    "expansion_kind": "authoritative_source_resolver",
+                    "expansion_metadata": {
+                        "query_count_planned": len(expanded_queries),
+                        "resolver": "technical_authoritative_source_profiles",
+                    },
+                    "source_engines": ["authoritative-source-resolver"],
+                    "response_metadata": {
+                        "status": "completed",
+                        "provider": "authoritative-source-resolver",
+                        "known_source_candidates_injected": True,
+                    },
+                    "result_count": len(known_path_candidates),
+                },
+            )
+        )
+        add_result = _add_known_path_candidates(
+            task=task,
+            search_query=search_query,
+            known_path_candidates=known_path_candidates,
+            existing_candidates=existing_candidates,
+            candidate_url_repository=self.candidate_url_repository,
+            provider="authoritative-source-resolver",
+            query_text=task.query,
+            expansion_kind="authoritative_source_resolver",
+            expansion_metadata={
+                "query_count_planned": len(expanded_queries),
+                "resolver": "technical_authoritative_source_profiles",
+            },
+            candidate_source="authoritative_source_resolver",
+            fallback_reason=None,
+            max_added=max_candidates,
+        )
+        raw_payload = dict(search_query.raw_response_json or {})
+        raw_payload["provider_result_diagnostics"] = {
+            "status": "completed",
+            "provider": "authoritative-source-resolver",
+            "query_text": task.query,
+            "result_count": len(known_path_candidates),
+            "selected_count": add_result.added,
+            "candidate_count": add_result.added,
+            "duplicate_count": add_result.duplicates_skipped,
+            "filtered_count": add_result.filtered_out,
+            "rejected_noisy_count": 0,
+            "fallback_used": False,
+            "known_source_candidates_injected": add_result.added,
+        }
+        raw_payload["known_source_resolver"] = {
+            "status": "completed",
+            "provider": "authoritative-source-resolver",
+            "query_text": task.query,
+            "result_count": len(known_path_candidates),
+            "selected_count": add_result.added,
+            "duplicates_skipped": add_result.duplicates_skipped,
+            "filtered_out": add_result.filtered_out,
+            "candidate_source": "authoritative_source_resolver",
+            "source_classes": [
+                str(candidate.get("source_class"))
+                for candidate in known_path_candidates
+                if candidate.get("source_class")
+            ],
+        }
+        search_query.raw_response_json = raw_payload
+        return PersistedSearchQuery(
+            search_query=search_query,
+            candidates_added=add_result.added,
+            duplicates_skipped=add_result.duplicates_skipped,
+            filtered_out=add_result.filtered_out,
         )
 
     def _expand_queries(
@@ -503,6 +762,12 @@ def _resolve_total_candidate_limit(raw_limit: Any, *, default_limit: int) -> int
     return default_limit
 
 
+def _resolve_explicit_candidate_limit(raw_limit: Any) -> int | None:
+    if isinstance(raw_limit, int) and raw_limit > 0:
+        return raw_limit
+    return None
+
+
 def _known_path_candidates_for_query(
     *,
     query: str,
@@ -584,6 +849,89 @@ def _known_path_candidates_for_query(
                 },
             ]
         )
+    if _is_searxng_docker_deployment_query(query):
+        candidates.extend(
+            [
+                {
+                    "url": "https://docs.searxng.org/admin/installation-docker",
+                    "title": "Installation container - SearXNG Documentation",
+                    "snippet": "Deterministic official SearXNG container installation candidate.",
+                    "rank": 10021,
+                    "reason": (
+                        "known_path_candidate: official SearXNG Docker/container installation"
+                    ),
+                },
+                {
+                    "url": "https://raw.githubusercontent.com/searxng/searxng-docker/main/README.md",
+                    "title": "searxng-docker README.md",
+                    "snippet": "Deterministic raw README candidate for SearXNG Docker repository.",
+                    "rank": 10022,
+                    "reason": "known_path_candidate: raw SearXNG Docker README main branch",
+                },
+                {
+                    "url": (
+                        "https://raw.githubusercontent.com/searxng/searxng-docker/master/README.md"
+                    ),
+                    "title": "searxng-docker README.md",
+                    "snippet": "Deterministic raw README candidate for SearXNG Docker repository.",
+                    "rank": 10023,
+                    "reason": "known_path_candidate: raw SearXNG Docker README master branch",
+                },
+                {
+                    "url": "https://github.com/searxng/searxng-docker",
+                    "title": "searxng/searxng-docker",
+                    "snippet": "Deterministic official SearXNG Docker repository candidate.",
+                    "rank": 10024,
+                    "reason": "known_path_candidate: official SearXNG Docker repository",
+                },
+                {
+                    "url": (
+                        "https://raw.githubusercontent.com/searxng/searxng/master/"
+                        "container/docker-compose.yml"
+                    ),
+                    "title": "SearXNG container docker-compose.yml",
+                    "snippet": (
+                        "Deterministic current SearXNG container compose template candidate."
+                    ),
+                    "rank": 10025,
+                    "reason": "known_path_candidate: current SearXNG compose template",
+                },
+                {
+                    "url": (
+                        "https://raw.githubusercontent.com/searxng/searxng/master/"
+                        "container/.env.example"
+                    ),
+                    "title": "SearXNG container .env.example",
+                    "snippet": "Deterministic current SearXNG container env template candidate.",
+                    "rank": 10026,
+                    "reason": "known_path_candidate: current SearXNG env template",
+                },
+                {
+                    "url": (
+                        "https://raw.githubusercontent.com/searxng/searxng-docker/main/"
+                        "docker-compose.yml"
+                    ),
+                    "title": "searxng-docker docker-compose.yml",
+                    "snippet": (
+                        "Deterministic raw compose candidate for SearXNG Docker repository."
+                    ),
+                    "rank": 10027,
+                    "reason": "known_path_candidate: raw SearXNG Docker Compose main branch",
+                },
+                {
+                    "url": (
+                        "https://raw.githubusercontent.com/searxng/searxng-docker/master/"
+                        "docker-compose.yml"
+                    ),
+                    "title": "searxng-docker docker-compose.yml",
+                    "snippet": (
+                        "Deterministic raw compose candidate for SearXNG Docker repository."
+                    ),
+                    "rank": 10028,
+                    "reason": "known_path_candidate: raw SearXNG Docker Compose master branch",
+                },
+            ]
+        )
     if not candidates:
         return []
 
@@ -617,11 +965,14 @@ def _add_known_path_candidates(
     expansion_metadata: dict[str, Any],
     candidate_source: str,
     fallback_reason: str | None,
+    max_added: int | None = None,
 ) -> _KnownPathAddResult:
     added_candidates: list[CandidateUrl] = []
     duplicates_skipped = 0
     filtered_out = 0
     for known_path in known_path_candidates:
+        if max_added is not None and len(added_candidates) >= max(0, max_added):
+            break
         canonical = canonicalize_url(str(known_path.get("url", "")))
         if canonical is None:
             filtered_out += 1
@@ -636,6 +987,12 @@ def _add_known_path_candidates(
             "candidate_source": candidate_source,
             "original_search_provider": provider,
         }
+        source_class = known_path.get("source_class")
+        source_entity = known_path.get("entity")
+        if source_class:
+            result_metadata["known_source_class"] = str(source_class)
+        if source_entity:
+            result_metadata["known_source_entity"] = str(source_entity)
         if fallback_reason is not None:
             result_metadata["fallback_reason"] = fallback_reason
 
@@ -653,6 +1010,10 @@ def _add_known_path_candidates(
             "original_search_provider": provider,
             "source_selection_reason": known_path.get("reason"),
         }
+        if source_class:
+            metadata_json["known_source_class"] = str(source_class)
+        if source_entity:
+            metadata_json["known_source_entity"] = str(source_entity)
         if fallback_reason is not None:
             metadata_json["fallback_reason"] = fallback_reason
 
@@ -680,6 +1041,62 @@ def _add_known_path_candidates(
     )
 
 
+def _raw_readme_candidates_for_provider_results(
+    provider_results: tuple[Any, ...],
+    *,
+    constraints: dict[str, Any],
+) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    seen_repositories: set[tuple[str, str]] = set()
+    allow_domains = _resolve_domains(constraints.get("domains_allow"))
+    deny_domains = _resolve_domains(constraints.get("domains_deny"))
+    for result in provider_results:
+        owner_repo = _github_repository_owner_repo(result.url)
+        if owner_repo is None or owner_repo in seen_repositories:
+            continue
+        seen_repositories.add(owner_repo)
+        owner, repo = owner_repo
+        base_rank = max(0, int(getattr(result, "rank", 1000) or 1000) - 1)
+        for branch in ("main", "master"):
+            url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/README.md"
+            canonical = canonicalize_url(url)
+            if canonical is None or not is_domain_allowed(
+                canonical.domain,
+                allow_domains=allow_domains,
+                deny_domains=deny_domains,
+            ):
+                continue
+            candidates.append(
+                {
+                    "url": url,
+                    "title": f"{owner}/{repo} README.md",
+                    "snippet": (
+                        "Deterministic raw README follow-up for a GitHub repository candidate."
+                    ),
+                    "rank": base_rank,
+                    "reason": (
+                        "known_path_candidate: raw GitHub README follow-up for repository "
+                        f"{owner}/{repo} {branch} branch"
+                    ),
+                }
+            )
+    return candidates
+
+
+def _github_repository_owner_repo(url: str) -> tuple[str, str] | None:
+    parsed = urlsplit(url)
+    domain = parsed.netloc.lower().removeprefix("www.")
+    if domain != "github.com":
+        return None
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    if owner in {"topics", "orgs", "marketplace", "features", "settings"}:
+        return None
+    return owner, repo.removesuffix(".git")
+
+
 def _coerce_candidate_rank(value: object) -> int:
     return value if isinstance(value, int) and value >= 0 else 99999
 
@@ -689,10 +1106,11 @@ def _can_use_known_path_fallback(
     error: SearchProviderError,
     include_default_expansions: bool,
 ) -> bool:
-    return (
-        include_default_expansions
-        and error.reason == "searxng_empty_results_with_unresponsive_engines"
-    )
+    return include_default_expansions and error.reason in {
+        "searxng_empty_results_with_unresponsive_engines",
+        "searxng_timeout",
+        "searxng_request_error",
+    }
 
 
 def _search_provider_failure_diagnostics(
@@ -703,6 +1121,8 @@ def _search_provider_failure_diagnostics(
     error: SearchProviderError,
     fallback_applied: bool,
     fallback_candidate_count: int,
+    available_candidate_count: int,
+    tolerated: bool,
 ) -> dict[str, object]:
     failed_query_payload = {
         "query_text": _safe_query_preview(failed_query.query_text),
@@ -720,10 +1140,105 @@ def _search_provider_failure_diagnostics(
         "provider_error_reason": error.reason,
         "known_path_fallback_applied": fallback_applied,
         "known_path_fallback_candidate_count": fallback_candidate_count,
+        "available_candidate_count": available_candidate_count,
+        "search_provider_failure_tolerated": tolerated,
         "failed_queries": [failed_query_payload],
         "first_failed_queries": [failed_query_payload["query_text"]],
         "provider_error": error.to_payload(),
     }
+
+
+def _provider_result_quality_decision(
+    *,
+    result: Any,
+    canonical_url: str,
+    domain: str,
+    query: str,
+) -> dict[str, object]:
+    title = getattr(result, "title", None)
+    snippet = getattr(result, "snippet", None)
+    source_engine = str(getattr(result, "source_engine", "") or "").strip().lower()
+    normalized_domain = domain.lower().removeprefix("www.")
+    if candidate_matches_query_subject(
+        query=query,
+        url=canonical_url,
+        title=title if isinstance(title, str) else None,
+        snippet=snippet if isinstance(snippet, str) else None,
+    ):
+        return {"accepted": True, "reason": "entity_or_subject_match"}
+    if not _is_overview_or_technical_query(query):
+        return {"accepted": True, "reason": "non_overview_query"}
+    if _is_noisy_specialty_result_domain_or_engine(
+        domain=normalized_domain,
+        source_engine=source_engine,
+    ):
+        return {
+            "accepted": False,
+            "reason": "specialty_engine_result_missing_query_entity",
+        }
+    return {"accepted": True, "reason": "generic_result_retained"}
+
+
+def _is_overview_or_technical_query(query: str) -> bool:
+    lower = query.lower()
+    return any(
+        marker in lower
+        for marker in (
+            "what is",
+            "what are",
+            "how does",
+            "how do",
+            "overview",
+            "compare",
+            "framework",
+            "library",
+            "large language model",
+            "scheduling",
+            "autograd",
+            "orchestration",
+        )
+    )
+
+
+def _query_requests_deployment_or_installation(query: str) -> bool:
+    lower = query.lower()
+    return any(
+        marker in lower
+        for marker in (
+            "deploy",
+            "deployment",
+            "docker",
+            "compose",
+            "install",
+            "installation",
+            "configure",
+            "self-host",
+            "self host",
+        )
+    )
+
+
+def _is_noisy_specialty_result_domain_or_engine(*, domain: str, source_engine: str) -> bool:
+    noisy_engines = {
+        "mdn",
+        "stackoverflow",
+        "stack overflow",
+        "stackexchange",
+        "reddit",
+        "semantic scholar",
+        "arxiv",
+    }
+    if source_engine in noisy_engines:
+        return True
+    noisy_domains = (
+        "developer.mozilla.org",
+        "stackoverflow.com",
+        "stackexchange.com",
+        "reddit.com",
+        "medium.com",
+        "news.ycombinator.com",
+    )
+    return any(domain == item or domain.endswith(f".{item}") for item in noisy_domains)
 
 
 def _safe_query_preview(query_text: str, *, limit: int = 200) -> str:
@@ -766,6 +1281,23 @@ def _is_langgraph_overview_query(query: str) -> bool:
         or "site:docs.langchain.com" in lower
         or "site:reference.langchain.com" in lower
         or "langchain-ai langgraph" in lower
+    )
+
+
+def _is_searxng_docker_deployment_query(query: str) -> bool:
+    lower = query.lower()
+    return "searxng" in lower and any(
+        term in lower
+        for term in (
+            "deploy",
+            "deployment",
+            "docker",
+            "compose",
+            "container",
+            "install",
+            "self-host",
+            "self host",
+        )
     )
 
 

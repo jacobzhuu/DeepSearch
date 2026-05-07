@@ -76,13 +76,43 @@ class FailingSearchProvider:
         raise SearchProviderError(
             reason=self.reason,
             message=(
-                "SearXNG returned no results and reported unresponsive engines: "
-                "brave, duckduckgo."
+                "SearXNG returned no results and reported unresponsive engines: brave, duckduckgo."
             ),
             status_code=200,
             content_type="application/json",
             body_preview=None,
             unresponsive_engines=["brave", "duckduckgo"],
+        )
+
+
+@dataclass
+class SequencedSearchProvider:
+    responses: dict[str, tuple[SearchResultItem, ...]]
+    failures: dict[str, SearchProviderError]
+    name: str = "searxng"
+
+    def __post_init__(self) -> None:
+        self.requests: list[SearchRequest] = []
+
+    def search(self, request: SearchRequest) -> SearchResponse:
+        self.requests.append(request)
+        if request.query_text in self.failures:
+            raise self.failures[request.query_text]
+        results = self.responses.get(request.query_text, ())
+        return SearchResponse(
+            provider=self.name,
+            source_engines=tuple(
+                sorted(
+                    {
+                        result.source_engine
+                        for result in results
+                        if result.source_engine is not None and result.source_engine.strip()
+                    }
+                )
+            ),
+            result_count=len(results),
+            results=results,
+            metadata={"request_query": request.query_text},
         )
 
 
@@ -262,7 +292,7 @@ def test_discover_candidates_uses_deduped_planner_queries(db_session: Session) -
     task_service = create_research_task_service(db_session)
     task = task_service.create_task(
         query="What is SearXNG and how does it work?",
-        constraints={"max_urls": 3},
+        constraints={"max_urls": 10},
     )
     provider = StaticSearchProvider(
         responses={
@@ -328,7 +358,8 @@ def test_discover_candidates_uses_deduped_planner_queries(db_session: Session) -
         "SearXNG privacy not storing user information",
         "What is SearXNG and how does it work?",
     ]
-    assert [item.search_query.query_text for item in result.search_queries] == [
+    assert result.search_queries[0].search_query.provider == "authoritative-source-resolver"
+    assert [item.search_query.query_text for item in result.search_queries[1:]] == [
         "SearXNG official documentation what is SearXNG",
         "SearXNG privacy not storing user information",
         "What is SearXNG and how does it work?",
@@ -343,10 +374,96 @@ def test_discover_candidates_uses_deduped_planner_queries(db_session: Session) -
     )
     assert about_candidate.metadata_json["known_path_candidate"] is True
     assert about_candidate.metadata_json["source_engine"] == "deterministic_known_path"
-    first_raw_response = _raw_response(persisted_queries[0])
+    resolver_raw_response = _raw_response(persisted_queries[0])
+    assert resolver_raw_response["known_source_resolver"]["selected_count"] >= 3
+    first_raw_response = _raw_response(persisted_queries[1])
     assert first_raw_response["expansion_kind"] == "research_plan"
     assert first_raw_response["expansion_metadata"]["expected_source_type"] == "official_docs"
     assert first_raw_response["expansion_metadata"]["query_source"] == ("guardrail_query")
+
+
+def test_discover_candidates_applies_max_urls_across_authoritative_and_provider_results(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={"max_urls": 8},
+    )
+    provider = StaticSearchProvider(
+        responses={
+            "What is LangGraph and how does it work?": (
+                SearchResultItem(
+                    url="https://example.com/provider-one",
+                    title="Provider one",
+                    snippet="Provider result one",
+                    source_engine="fake",
+                    rank=1,
+                ),
+                SearchResultItem(
+                    url="https://example.com/provider-two",
+                    title="Provider two",
+                    snippet="Provider result two",
+                    source_engine="fake",
+                    rank=2,
+                ),
+            )
+        }
+    )
+    service = _create_search_service(db_session, provider=provider, max_results_per_query=5)
+
+    service.discover_candidates(task.id, include_default_expansions=False)
+    persisted_candidates = CandidateUrlRepository(db_session).list_for_task(task.id)
+    authoritative_candidates = [
+        candidate
+        for candidate in persisted_candidates
+        if (candidate.metadata_json or {}).get("candidate_source")
+        == "authoritative_source_resolver"
+    ]
+    provider_candidates = [
+        candidate
+        for candidate in persisted_candidates
+        if (candidate.metadata_json or {}).get("provider") == "searxng"
+    ]
+
+    assert len(persisted_candidates) == 8
+    assert len(authoritative_candidates) == 7
+    assert len(provider_candidates) == 1
+    assert [request.limit for request in provider.requests] == [1]
+
+
+def test_discover_candidates_does_not_call_provider_when_authoritative_candidates_fill_budget(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={"max_urls": 3},
+    )
+    provider = StaticSearchProvider(
+        responses={
+            "What is LangGraph and how does it work?": (
+                SearchResultItem(
+                    url="https://example.com/provider-one",
+                    title="Provider one",
+                    snippet="Provider result one",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            )
+        }
+    )
+    service = _create_search_service(db_session, provider=provider, max_results_per_query=5)
+
+    service.discover_candidates(task.id, include_default_expansions=False)
+    persisted_candidates = CandidateUrlRepository(db_session).list_for_task(task.id)
+
+    assert len(persisted_candidates) == 3
+    assert all(
+        (candidate.metadata_json or {}).get("candidate_source") == "authoritative_source_resolver"
+        for candidate in persisted_candidates
+    )
+    assert provider.requests == []
 
 
 def test_discover_candidates_injects_langgraph_known_path_fallback_on_unresponsive_search(
@@ -376,39 +493,193 @@ def test_discover_candidates_injects_langgraph_known_path_fallback_on_unresponsi
     canonical_urls = [candidate.canonical_url for candidate in persisted_candidates]
 
     assert len(provider.requests) == 1
-    assert result.search_queries[0].candidates_added == 6
-    assert canonical_urls == [
-        "https://docs.langchain.com/oss/python/langgraph/overview",
-        "https://docs.langchain.com/oss/javascript/langgraph/overview",
-        "https://reference.langchain.com/python/langgraph",
-        "https://reference.langchain.com/python/langgraph/graph/state",
-        "https://www.langchain.com/langgraph",
-        "https://github.com/langchain-ai/langgraph",
-    ]
+    assert result.search_queries[0].search_query.provider == "authoritative-source-resolver"
+    assert result.search_queries[0].candidates_added >= 6
+    assert "https://docs.langchain.com/oss/python/langgraph/overview" in canonical_urls
+    assert "https://reference.langchain.com/python/langgraph/graph/state" in canonical_urls
+    assert "https://github.com/langchain-ai/langgraph" in canonical_urls
+    assert "https://pypi.org/project/langgraph" in canonical_urls
     assert all(
-        candidate.metadata_json["candidate_source"] == "known_path_fallback"
+        candidate.metadata_json["candidate_source"]
+        in {
+            "authoritative_source_resolver",
+            "known_path_fallback",
+        }
         for candidate in persisted_candidates
     )
+    fallback_candidates = [
+        candidate
+        for candidate in persisted_candidates
+        if candidate.metadata_json["candidate_source"] == "known_path_fallback"
+    ]
+    assert fallback_candidates
     assert all(
         candidate.metadata_json["fallback_reason"]
         == "searxng_empty_results_with_unresponsive_engines"
-        for candidate in persisted_candidates
+        for candidate in fallback_candidates
     )
     assert all(
         candidate.metadata_json["original_search_provider"] == "searxng"
-        for candidate in persisted_candidates
+        for candidate in fallback_candidates
     )
 
-    fallback_payload = _raw_response(persisted_queries[0])["known_path_fallback"]
+    fallback_payload = _raw_response(persisted_queries[1])["known_path_fallback"]
     assert fallback_payload["known_path_fallback_applied"] is True
-    assert fallback_payload["known_path_fallback_candidate_count"] == 6
-    assert fallback_payload["known_path_fallback_duplicates_skipped"] == 0
+    assert fallback_payload["known_path_fallback_candidate_count"] >= 1
+    assert fallback_payload["known_path_fallback_duplicates_skipped"] >= 5
     assert fallback_payload["query_count_attempted"] == 1
     assert fallback_payload["empty_query_count"] == 1
     assert fallback_payload["provider_error_type"] == "SearchProviderError"
     assert fallback_payload["failed_queries"][0]["query_text"] == (
         "LangGraph site:docs.langchain.com how it works"
     )
+
+
+def test_discover_candidates_tolerates_later_langgraph_failure_when_candidates_exist(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    provider = SequencedSearchProvider(
+        responses={
+            "LangGraph official docs overview": (
+                SearchResultItem(
+                    url="https://docs.langchain.com/oss/python/langgraph/overview",
+                    title="LangGraph overview - Docs by LangChain",
+                    snippet="Official docs",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            )
+        },
+        failures={
+            "LangGraph state graph reference": SearchProviderError(
+                reason="searxng_empty_results_with_unresponsive_engines",
+                message=(
+                    "SearXNG returned no results and reported unresponsive engines: "
+                    "brave, duckduckgo."
+                ),
+                status_code=200,
+                content_type="application/json",
+                body_preview=None,
+                unresponsive_engines=["brave", "duckduckgo"],
+            )
+        },
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(
+        task.id,
+        planned_search_queries=[
+            PlannedSearchQuery(
+                query_text="LangGraph official docs overview",
+                rationale="owned docs",
+                expected_source_type="official_docs",
+                priority=1,
+            ),
+            PlannedSearchQuery(
+                query_text="LangGraph state graph reference",
+                rationale="owned reference",
+                expected_source_type="reference",
+                priority=2,
+            ),
+            PlannedSearchQuery(
+                query_text="LangGraph GitHub repository",
+                rationale="upstream repository",
+                expected_source_type="official_repository",
+                priority=3,
+            ),
+        ],
+    )
+    persisted_queries = SearchQueryRepository(db_session).list_for_task(task.id)
+    persisted_candidates = CandidateUrlRepository(db_session).list_for_task(task.id)
+
+    assert [request.query_text for request in provider.requests] == [
+        "LangGraph official docs overview",
+        "LangGraph state graph reference",
+    ]
+    assert len(result.search_queries) == 3
+    assert len(result.candidate_urls) >= 7
+    assert len(persisted_candidates) >= 7
+    fallback_payload = _raw_response(persisted_queries[2])["known_path_fallback"]
+    assert fallback_payload["known_path_fallback_applied"] is True
+    assert fallback_payload["known_path_fallback_candidate_count"] == 0
+    assert fallback_payload["known_path_fallback_duplicates_skipped"] >= 6
+    assert fallback_payload["available_candidate_count"] >= 7
+    assert fallback_payload["search_provider_failure_tolerated"] is True
+
+
+def test_discover_candidates_continues_after_first_provider_failure_when_later_query_succeeds(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is ExampleFlow and how does routing work?",
+        constraints={},
+    )
+    provider = SequencedSearchProvider(
+        responses={
+            "ExampleFlow routing official docs": (
+                SearchResultItem(
+                    url="https://example.org/exampleflow/routing",
+                    title="ExampleFlow routing",
+                    snippet="Routing overview.",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            )
+        },
+        failures={
+            "ExampleFlow general overview": SearchProviderError(
+                reason="searxng_empty_results_with_unresponsive_engines",
+                message=(
+                    "SearXNG returned no results and reported unresponsive engines: "
+                    "brave, duckduckgo."
+                ),
+                status_code=200,
+                content_type="application/json",
+                body_preview=None,
+                unresponsive_engines=["brave", "duckduckgo"],
+            )
+        },
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(
+        task.id,
+        planned_search_queries=[
+            PlannedSearchQuery(
+                query_text="ExampleFlow general overview",
+                rationale="overview",
+                expected_source_type="general_web",
+                priority=1,
+            ),
+            PlannedSearchQuery(
+                query_text="ExampleFlow routing official docs",
+                rationale="owned docs",
+                expected_source_type="official_docs",
+                priority=2,
+            ),
+        ],
+        include_default_expansions=False,
+    )
+    persisted_queries = SearchQueryRepository(db_session).list_for_task(task.id)
+    persisted_candidates = CandidateUrlRepository(db_session).list_for_task(task.id)
+
+    assert [request.query_text for request in provider.requests] == [
+        "ExampleFlow general overview",
+        "ExampleFlow routing official docs",
+    ]
+    assert len(result.search_queries) == 2
+    assert len(result.candidate_urls) == 1
+    assert len(persisted_candidates) == 1
+    failure_payload = _raw_response(persisted_queries[0])["search_provider_failure"]
+    assert failure_payload["known_path_fallback_applied"] is False
+    assert failure_payload["search_provider_failure_tolerated"] is True
+    assert failure_payload["failed_queries"][0]["query_text"] == "ExampleFlow general overview"
 
 
 def test_discover_candidates_unknown_entity_still_fails_on_unresponsive_search(
@@ -467,11 +738,224 @@ def test_discover_candidates_dedupes_langgraph_known_path_guardrails_from_provid
 
     assert canonical_urls.count("https://docs.langchain.com/oss/python/langgraph/overview") == 1
     assert "https://github.com/langchain-ai/langgraph" in canonical_urls
-    assert len(canonical_urls) == 6
-    assert result.search_queries[0].duplicates_skipped == 1
+    assert len(canonical_urls) == 8
+    assert result.search_queries[1].duplicates_skipped >= 1
     fallback_candidates = [
         candidate
         for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
         if candidate.metadata_json.get("candidate_source") == "known_path_guardrail"
     ]
-    assert len(fallback_candidates) == 5
+    assert len(fallback_candidates) == 1
+
+
+def test_discover_candidates_generates_authoritative_sources_for_technical_project(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="Explain FastAPI request handling and dependency injection",
+        constraints={},
+    )
+    provider = StaticSearchProvider(responses={})
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(task.id, include_default_expansions=False)
+    persisted_queries = SearchQueryRepository(db_session).list_for_task(task.id)
+    canonical_urls = [
+        candidate.canonical_url
+        for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
+    ]
+
+    assert result.search_queries[0].search_query.provider == "authoritative-source-resolver"
+    assert "https://fastapi.tiangolo.com/" in canonical_urls
+    assert "https://github.com/fastapi/fastapi" in canonical_urls
+    assert "https://pypi.org/project/fastapi" in canonical_urls
+    resolver_payload = _raw_response(persisted_queries[0])["known_source_resolver"]
+    assert resolver_payload["selected_count"] >= 3
+    assert "official_docs" in resolver_payload["source_classes"]
+    assert "official_repository" in resolver_payload["source_classes"]
+
+
+def test_discover_candidates_rejects_noisy_specialty_results_without_entity_match(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is PyTorch and how does autograd work?",
+        constraints={},
+    )
+    provider = StaticSearchProvider(
+        responses={
+            "What is PyTorch and how does autograd work?": (
+                SearchResultItem(
+                    url="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Overview",
+                    title="HTTP overview",
+                    snippet="A web platform overview for HTTP.",
+                    source_engine="mdn",
+                    rank=1,
+                ),
+                SearchResultItem(
+                    url="https://pytorch.org/docs/stable/autograd.html",
+                    title="PyTorch autograd documentation",
+                    snippet="PyTorch automatic differentiation package.",
+                    source_engine="duckduckgo",
+                    rank=2,
+                ),
+            )
+        }
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    service.discover_candidates(task.id, include_default_expansions=False)
+    persisted_queries = SearchQueryRepository(db_session).list_for_task(task.id)
+    canonical_urls = [
+        candidate.canonical_url
+        for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
+    ]
+
+    assert "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Overview" not in (
+        canonical_urls
+    )
+    assert "https://pytorch.org/docs/stable/autograd.html" in canonical_urls
+    provider_payload = _raw_response(persisted_queries[1])["provider_result_diagnostics"]
+    assert provider_payload["selected_count"] == 0
+    assert provider_payload["rejected_noisy_count"] == 1
+    assert provider_payload["rejected_results"][0]["source_engine"] == "mdn"
+
+
+def test_discover_candidates_records_timeout_without_aborting_when_authoritative_sources_exist(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is Kubernetes and how does scheduling work?",
+        constraints={},
+    )
+    timeout_error = SearchProviderError(
+        reason="searxng_timeout",
+        message="SearXNG request timed out",
+        status_code=None,
+        content_type=None,
+        body_preview=None,
+        unresponsive_engines=[],
+    )
+    provider = SequencedSearchProvider(
+        responses={}, failures={"Kubernetes scheduling": timeout_error}
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(
+        task.id,
+        planned_search_queries=[
+            PlannedSearchQuery(
+                query_text="Kubernetes scheduling",
+                rationale="scheduler docs",
+                expected_source_type="official_docs",
+                priority=1,
+            )
+        ],
+        include_default_expansions=False,
+    )
+    persisted_queries = SearchQueryRepository(db_session).list_for_task(task.id)
+    canonical_urls = [
+        candidate.canonical_url
+        for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
+    ]
+
+    assert result.candidate_urls
+    assert "https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler" in (
+        canonical_urls
+    )
+    failure_payload = _raw_response(persisted_queries[1])["search_provider_failure"]
+    assert failure_payload["provider_error_reason"] == "searxng_timeout"
+    assert failure_payload["search_provider_failure_tolerated"] is True
+    assert failure_payload["available_candidate_count"] >= 3
+
+
+def test_discover_candidates_injects_searxng_docker_known_path_guardrails(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    provider = StaticSearchProvider(
+        responses={
+            "How to deploy SearXNG with Docker?": (
+                SearchResultItem(
+                    url="https://docs.searxng.org/admin/installation-docker",
+                    title="Installation container - SearXNG Documentation",
+                    snippet="Official container docs",
+                    source_engine="fake",
+                    rank=1,
+                ),
+            )
+        }
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    result = service.discover_candidates(task.id, include_default_expansions=False)
+    canonical_urls = [
+        candidate.canonical_url
+        for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
+    ]
+
+    assert canonical_urls.count("https://docs.searxng.org/admin/installation-docker") == 1
+    assert "https://github.com/searxng/searxng-docker" in canonical_urls
+    assert "https://github.com/searxng/searxng-docker/blob/master/docker-compose.yaml" not in (
+        canonical_urls
+    )
+    assert (
+        "https://raw.githubusercontent.com/searxng/searxng-docker/main/README.md" in canonical_urls
+    )
+    assert (
+        "https://raw.githubusercontent.com/searxng/searxng-docker/master/README.md"
+        in canonical_urls
+    )
+    assert (
+        "https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml"
+        in canonical_urls
+    )
+    assert (
+        "https://raw.githubusercontent.com/searxng/searxng/master/container/.env.example"
+        in canonical_urls
+    )
+    assert result.search_queries[0].duplicates_skipped == 1
+
+
+def test_discover_candidates_adds_raw_readme_for_github_repository_result(
+    db_session: Session,
+) -> None:
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="How to deploy SearXNG with Docker?",
+        constraints={},
+    )
+    provider = StaticSearchProvider(
+        responses={
+            "How to deploy SearXNG with Docker?": (
+                SearchResultItem(
+                    url="https://github.com/searxng/searxng-docker",
+                    title="searxng/searxng-docker",
+                    snippet="Official repository",
+                    source_engine="fake",
+                    rank=3,
+                ),
+            )
+        }
+    )
+    service = _create_search_service(db_session, provider=provider)
+
+    service.discover_candidates(task.id, include_default_expansions=False)
+    canonical_urls = [
+        candidate.canonical_url
+        for candidate in CandidateUrlRepository(db_session).list_for_task(task.id)
+    ]
+
+    raw_main = "https://raw.githubusercontent.com/searxng/searxng-docker/main/README.md"
+    raw_master = "https://raw.githubusercontent.com/searxng/searxng-docker/master/README.md"
+    repository_html = "https://github.com/searxng/searxng-docker"
+
+    assert set(canonical_urls[:2]) == {raw_main, raw_master}
+    assert canonical_urls[2] == repository_html

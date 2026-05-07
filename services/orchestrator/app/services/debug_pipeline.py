@@ -35,10 +35,14 @@ from services.orchestrator.app.planning import (
     PlannedSearchQuery,
     ResearchPlan,
     ResearchPlannerService,
+    build_default_research_plan,
     build_optional_research_plan,
     research_plan_from_serialized_payload,
 )
 from services.orchestrator.app.research_quality import (
+    LLMClaimReviewService,
+    LLMEvidenceRerankerService,
+    LLMQueryRewriterService,
     SourceJudgeService,
     SourceYieldSummary,
     analyze_required_slot_gaps,
@@ -59,7 +63,13 @@ from services.orchestrator.app.services.acquisition import (
 from services.orchestrator.app.services.claims import ClaimDraftingService
 from services.orchestrator.app.services.indexing import IndexingService
 from services.orchestrator.app.services.parsing import ParsingService, parse_entry_diagnostic
-from services.orchestrator.app.services.reporting import ReportSynthesisService
+from services.orchestrator.app.services.reporting import (
+    ReportSynthesisService,
+    _claim_focus_matches_query,
+    _claim_focus_required_for_report,
+    _report_claim_answer_relevant,
+    _report_claim_score,
+)
 from services.orchestrator.app.services.research_tasks import (
     TaskNotFoundError,
     build_task_event_payload,
@@ -192,7 +202,10 @@ class DebugRealPipelineRunner:
         claims_service: ClaimDraftingService,
         reporting_service: ReportSynthesisService,
         planner_service: ResearchPlannerService | None = None,
+        query_rewriter_service: LLMQueryRewriterService | None = None,
         source_judge_service: SourceJudgeService | None = None,
+        evidence_reranker_service: LLMEvidenceRerankerService | None = None,
+        claim_reviewer_service: LLMClaimReviewService | None = None,
         dependencies: dict[str, Any],
         fetch_limit: int = 3,
         parse_limit: int = 3,
@@ -214,7 +227,10 @@ class DebugRealPipelineRunner:
         self.claims_service = claims_service
         self.reporting_service = reporting_service
         self.planner_service = planner_service
+        self.query_rewriter_service = query_rewriter_service
         self.source_judge_service = source_judge_service
+        self.evidence_reranker_service = evidence_reranker_service
+        self.claim_reviewer_service = claim_reviewer_service
         self.research_plan: ResearchPlan | None = None
         self.dependencies = dependencies
         self.fetch_limit = fetch_limit
@@ -229,6 +245,7 @@ class DebugRealPipelineRunner:
         self.max_gap_rounds = max(0, max_gap_rounds)
         self.gap_max_queries_per_round = max(1, gap_max_queries_per_round)
         self.supplemental_acquisition_ran = False
+        self.llm_assistance: dict[str, Any] = {}
         self.task_repository = ResearchTaskRepository(session)
         self.run_repository = ResearchRunRepository(session)
         self.event_repository = TaskEventRepository(session)
@@ -444,6 +461,35 @@ class DebugRealPipelineRunner:
                 "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
                 "continuing_with_existing_evidence": True,
             }
+        tolerated_failure = _supplemental_search_provider_failure(search_result)
+        if tolerated_failure is not None:
+            existing_evidence = self._existing_evidence_status_for_gap_fallback(task_id)
+            if existing_evidence["usable_evidence"]:
+                reason = str(
+                    tolerated_failure.get("reason")
+                    or tolerated_failure.get("provider_failure_reason")
+                    or "search_provider_unavailable"
+                )
+                warnings = [
+                    GAP_SEARCH_UNAVAILABLE_WARNING,
+                    (
+                        f"{SUPPLEMENTAL_SEARCH_FAILED_WARNING}: {reason}; "
+                        "continuing to reporting with existing evidence."
+                    ),
+                ]
+                return {
+                    "gap_analysis": gap_analysis,
+                    "search": {
+                        **search_result,
+                        "failed": True,
+                        "reason": reason,
+                        "error": tolerated_failure.get("error"),
+                    },
+                    "warnings": warnings,
+                    "existing_evidence": existing_evidence,
+                    "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                    "continuing_with_existing_evidence": True,
+                }
         selected_candidate_ids, skipped_gap_search_sources = _select_gap_search_candidate_ids(
             search_result,
             limit=self.max_supplemental_sources,
@@ -605,11 +651,13 @@ class DebugRealPipelineRunner:
             task_id,
             planned_search_queries=effective_planned_queries,
             include_default_expansions=include_default_expansions,
+            include_authoritative_source_resolver=False,
         )
         if require_candidates and not result.candidate_urls:
             raise DebugPipelinePreconditionError("search produced no candidate URLs")
         search_queries = []
         search_result_count = 0
+        candidate_urls_added = 0
         known_path_fallbacks: list[dict[str, Any]] = []
         for item in result.search_queries:
             raw_payload = item.search_query.raw_response_json or {}
@@ -617,6 +665,7 @@ class DebugRealPipelineRunner:
             if not isinstance(result_count, int):
                 result_count = 0
             search_result_count += result_count
+            candidate_urls_added += item.candidates_added
             search_query_payload = {
                 "search_query_id": str(item.search_query.id),
                 "query_text": item.search_query.query_text,
@@ -629,6 +678,28 @@ class DebugRealPipelineRunner:
                     "unresponsive_engines", []
                 ),
             }
+            search_provider_failure = raw_payload.get("search_provider_failure")
+            if isinstance(search_provider_failure, dict):
+                search_query_payload["search_provider_failure"] = _json_safe(
+                    search_provider_failure
+                )
+            provider_result_diagnostics = raw_payload.get("provider_result_diagnostics")
+            if isinstance(provider_result_diagnostics, dict):
+                search_query_payload["provider_result_diagnostics"] = _json_safe(
+                    provider_result_diagnostics
+                )
+                search_query_payload["selected_count"] = provider_result_diagnostics.get(
+                    "selected_count"
+                )
+                search_query_payload["rejected_noisy_count"] = provider_result_diagnostics.get(
+                    "rejected_noisy_count"
+                )
+                search_query_payload["fallback_used"] = provider_result_diagnostics.get(
+                    "fallback_used"
+                )
+            known_source_resolver = raw_payload.get("known_source_resolver")
+            if isinstance(known_source_resolver, dict):
+                search_query_payload["known_source_resolver"] = _json_safe(known_source_resolver)
             known_path_fallback = raw_payload.get("known_path_fallback")
             if isinstance(known_path_fallback, dict):
                 safe_fallback = _json_safe(known_path_fallback)
@@ -648,11 +719,17 @@ class DebugRealPipelineRunner:
                     query=result.task.query,
                 )
             ]
+            self._persist_source_judgments(result.candidate_urls, source_judgments)
             judgments_by_url = {item["canonical_url"]: item for item in source_judgments}
             for selected_source in selected_sources:
                 canonical_url = selected_source.get("canonical_url")
                 if isinstance(canonical_url, str) and canonical_url in judgments_by_url:
                     selected_source["source_judge"] = judgments_by_url[canonical_url]
+            self.llm_assistance["source_judge"] = _source_judge_assistance_summary(
+                source_judgments,
+                enabled=self.source_judge_service.enabled,
+                active=self.source_judge_service.active_rerank,
+            )
         return {
             "search_queries": search_queries,
             "search_query_count": len(result.search_queries),
@@ -685,21 +762,59 @@ class DebugRealPipelineRunner:
             "extracted_entity": (
                 self.research_plan.extracted_entity if self.research_plan is not None else None
             ),
-            "candidate_urls_added": len(result.candidate_urls),
+            "candidate_urls_added": candidate_urls_added,
+            "candidate_urls_available": len(result.candidate_urls),
             "selected_sources": selected_sources,
             "source_judgments": source_judgments,
+            "llm_assistance": dict(self.llm_assistance),
             "duplicates_skipped": result.duplicates_skipped,
             "filtered_out": result.filtered_out,
             "known_path_fallback": _known_path_fallback_summary(known_path_fallbacks),
         }
+
+    def _persist_source_judgments(
+        self,
+        candidates: list[CandidateUrl],
+        judgments: list[dict[str, Any]],
+    ) -> None:
+        if self.source_judge_service is None or not judgments:
+            return
+        candidates_by_url = {candidate.canonical_url: candidate for candidate in candidates}
+        for judgment in judgments:
+            canonical_url = judgment.get("canonical_url")
+            if not isinstance(canonical_url, str):
+                continue
+            candidate = candidates_by_url.get(canonical_url)
+            if candidate is None:
+                continue
+            metadata = dict(candidate.metadata_json or {})
+            output = judgment.get("output_judgment")
+            metadata["llm_source_judge"] = _json_safe(judgment)
+            if (
+                self.source_judge_service.active_rerank
+                and isinstance(output, dict)
+                and judgment.get("used_in_final_ranking") is True
+            ):
+                metadata["llm_source_judge_priority_delta"] = _source_judge_priority_delta(output)
+            candidate.metadata_json = metadata
+        self.session.flush()
 
     def _run_planner_if_configured(self, task_id: UUID) -> None:
         task = self._get_task(task_id)
         existing_plan = self._latest_existing_research_plan(task)
         if existing_plan is not None:
             self.research_plan = existing_plan
+            self._apply_query_rewriter_if_configured(task)
             return
         if self.planner_service is None:
+            if self.query_rewriter_service is not None and self.query_rewriter_service.enabled:
+                self.research_plan = build_default_research_plan(
+                    task.query,
+                    max_subquestions=5,
+                    max_search_queries=8,
+                    planner_mode="deterministic",
+                )
+                self._apply_query_rewriter_if_configured(task)
             return
         planner_result = build_optional_research_plan(
             planner_service=self.planner_service,
@@ -733,6 +848,8 @@ class DebugRealPipelineRunner:
 
         plan = planner_result.plan
         self.research_plan = plan
+        self._apply_query_rewriter_if_configured(task)
+        plan = self.research_plan or plan
         self._record_event(
             task_id,
             "research_plan.created",
@@ -755,6 +872,58 @@ class DebugRealPipelineRunner:
             },
         )
         self.session.commit()
+
+    def _apply_query_rewriter_if_configured(self, task: ResearchTask) -> None:
+        if self.query_rewriter_service is None or self.research_plan is None:
+            return
+        result = self.query_rewriter_service.rewrite(
+            query=task.query,
+            plan=self.research_plan,
+            constraints=dict(task.constraints_json),
+        )
+        self.llm_assistance[result.stage] = {
+            "enabled": self.query_rewriter_service.enabled,
+            "used": result.used,
+            "status": result.status,
+            "fallback_reason": result.fallback_reason,
+            **_json_safe(result.diagnostics),
+        }
+        if not result.search_queries:
+            return
+        existing_query_texts = {query.query_text for query in self.research_plan.search_queries}
+        merged_queries = list(self.research_plan.search_queries)
+        for rewritten_query in sorted(result.search_queries, key=lambda item: item.priority):
+            if rewritten_query.query_text in existing_query_texts:
+                continue
+            merged_queries.append(rewritten_query)
+            existing_query_texts.add(rewritten_query.query_text)
+        self.research_plan = ResearchPlan(
+            intent=self.research_plan.intent,
+            normalized_question=self.research_plan.normalized_question,
+            subquestions=list(self.research_plan.subquestions),
+            search_queries=merged_queries,
+            source_preferences=dict(self.research_plan.source_preferences),
+            answer_outline=list(self.research_plan.answer_outline),
+            risk_notes=list(self.research_plan.risk_notes),
+            planner_mode=self.research_plan.planner_mode,
+            warnings=list(self.research_plan.warnings),
+            answer_slots=list(self.research_plan.answer_slots),
+            raw_planner_queries=list(self.research_plan.raw_planner_queries),
+            final_search_queries=[
+                *list(self.research_plan.final_search_queries),
+                *[query.to_payload() for query in result.search_queries],
+            ],
+            dropped_or_downweighted_planner_queries=list(
+                self.research_plan.dropped_or_downweighted_planner_queries
+            ),
+            planner_guardrail_warnings=list(self.research_plan.planner_guardrail_warnings),
+            intent_classification=self.research_plan.intent_classification,
+            extracted_entity=self.research_plan.extracted_entity,
+            planner_diagnostics={
+                **dict(self.research_plan.planner_diagnostics),
+                "llm_query_rewriter": self.llm_assistance[result.stage],
+            },
+        )
 
     def _latest_existing_research_plan(self, task: ResearchTask) -> ResearchPlan | None:
         for event in reversed(self.event_repository.list_for_task(task.id)):
@@ -785,6 +954,13 @@ class DebugRealPipelineRunner:
                 target_successful_snapshots,
                 self.min_answer_sources,
                 6,
+            )
+            fetch_limit = max(fetch_limit, 6)
+        elif self._is_comparison_run(task_id):
+            target_successful_snapshots = max(
+                target_successful_snapshots,
+                self.min_answer_sources,
+                4,
             )
             fetch_limit = max(fetch_limit, 6)
         elif self._is_deployment_run(task_id):
@@ -859,6 +1035,10 @@ class DebugRealPipelineRunner:
             query=task.query,
             limit=max(claim_limit * 2, 8),
         )
+        source_chunk_ids, evidence_rerank_diagnostics = self._rerank_claim_chunks_if_configured(
+            task,
+            source_chunk_ids,
+        )
         result: Any = self.claims_service.draft_claims(
             task_id,
             query=task.query,
@@ -885,6 +1065,12 @@ class DebugRealPipelineRunner:
                     query=task.query,
                     limit=max(claim_limit * 2, 8),
                 )
+                refreshed_chunk_ids, refreshed_rerank = self._rerank_claim_chunks_if_configured(
+                    task,
+                    refreshed_chunk_ids,
+                )
+                if refreshed_rerank:
+                    evidence_rerank_diagnostics = refreshed_rerank
                 second_result = self.claims_service.draft_claims(
                     task_id,
                     query=task.query,
@@ -939,6 +1125,14 @@ class DebugRealPipelineRunner:
                 category_coverage,
             ),
             "supplemental_acquisition": supplemental_result,
+            "llm_assistance": {
+                **dict(self.llm_assistance),
+                **(
+                    {"evidence_reranker": evidence_rerank_diagnostics}
+                    if evidence_rerank_diagnostics
+                    else {}
+                ),
+            },
         }
         if not result.entries:
             failure_details = _build_claim_failure_details(
@@ -976,7 +1170,42 @@ class DebugRealPipelineRunner:
                 category_coverage,
             ),
             "supplemental_acquisition": supplemental_result,
+            "llm_assistance": {
+                **dict(self.llm_assistance),
+                **(
+                    {"evidence_reranker": evidence_rerank_diagnostics}
+                    if evidence_rerank_diagnostics
+                    else {}
+                ),
+            },
         }
+
+    def _rerank_claim_chunks_if_configured(
+        self,
+        task: ResearchTask,
+        source_chunk_ids: list[UUID],
+    ) -> tuple[list[UUID], dict[str, Any] | None]:
+        if self.evidence_reranker_service is None or not source_chunk_ids:
+            return source_chunk_ids, None
+        chunks = SourceChunkRepository(self.session).list_by_ids_for_task(task.id, source_chunk_ids)
+        chunks_by_id = {chunk.id: chunk for chunk in chunks}
+        ordered_chunks = [
+            chunks_by_id[chunk_id] for chunk_id in source_chunk_ids if chunk_id in chunks_by_id
+        ]
+        result = self.evidence_reranker_service.rerank(
+            query=task.query,
+            chunks=ordered_chunks,
+            answer_slots=[slot.to_payload() for slot in answer_slots_for_query(task.query)],
+        )
+        summary = {
+            "enabled": self.evidence_reranker_service.enabled,
+            "used": result.used,
+            "status": result.status,
+            "fallback_reason": result.fallback_reason,
+            **_json_safe(result.diagnostics),
+        }
+        self.llm_assistance[result.stage] = summary
+        return result.source_chunk_ids, summary
 
     def _run_supplemental_acquisition(
         self,
@@ -1050,6 +1279,7 @@ class DebugRealPipelineRunner:
     def _run_verify_claims(self, task_id: UUID) -> dict[str, Any]:
         task = self._get_task(task_id)
         claim_limit = _claim_limit_for_query(task.query, self.claim_limit)
+        claim_review_summary = self._review_claims_if_configured(task, claim_limit=claim_limit)
         result = self.claims_service.verify_claims(
             task_id,
             claim_ids=None,
@@ -1061,7 +1291,11 @@ class DebugRealPipelineRunner:
         slot_coverage_summary = build_slot_coverage_summary(
             task.query,
             evidence_candidates=_evidence_candidates_from_claims(self.session, task_id),
-            claim_rows=_claim_rows_for_slot_summary_from_claims(self.session, task_id),
+            claim_rows=_claim_rows_for_slot_summary_from_claims(
+                self.session,
+                task_id,
+                query=task.query,
+            ),
         )
         return {
             "verified_claims": result.verified_claims,
@@ -1071,7 +1305,52 @@ class DebugRealPipelineRunner:
             "reused_claim_evidence": result.reused_claim_evidence,
             "verification_summary": verification_summary,
             "slot_coverage_summary": slot_coverage_summary,
+            "llm_assistance": {
+                **dict(self.llm_assistance),
+                **({"claim_reviewer": claim_review_summary} if claim_review_summary else {}),
+            },
         }
+
+    def _review_claims_if_configured(
+        self,
+        task: ResearchTask,
+        *,
+        claim_limit: int,
+    ) -> dict[str, Any] | None:
+        if self.claim_reviewer_service is None:
+            return None
+        claims = ClaimRepository(self.session).list_for_task(
+            task.id,
+            verification_status="draft",
+            limit=claim_limit,
+        )
+        result = self.claim_reviewer_service.review(query=task.query, claims=claims)
+        decisions_by_claim_id = {
+            decision["claim_id"]: decision
+            for decision in result.decisions
+            if isinstance(decision.get("claim_id"), str)
+            and result.used
+            and result.status == "used"
+            and not decision.get("quality_flags")
+        }
+        for claim in claims:
+            decision = decisions_by_claim_id.get(str(claim.id))
+            if decision is None:
+                continue
+            claim.notes_json = {
+                **(claim.notes_json or {}),
+                "llm_claim_review": _json_safe(decision),
+            }
+        self.session.flush()
+        summary = {
+            "enabled": self.claim_reviewer_service.enabled,
+            "used": result.used,
+            "status": result.status,
+            "fallback_reason": result.fallback_reason,
+            **_json_safe(result.diagnostics),
+        }
+        self.llm_assistance[result.stage] = summary
+        return summary
 
     def _run_report(self, task_id: UUID) -> dict[str, Any]:
         result = self.reporting_service.generate_markdown_report(task_id)
@@ -1098,6 +1377,7 @@ class DebugRealPipelineRunner:
             "verification_summary": manifest.get("verification_summary", {}),
             "dropped_sources": manifest.get("dropped_sources", []),
             "report_writer": manifest.get("report_writer", {}),
+            "llm_assistance": dict(self.llm_assistance),
             "warnings": source_quality_summary["warnings"],
         }
 
@@ -1381,7 +1661,11 @@ class DebugRealPipelineRunner:
         return build_slot_coverage_summary(
             task.query,
             evidence_candidates=_evidence_candidates_from_claims(self.session, task_id),
-            claim_rows=_claim_rows_for_slot_summary_from_claims(self.session, task_id),
+            claim_rows=_claim_rows_for_slot_summary_from_claims(
+                self.session,
+                task_id,
+                query=task.query,
+            ),
         )
 
     def _existing_evidence_status_for_gap_fallback(self, task_id: UUID) -> dict[str, Any]:
@@ -1426,6 +1710,11 @@ class DebugRealPipelineRunner:
                 return True
         task = self._get_task(task_id)
         return classify_query_intent(task.query).intent_name == "deployment"
+
+    def _is_comparison_run(self, task_id: UUID) -> bool:
+        task = self._get_task(task_id)
+        lower = f" {task.query.lower()} "
+        return " compare " in lower or " vs " in lower or " versus " in lower
 
 
 def collect_debug_pipeline_counts(
@@ -1493,6 +1782,8 @@ def _candidate_url_summary(candidate_url: Any, *, query: str | None = None) -> d
         "original_search_provider",
         "known_path_candidate",
         "source_selection_reason",
+        "llm_source_judge_priority_delta",
+        "llm_source_judge",
     ):
         value = metadata.get(key)
         if value is None:
@@ -1516,6 +1807,33 @@ def _known_path_fallback_summary(fallbacks: list[dict[str, Any]]) -> dict[str, A
         "filtered_out": filtered_out,
         "fallbacks": fallbacks,
     }
+
+
+def _supplemental_search_provider_failure(
+    search_result: dict[str, Any],
+) -> dict[str, Any] | None:
+    if search_result.get("supplemental_search") is not True:
+        return None
+    for search_query in search_result.get("search_queries", []):
+        if not isinstance(search_query, dict):
+            continue
+        failure = search_query.get("search_provider_failure")
+        if not isinstance(failure, dict):
+            continue
+        error = failure.get("error")
+        if not isinstance(error, dict):
+            error = failure.get("provider_error")
+        reason = None
+        if isinstance(error, dict):
+            reason = error.get("reason")
+        return {
+            "reason": reason
+            or failure.get("provider_error_reason")
+            or failure.get("provider_failure_reason"),
+            "error": error,
+            **failure,
+        }
+    return None
 
 
 def _safe_int(value: Any) -> int:
@@ -1803,21 +2121,73 @@ def _select_claim_drafting_chunk_ids(
             -_deployment_chunk_signal_score(chunk.text) if deployment_query else 0,
             0 if _chunk_metadata_eligible_for_claims(chunk.metadata_json or {}) else 1,
             -_numeric_metadata_score(chunk.metadata_json or {}, "content_quality_score"),
-            chunk.source_document.fetched_at,
+            _datetime_sort_key(chunk.source_document.fetched_at),
             str(chunk.source_document_id),
             chunk.chunk_no,
         ),
     )
-    return [chunk.id for chunk in ordered_chunks[:limit]]
+    selected: list[SourceChunk] = []
+    selected_ids: set[UUID] = set()
+    per_source_counts: dict[UUID, int] = {}
+
+    def add_chunk(chunk: SourceChunk) -> bool:
+        if len(selected) >= limit or chunk.id in selected_ids:
+            return False
+        selected.append(chunk)
+        selected_ids.add(chunk.id)
+        per_source_counts[chunk.source_document_id] = (
+            per_source_counts.get(chunk.source_document_id, 0) + 1
+        )
+        return True
+
+    eligible_chunks = [
+        chunk
+        for chunk in ordered_chunks
+        if _chunk_metadata_eligible_for_claims(chunk.metadata_json or {})
+    ]
+    for chunk in eligible_chunks:
+        if chunk.source_document_id not in per_source_counts:
+            add_chunk(chunk)
+        if len(selected) >= limit:
+            break
+
+    per_source_target = 2 if _query_needs_balanced_source_claims(query) else 1
+    if per_source_target > 1 and len(selected) < limit:
+        for chunk in eligible_chunks:
+            if per_source_counts.get(chunk.source_document_id, 0) >= per_source_target:
+                continue
+            add_chunk(chunk)
+            if len(selected) >= limit:
+                break
+
+    for chunk in ordered_chunks:
+        add_chunk(chunk)
+        if len(selected) >= limit:
+            break
+
+    return [chunk.id for chunk in selected]
 
 
 def _claim_limit_for_query(query: str, default_limit: int) -> int:
     if classify_query_intent(query).intent_name != "deployment":
+        answer_slots = answer_slots_for_query(query)
+        required_slot_count = sum(1 for slot in answer_slots if slot.required)
+        if required_slot_count >= 4:
+            return max(default_limit, min(10, required_slot_count + 3))
         return default_limit
     deployment_slot_count = sum(
         1 for slot in answer_slots_for_query(query) if slot.slot_id.startswith("deployment_")
     )
     return max(default_limit, deployment_slot_count + 8)
+
+
+def _query_needs_balanced_source_claims(query: str) -> bool:
+    lower = query.lower()
+    if any(term in lower for term in ("compare", "comparison", " versus ", " vs ")):
+        return True
+    if "how does" in lower or "how do" in lower:
+        return True
+    return False
 
 
 def _deployment_chunk_signal_score(text: str) -> int:
@@ -1865,6 +2235,14 @@ def _source_document_category(source_document: SourceDocument, *, query: str | N
 def _numeric_metadata_score(metadata: dict[str, Any], key: str) -> float:
     value = metadata.get(key)
     return float(value) if isinstance(value, int | float) else 0.0
+
+
+def _datetime_sort_key(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min
+    if value.tzinfo is not None:
+        return value.astimezone(UTC).replace(tzinfo=None)
+    return value
 
 
 def _supplemental_trigger_reason(result: Any, *, query: str) -> str | None:
@@ -2500,20 +2878,26 @@ def _claim_rows_for_slot_summary_from_entries(entries: list[Any]) -> list[dict[s
     rows: list[dict[str, Any]] = []
     for entry in entries:
         claim = entry.claim
-        notes = claim.notes_json if claim is not None else {}
-        if not isinstance(notes, dict):
+        if claim is None:
             continue
-        rows.append(_claim_slot_summary_row(claim))
+        row = _claim_slot_summary_row(claim)
+        if row is not None:
+            rows.append(row)
     return rows
 
 
 def _claim_rows_for_slot_summary_from_claims(
     session: Session,
     task_id: UUID,
+    *,
+    query: str | None = None,
 ) -> list[dict[str, Any]]:
-    return [
-        _claim_slot_summary_row(claim) for claim in ClaimRepository(session).list_for_task(task_id)
-    ]
+    rows: list[dict[str, Any]] = []
+    for claim in ClaimRepository(session).list_for_task(task_id):
+        row = _claim_slot_summary_row(claim, query=query)
+        if row is not None:
+            rows.append(row)
+    return rows
 
 
 def _evidence_candidates_from_claims(
@@ -2529,8 +2913,15 @@ def _evidence_candidates_from_claims(
     return rows
 
 
-def _claim_slot_summary_row(claim: Any) -> dict[str, Any]:
-    notes = claim.notes_json or {}
+def _claim_slot_summary_row(claim: Any, *, query: str | None = None) -> dict[str, Any] | None:
+    notes = claim.notes_json if isinstance(claim.notes_json, dict) else {}
+    slot_ids = [item for item in notes.get("slot_ids", []) if isinstance(item, str) and item]
+    if query is not None and not _claim_counts_toward_gap_slot_coverage(
+        claim,
+        query=query,
+        slot_ids=slot_ids,
+    ):
+        return None
     verification = notes.get("verification") if isinstance(notes, dict) else {}
     if not isinstance(verification, dict):
         verification = {}
@@ -2540,7 +2931,7 @@ def _claim_slot_summary_row(claim: Any) -> dict[str, Any]:
     return {
         "claim_id": str(claim.id),
         "verification_status": claim.verification_status,
-        "slot_ids": notes.get("slot_ids", []) if isinstance(notes, dict) else [],
+        "slot_ids": slot_ids,
         "source_document_id": (
             notes.get("source_document_id")
             if isinstance(notes.get("source_document_id"), str)
@@ -2548,6 +2939,28 @@ def _claim_slot_summary_row(claim: Any) -> dict[str, Any]:
         ),
         "support_level": support_level,
     }
+
+
+def _claim_counts_toward_gap_slot_coverage(
+    claim: Any,
+    *,
+    query: str,
+    slot_ids: list[str],
+) -> bool:
+    notes = claim.notes_json if isinstance(claim.notes_json, dict) else {}
+    report_eligible = notes.get("report_eligible")
+    if report_eligible is False:
+        return False
+    if report_eligible is True:
+        return True
+    claim_score = _report_claim_score(claim, query=query)
+    if not _report_claim_answer_relevant(claim_score, query=query):
+        return False
+    if _claim_focus_required_for_report(query=query, slot_ids=slot_ids) and not (
+        _claim_focus_matches_query(claim.statement, query=query)
+    ):
+        return False
+    return True
 
 
 def _build_verification_summary(entries: list[Any]) -> dict[str, Any]:
@@ -2721,6 +3134,71 @@ def _format_parse_no_documents_message(parse_decisions: list[dict[str, Any]]) ->
         )
 
     return "parse produced no source documents; parse decisions: " + " | ".join(formatted_decisions)
+
+
+def _source_judge_priority_delta(output: dict[str, Any]) -> int:
+    label = str(output.get("label") or "uncertain")
+    confidence = output.get("confidence")
+    confidence_value = float(confidence) if isinstance(confidence, int | float) else 0.0
+    adjustment = output.get("priority_adjustment")
+    numeric_adjustment = float(adjustment) if isinstance(adjustment, int | float) else 0.0
+    label_delta = {
+        "accept": -4,
+        "authoritative": -4,
+        "relevant": -2,
+        "uncertain": 0,
+        "stale": 8,
+        "marketing": 10,
+        "downrank": 16,
+        "low_quality": 24,
+        "reject": 80,
+        "unsafe": 80,
+    }.get(label, 0)
+    combined = label_delta + numeric_adjustment
+    if confidence_value < 0.55 and combined < 0:
+        combined = 0
+    return max(-6, min(90, int(round(combined))))
+
+
+def _source_judge_assistance_summary(
+    judgments: list[dict[str, Any]],
+    *,
+    enabled: bool,
+    active: bool,
+) -> dict[str, Any]:
+    label_counts: dict[str, int] = {}
+    fallback_counts: dict[str, int] = {}
+    used_in_final_ranking = 0
+    for judgment in judgments:
+        output = judgment.get("output_judgment")
+        label = "unknown"
+        if isinstance(output, dict):
+            label = str(output.get("label") or "unknown")
+        label_counts[label] = label_counts.get(label, 0) + 1
+        fallback_status = str(judgment.get("fallback_status") or "none")
+        fallback_counts[fallback_status] = fallback_counts.get(fallback_status, 0) + 1
+        if judgment.get("used_in_final_ranking") is True:
+            used_in_final_ranking += 1
+    active_rerank_reason: str | None = None
+    if not active:
+        active_rerank_reason = "active_rerank_disabled"
+    elif not judgments:
+        active_rerank_reason = "no_candidates_reviewed"
+    elif fallback_counts and fallback_counts.get("none", 0) == 0:
+        active_rerank_reason = "all_judgments_fell_back"
+    elif used_in_final_ranking == 0:
+        active_rerank_reason = "no_judgment_passed_active_rerank_guardrails"
+    return {
+        "enabled": enabled,
+        "used": enabled and bool(judgments),
+        "status": "used" if enabled and judgments else "disabled",
+        "active_rerank": active,
+        "active_rerank_reason": active_rerank_reason,
+        "judged_candidate_count": len(judgments),
+        "used_in_final_ranking_count": used_in_final_ranking,
+        "label_counts": dict(sorted(label_counts.items())),
+        "fallback_counts": dict(sorted(fallback_counts.items())),
+    }
 
 
 def _stage_warnings(stage_result: dict[str, Any]) -> list[str]:

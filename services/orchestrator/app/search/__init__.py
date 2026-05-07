@@ -13,6 +13,7 @@ from services.orchestrator.app.search.providers import (
     SearchResultItem,
     SearXNGSearchProvider,
     SmokeSearchProvider,
+    YaCySearchProvider,
 )
 from services.orchestrator.app.search.query_expansion import (
     ExpandedQuery,
@@ -32,6 +33,7 @@ __all__ = [
     "SearXNGSearchProvider",
     "SimpleQueryExpansionStrategy",
     "SmokeSearchProvider",
+    "YaCySearchProvider",
     "canonicalize_url",
     "is_domain_allowed",
 ]

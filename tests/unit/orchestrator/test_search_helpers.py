@@ -9,6 +9,7 @@ from services.orchestrator.app.search import (
     SearXNGSearchProvider,
     SimpleQueryExpansionStrategy,
     SmokeSearchProvider,
+    YaCySearchProvider,
     canonicalize_url,
     is_domain_allowed,
 )
@@ -164,6 +165,79 @@ def test_searxng_provider_rejects_html_response() -> None:
     assert "not json" in (exc_info.value.body_preview or "")
 
 
+def test_yacy_provider_parses_json_results() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/yacysearch.json"
+        assert request.url.params["query"] == "LangGraph"
+        assert request.url.params["maximumRecords"] == "5"
+        return httpx.Response(
+            200,
+            json={
+                "channels": [
+                    {
+                        "items": [
+                            {
+                                "link": "https://docs.langchain.com/oss/python/langgraph/overview",
+                                "title": "LangGraph overview",
+                                "description": "Official documentation.",
+                            }
+                        ]
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    provider = YaCySearchProvider(
+        base_url="http://yacy.test",
+        timeout_seconds=5.0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = provider.search(SearchRequest(query_text="LangGraph", language=None, limit=5))
+
+    assert response.provider == "yacy"
+    assert response.result_count == 1
+    assert response.results[0].source_engine == "yacy"
+    assert response.results[0].title == "LangGraph overview"
+
+
+def test_yacy_provider_wraps_read_timeout_as_search_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    provider = YaCySearchProvider(
+        base_url="http://yacy.test",
+        timeout_seconds=5.0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        provider.search(SearchRequest(query_text="LangGraph", language=None, limit=5))
+
+    assert exc_info.value.reason == "yacy_timeout"
+    assert exc_info.value.status_code is None
+    assert exc_info.value.details["request_params"]["query"] == "LangGraph"
+
+
+def test_yacy_provider_wraps_request_error_as_search_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection failed", request=request)
+
+    provider = YaCySearchProvider(
+        base_url="http://yacy.test",
+        timeout_seconds=5.0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        provider.search(SearchRequest(query_text="LangGraph", language=None, limit=5))
+
+    assert exc_info.value.reason == "yacy_request_error"
+    assert exc_info.value.status_code is None
+    assert exc_info.value.details["request_params"]["query"] == "LangGraph"
+
+
 def test_searxng_provider_rejects_403_response() -> None:
     client = httpx.Client(
         transport=httpx.MockTransport(
@@ -216,6 +290,78 @@ def test_searxng_provider_rejects_empty_results_with_unresponsive_engines() -> N
 
     assert exc_info.value.reason == "searxng_empty_results_with_unresponsive_engines"
     assert exc_info.value.unresponsive_engines == ["google", "bing"]
+
+
+def test_searxng_provider_retries_empty_unresponsive_general_search_with_resilient_engines() -> (
+    None
+):
+    seen_queries: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_queries.append(request.url)
+        if "engines=" not in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [],
+                    "unresponsive_engines": [["duckduckgo", "CAPTCHA"]],
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "number_of_results": 1,
+                "results": [
+                    {
+                        "url": "https://github.com/example/project",
+                        "title": "example/project",
+                        "content": "Repository result.",
+                        "engine": "github",
+                        "category": "it",
+                    }
+                ],
+                "unresponsive_engines": [],
+            },
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    provider = SearXNGSearchProvider(
+        base_url="http://searxng.test",
+        timeout_seconds=5.0,
+        client=client,
+    )
+
+    response = provider.search(SearchRequest(query_text="Example project", language=None, limit=10))
+
+    assert len(seen_queries) == 2
+    assert response.result_count == 1
+    assert response.source_engines == ("github",)
+    assert response.metadata["fallback_after_provider_error"]["reason"] == (
+        "searxng_empty_results_with_unresponsive_engines"
+    )
+    assert "github" in response.metadata["fallback_source_engines"]
+    assert "mdn" not in response.metadata["fallback_source_engines"]
+    assert "stackoverflow" not in response.metadata["fallback_source_engines"]
+
+
+def test_searxng_provider_wraps_read_timeout_as_search_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    provider = SearXNGSearchProvider(
+        base_url="http://searxng.test",
+        timeout_seconds=5.0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(SearchProviderError) as exc_info:
+        provider.search(SearchRequest(query_text="Kubernetes scheduling", language=None, limit=5))
+
+    assert exc_info.value.reason == "searxng_timeout"
+    assert exc_info.value.status_code is None
+    assert exc_info.value.details["request_params"]["q"] == "Kubernetes scheduling"
 
 
 def test_searxng_provider_disables_environment_proxy_lookup_for_internal_client(

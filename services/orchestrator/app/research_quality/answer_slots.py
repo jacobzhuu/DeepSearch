@@ -47,10 +47,24 @@ def answer_slots_for_query(query: str | None) -> list[AnswerSlot]:
         ]
     if _asks_deployment(lower):
         return [
-            AnswerSlot("deployment_target", "Deployment target", ("deployment/self_hosting",)),
             AnswerSlot(
-                "deployment_steps",
-                "Deployment steps",
+                "deployment_prerequisites",
+                "Prerequisites",
+                ("deployment/self_hosting",),
+            ),
+            AnswerSlot(
+                "deployment_run_or_compose",
+                "Docker run / Docker Compose",
+                ("deployment/self_hosting", "feature"),
+            ),
+            AnswerSlot(
+                "deployment_volumes",
+                "Volumes",
+                ("deployment/self_hosting", "feature"),
+            ),
+            AnswerSlot(
+                "deployment_ports",
+                "Ports",
                 ("deployment/self_hosting", "feature"),
             ),
             AnswerSlot(
@@ -59,10 +73,19 @@ def answer_slots_for_query(query: str | None) -> list[AnswerSlot]:
                 ("deployment/self_hosting", "feature", "mechanism"),
             ),
             AnswerSlot(
-                "deployment_limitations",
-                "Operational limitations",
+                "deployment_security",
+                "Security",
+                ("deployment/self_hosting", "privacy", "feature", "other"),
+            ),
+            AnswerSlot(
+                "deployment_troubleshooting",
+                "Troubleshooting",
                 ("privacy", "feature", "other"),
-                required=False,
+            ),
+            AnswerSlot(
+                "deployment_update_maintenance",
+                "Update / maintenance",
+                ("deployment/self_hosting", "feature", "other"),
             ),
         ]
     if _asks_privacy(lower):
@@ -119,6 +142,10 @@ def claim_categories_for_slots(slots: list[AnswerSlot]) -> list[str]:
 
 def slot_ids_for_claim_category(category: str, *, query: str | None) -> list[str]:
     normalized_category = category.strip()
+    if _asks_deployment((query or "").strip().lower()) and normalized_category == (
+        "deployment/self_hosting"
+    ):
+        return []
     return [
         slot.slot_id
         for slot in answer_slots_for_query(query)

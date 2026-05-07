@@ -126,6 +126,7 @@ def _add_candidate(
     domain: str,
     rank: int,
     title: str = "Example source",
+    metadata_json: dict[str, object] | None = None,
 ) -> CandidateUrl:
     candidate_url = CandidateUrlRepository(db_session).add(
         CandidateUrl(
@@ -137,7 +138,7 @@ def _add_candidate(
             title=title,
             rank=rank,
             selected=False,
-            metadata_json={},
+            metadata_json=metadata_json or {},
         )
     )
     db_session.commit()
@@ -234,6 +235,127 @@ def test_acquisition_service_skips_existing_jobs_and_advances_to_next_candidate(
     assert second_result.created == 1
     assert second_result.skipped_existing == 1
     assert second_result.entries[-1].candidate_url.id == second_candidate.id
+
+
+def test_acquisition_service_prioritizes_raw_github_readme_over_repository_html(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task, repo_candidate = _seed_candidate(
+        db_session,
+        query="How to deploy SearXNG with Docker?",
+        canonical_url="https://github.com/searxng/searxng-docker",
+    )
+    repo_candidate.domain = "github.com"
+    repo_candidate.title = "searxng/searxng-docker"
+    raw_candidate = _add_candidate(
+        db_session,
+        repo_candidate,
+        canonical_url="https://raw.githubusercontent.com/searxng/searxng-docker/master/README.md",
+        domain="raw.githubusercontent.com",
+        title="searxng-docker README.md",
+        rank=0,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"This repository has been archived and superseded.",
+            request=request,
+        )
+
+    service = _create_acquisition_service(
+        db_session,
+        transport=httpx.MockTransport(handler),
+        snapshot_root=tmp_path,
+        resolver=StaticResolver("185.199.108.133"),
+    )
+
+    result = service.acquire_candidates(
+        task.id,
+        candidate_url_ids=None,
+        limit=1,
+    )
+
+    assert result.created == 1
+    assert result.entries[0].candidate_url.id == raw_candidate.id
+
+
+def test_acquisition_service_interleaves_authoritative_entities_for_comparison(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task, langgraph_first = _seed_candidate(
+        db_session,
+        query="Compare LangGraph and AutoGen for multi-agent orchestration.",
+        canonical_url="https://docs.langchain.com/oss/python/langgraph/overview",
+    )
+    langgraph_first.domain = "docs.langchain.com"
+    langgraph_first.title = "LangGraph overview"
+    langgraph_first.metadata_json = {
+        "known_path_candidate": True,
+        "candidate_source": "authoritative_source_resolver",
+        "known_source_entity": "LangGraph",
+    }
+    _add_candidate(
+        db_session,
+        langgraph_first,
+        canonical_url="https://docs.langchain.com/oss/javascript/langgraph/overview",
+        domain="docs.langchain.com",
+        title="LangGraph JavaScript overview",
+        rank=11,
+        metadata_json={
+            "known_path_candidate": True,
+            "candidate_source": "authoritative_source_resolver",
+            "known_source_entity": "LangGraph",
+        },
+    )
+    autogen_first = _add_candidate(
+        db_session,
+        langgraph_first,
+        canonical_url="https://microsoft.github.io/autogen/stable/",
+        domain="microsoft.github.io",
+        title="AutoGen documentation",
+        rank=10,
+        metadata_json={
+            "known_path_candidate": True,
+            "candidate_source": "authoritative_source_resolver",
+            "known_source_entity": "AutoGen",
+        },
+    )
+
+    requested_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_hosts.append(request.url.host or "")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=f"<html><body>{request.url}</body></html>".encode(),
+            request=request,
+        )
+
+    service = _create_acquisition_service(
+        db_session,
+        transport=httpx.MockTransport(handler),
+        snapshot_root=tmp_path,
+        resolver=StaticResolver("93.184.216.34"),
+    )
+
+    result = service.acquire_candidates(
+        task.id,
+        candidate_url_ids=None,
+        limit=2,
+        target_successful_snapshots=2,
+    )
+
+    assert result.created == 2
+    assert [entry.candidate_url.id for entry in result.entries] == [
+        langgraph_first.id,
+        autogen_first.id,
+    ]
+    assert requested_hosts == ["docs.langchain.com", "microsoft.github.io"]
 
 
 def test_acquisition_service_continues_until_later_candidate_succeeds(

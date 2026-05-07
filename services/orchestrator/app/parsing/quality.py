@@ -224,6 +224,8 @@ def _authority_score(
 ) -> tuple[float, str]:
     if source_category in {"official_about", "official_docs_reference"}:
         return 0.95, "official_docs"
+    if source_category == "official_repository":
+        return 0.86, "official_github_repository"
     if source_category == "official_home":
         return 0.72, "project_homepage"
     if source_category == "github_readme_or_repo":
@@ -266,6 +268,11 @@ def assess_chunk_quality(
     is_pointer_or_project_meta_noise = _looks_like_pointer_or_project_meta_noise(lower)
     is_navigation_noise = is_navigation_noise or is_pointer_or_project_meta_noise
     is_diagram_or_config_section = _looks_like_diagram_or_config_section(normalized)
+    is_deployment_code_or_config = _is_deployment_query(
+        query
+    ) and _looks_like_deployment_code_or_config(normalized)
+    if is_deployment_code_or_config:
+        is_diagram_or_config_section = False
     boilerplate_score = _boilerplate_score(lower)
     query_relevance_score = _query_relevance_score(normalized, query)
     information_density_score = _chunk_information_density_score(normalized)
@@ -285,6 +292,8 @@ def assess_chunk_quality(
             reasons.append("navigation_noise")
     if is_diagram_or_config_section:
         reasons.append("diagram_or_config_section")
+    if is_deployment_code_or_config:
+        reasons.append("deployment_code_or_config")
     if len(normalized) < 48:
         reasons.append("very_short")
     if repetition_penalty:
@@ -307,6 +316,8 @@ def assess_chunk_quality(
         score = min(score, 0.24)
     if is_diagram_or_config_section:
         score = min(score, 0.18)
+    if is_deployment_code_or_config:
+        score = max(score, 0.58)
     score = round(min(1.0, max(0.0, score)), 2)
 
     eligible = (
@@ -315,7 +326,7 @@ def assess_chunk_quality(
         and not is_reference_section
         and not is_navigation_noise
         and not is_diagram_or_config_section
-        and len(normalized) >= 48
+        and (len(normalized) >= 48 or is_deployment_code_or_config)
     )
     if eligible:
         quality = "high" if score >= 0.72 else "medium"
@@ -377,6 +388,8 @@ def _source_relevance_score(
 ) -> float:
     if source_category in {"official_about", "official_docs_reference"}:
         return 0.92
+    if source_category == "official_repository":
+        return 0.86
     if source_category in {"official_home", "github_readme_or_repo"}:
         return 0.78
     if source_category == "secondary_reference":
@@ -535,6 +548,68 @@ def _looks_like_diagram_or_config_section(text: str) -> bool:
         if line.strip().endswith(":") or re.match(r"^\s*[a-z0-9_]+\s*:", line.lower())
     )
     return arrow_lines >= 2 or (line_count >= 4 and colon_config_lines / line_count >= 0.4)
+
+
+def _looks_like_deployment_code_or_config(text: str) -> bool:
+    lower_text = text.lower()
+    deployment_markers = (
+        ".env.example",
+        "archived",
+        "bot protection",
+        "certificate",
+        "certificates",
+        "docker ",
+        "docker-compose",
+        "docker compose",
+        "podman ",
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "searxng/searxng",
+        "/etc/searxng",
+        "/var/cache/searxng",
+        "public instance",
+        "publicly accessible",
+        "reverse proxy",
+        "searxng-valkey",
+        "superseded",
+    )
+    config_markers = (
+        "services:",
+        "ports:",
+        "volumes:",
+        "environment:",
+        "restart:",
+        "cap_drop:",
+        "read_only:",
+        "secret_key:",
+        "base_url",
+        "limiter",
+        "settings.yml",
+        "searxng_",
+        "valkey://",
+    )
+    return any(marker in lower_text for marker in deployment_markers) or any(
+        marker in lower_text for marker in config_markers
+    )
+
+
+def _is_deployment_query(query: str | None) -> bool:
+    lower = (query or "").lower()
+    return any(
+        term in lower
+        for term in (
+            "deploy",
+            "deployment",
+            "docker",
+            "compose",
+            "container",
+            "install",
+            "self-host",
+            "self host",
+        )
+    )
 
 
 def _contains_explanatory_terms(lower_text: str) -> bool:

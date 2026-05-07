@@ -204,6 +204,61 @@ def test_parsing_service_skips_unsupported_mime_type(
     assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
 
 
+@pytest.mark.parametrize(
+    ("canonical_url", "mime_type", "content"),
+    [
+        (
+            "https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml",
+            "text/yaml",
+            b"services:\n  searxng:\n    image: docker.io/searxng/searxng:latest\n",
+        ),
+        (
+            "https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml",
+            "application/octet-stream",
+            b"services:\n  searxng:\n    image: docker.io/searxng/searxng:latest\n",
+        ),
+        (
+            "https://raw.githubusercontent.com/searxng/searxng/master/container/.env.example",
+            "application/octet-stream",
+            b"SEARXNG_BASE_URL=https://example.test/\n",
+        ),
+    ],
+)
+def test_parsing_service_parses_raw_yaml_and_env_as_safe_text(
+    db_session: Session,
+    tmp_path: Path,
+    canonical_url: str,
+    mime_type: str,
+    content: bytes,
+) -> None:
+    content_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        query="How to deploy SearXNG with Docker?",
+        canonical_url=canonical_url,
+        mime_type=mime_type,
+        content=content,
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    source_document = source_document_repo.get_for_content_snapshot(content_snapshot.id)
+    assert result.created == 1
+    assert result.entries[0].decision == "parsed"
+    assert source_document is not None
+    chunks = source_chunk_repo.list_for_document(source_document.id)
+    assert len(chunks) == 1
+    assert chunks[0].text == content.decode().strip()
+
+
 def test_parsing_service_creates_pdf_source_with_page_metadata(
     db_session: Session,
     tmp_path: Path,

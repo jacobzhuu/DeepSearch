@@ -290,9 +290,14 @@ class ParsingService:
                 parser_error="snapshot object was not found in object store",
             )
 
+        candidate_url = fetch_job.candidate_url
+        effective_mime_type = _effective_parse_mime_type(
+            content_snapshot.mime_type,
+            canonical_url=candidate_url.canonical_url,
+        )
         try:
             parsed_content = extract_parsed_content(
-                mime_type=content_snapshot.mime_type,
+                mime_type=effective_mime_type,
                 content=raw_content,
             )
         except UnsupportedMimeTypeError:
@@ -331,7 +336,6 @@ class ParsingService:
                 body_length=len(raw_content),
             )
 
-        candidate_url = fetch_job.candidate_url
         document_url = _document_url_for_fetch(
             candidate_url.canonical_url, fetch_attempt.trace_json
         )
@@ -522,6 +526,26 @@ def create_parsing_service(
         snapshot_object_store=snapshot_object_store,
         allowed_statuses=allowed_statuses,
     )
+
+
+def _effective_parse_mime_type(mime_type: str, *, canonical_url: str) -> str:
+    normalized = mime_type.split(";", 1)[0].strip().lower()
+    if normalized != "application/octet-stream":
+        return normalized
+    path = urlsplit(canonical_url).path.lower()
+    return _safe_text_mime_type_for_path(path) or normalized
+
+
+def _safe_text_mime_type_for_path(path: str) -> str | None:
+    if path.endswith((".yaml", ".yml")):
+        return "text/yaml"
+    if path.endswith((".md", ".markdown")):
+        return "text/markdown"
+    if path.endswith((".env", ".env.example")) or "/.env" in path:
+        return "application/x-env"
+    if path.endswith(".txt"):
+        return "text/plain"
+    return None
 
 
 def parse_entry_diagnostic(entry: ParseLedgerEntry) -> dict[str, object]:

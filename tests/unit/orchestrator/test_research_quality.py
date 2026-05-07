@@ -118,6 +118,33 @@ def test_langgraph_mirrors_and_third_party_github_are_not_official_owned() -> No
     assert freelancer.fetch_priority_score == 99
 
 
+def test_source_intent_handles_multiple_comparison_entities() -> None:
+    query = "Compare LangGraph and AutoGen for multi-agent orchestration."
+    langgraph_docs = classify_source_intent(
+        canonical_url="https://docs.langchain.com/oss/python/langgraph/overview",
+        domain="docs.langchain.com",
+        title="LangGraph overview - Docs by LangChain",
+        query=query,
+    )
+    autogen_docs = classify_source_intent(
+        canonical_url="https://microsoft.github.io/autogen/stable/",
+        domain="microsoft.github.io",
+        title="AutoGen documentation",
+        query=query,
+    )
+    autogen_repo = classify_source_intent(
+        canonical_url="https://github.com/microsoft/autogen",
+        domain="github.com",
+        title="microsoft/autogen",
+        query=query,
+    )
+
+    assert langgraph_docs.source_intent == "official_about"
+    assert autogen_docs.source_intent == "official_docs_reference"
+    assert autogen_repo.source_intent == "github_readme_or_repo"
+    assert autogen_docs.downrank_reason is None
+
+
 def test_source_intent_promotes_installation_only_for_deployment_queries() -> None:
     overview = classify_source_intent(
         canonical_url="https://docs.searxng.org/admin/installation.html",
@@ -135,6 +162,39 @@ def test_source_intent_promotes_installation_only_for_deployment_queries() -> No
     assert overview.source_intent == "official_installation_admin"
     assert overview.fetch_priority_score == 42
     assert deployment.fetch_priority_score == 0
+
+
+def test_source_intent_identifies_searxng_docker_repo_as_official_repository() -> None:
+    query = "How to deploy SearXNG with Docker?"
+
+    docker_repo = classify_source_intent(
+        canonical_url="https://github.com/searxng/searxng-docker",
+        domain="github.com",
+        title="searxng/searxng-docker",
+        query=query,
+    )
+    raw_readme = classify_source_intent(
+        canonical_url="https://raw.githubusercontent.com/searxng/searxng-docker/master/README.md",
+        domain="raw.githubusercontent.com",
+        title="searxng-docker README.md",
+        query=query,
+    )
+    current_compose = classify_source_intent(
+        canonical_url=(
+            "https://raw.githubusercontent.com/searxng/searxng/master/"
+            "container/docker-compose.yml"
+        ),
+        domain="raw.githubusercontent.com",
+        title="SearXNG container docker-compose.yml",
+        query=query,
+    )
+
+    assert docker_repo.source_intent == "official_repository"
+    assert docker_repo.fetch_priority_score == 0
+    assert raw_readme.source_intent == "official_repository"
+    assert raw_readme.fetch_priority_score == 0
+    assert current_compose.source_intent == "official_repository"
+    assert current_compose.selected_by == "source_quality"
 
 
 def test_answer_slots_are_query_intent_specific() -> None:

@@ -14,6 +14,7 @@ from services.orchestrator.app.search import (
     SearXNGSearchProvider,
     SimpleQueryExpansionStrategy,
     SmokeSearchProvider,
+    YaCySearchProvider,
 )
 from services.orchestrator.app.services.acquisition import create_acquisition_service
 from services.orchestrator.app.services.claims import create_claim_drafting_service
@@ -73,6 +74,15 @@ def create_pipeline_runner(
     llm_source_judge_provider = (
         create_llm_provider(settings) if llm_source_judge_configured(settings) else None
     )
+    llm_query_rewriter_provider = (
+        create_llm_provider(settings) if llm_query_rewriter_configured(settings) else None
+    )
+    llm_evidence_reranker_provider = (
+        create_llm_provider(settings) if llm_evidence_reranker_configured(settings) else None
+    )
+    llm_claim_reviewer_provider = (
+        create_llm_provider(settings) if llm_claim_reviewer_configured(settings) else None
+    )
     return DebugRealPipelineRunner(
         session,
         search_service=create_acquisition_search_service(
@@ -104,10 +114,13 @@ def create_pipeline_runner(
         claims_service=create_claim_drafting_service(
             session,
             index_backend=resolved_claim_index_backend,
-            max_candidates_per_request=min(settings.claim_drafting_max_candidates_per_request, 5),
+            max_candidates_per_request=min(
+                max(settings.claim_drafting_max_candidates_per_request, 8),
+                12,
+            ),
             verification_max_claims_per_request=min(
-                settings.claim_verification_max_claims_per_request,
-                5,
+                max(settings.claim_verification_max_claims_per_request, 8),
+                12,
             ),
             retrieval_max_results_per_request=settings.retrieval_max_results_per_request,
             draft_allowed_statuses=DRAFT_ALLOWED_STATUSES,
@@ -121,11 +134,24 @@ def create_pipeline_runner(
             llm_model=settings.llm_model,
             llm_report_writer_enabled=llm_report_provider is not None,
             llm_report_max_output_tokens=settings.llm_report_max_output_tokens,
+            include_ledger_debug_appendix=settings.report_include_ledger_debug_appendix,
         ),
         planner_service=create_research_planner_service(settings),
+        query_rewriter_service=create_query_rewriter_service(
+            settings,
+            provider=llm_query_rewriter_provider,
+        ),
         source_judge_service=create_source_judge_service(
             settings,
             provider=llm_source_judge_provider,
+        ),
+        evidence_reranker_service=create_evidence_reranker_service(
+            settings,
+            provider=llm_evidence_reranker_provider,
+        ),
+        claim_reviewer_service=create_claim_reviewer_service(
+            settings,
+            provider=llm_claim_reviewer_provider,
         ),
         dependencies=dependencies,
         fetch_limit=settings.acquisition_max_candidates_per_request,
@@ -172,6 +198,7 @@ def pipeline_dependency_summary(settings: Settings) -> dict[str, Any]:
         "search_provider": search_mode,
         "search_mode": "smoke-search" if search_mode == "smoke" else "real-search",
         "searxng_base_url": settings.searxng_base_url,
+        "yacy_base_url": settings.yacy_base_url,
         "snapshot_storage_backend": settings.snapshot_storage_backend,
         "snapshot_storage_root": settings.snapshot_storage_root,
         "snapshot_storage_bucket": settings.snapshot_storage_bucket,
@@ -193,6 +220,9 @@ def pipeline_dependency_summary(settings: Settings) -> dict[str, Any]:
         "llm_source_judge_active_rerank": bool(
             settings.llm_source_judge_active_rerank and llm_source_judge_configured(settings)
         ),
+        "llm_query_rewriter_enabled": llm_query_rewriter_configured(settings),
+        "llm_evidence_reranker_enabled": llm_evidence_reranker_configured(settings),
+        "llm_claim_reviewer_enabled": llm_claim_reviewer_configured(settings),
         "report_writer_mode": (
             "llm-grounded" if llm_report_writer_configured(settings) else "deterministic"
         ),
@@ -204,6 +234,8 @@ def validate_pipeline_configuration(dependencies: dict[str, Any]) -> None:
     missing = []
     if dependencies["search_provider"] == "searxng" and not dependencies["searxng_base_url"]:
         missing.append("SEARXNG_BASE_URL")
+    if dependencies["search_provider"] == "yacy" and not dependencies["yacy_base_url"]:
+        missing.append("YACY_BASE_URL")
     if not dependencies["snapshot_storage_backend"]:
         missing.append("SNAPSHOT_STORAGE_BACKEND")
     if not dependencies["snapshot_storage_bucket"]:
@@ -225,6 +257,13 @@ def build_runtime_search_provider(settings: Settings) -> SearchProvider:
     normalized_provider = settings.search_provider.strip().lower()
     if normalized_provider == "smoke":
         return SmokeSearchProvider()
+    if normalized_provider == "yacy":
+        return YaCySearchProvider(
+            base_url=settings.yacy_base_url,
+            timeout_seconds=settings.yacy_timeout_seconds,
+            resource=settings.yacy_resource,
+            verify=settings.yacy_verify,
+        )
     return SearXNGSearchProvider(
         base_url=settings.searxng_base_url,
         timeout_seconds=settings.searxng_timeout_seconds,
@@ -272,16 +311,28 @@ def build_runtime_index_backend(settings: Settings) -> ChunkIndexBackend:
 def llm_mode(settings: Settings) -> str:
     planner_configured = bool(settings.research_planner_enabled and settings.llm_enabled)
     report_configured = llm_report_writer_configured(settings)
+    assistance = [
+        name
+        for name, configured in (
+            ("rewrite", llm_query_rewriter_configured(settings)),
+            ("judge", llm_source_judge_configured(settings)),
+            ("rerank", llm_evidence_reranker_configured(settings)),
+            ("review", llm_claim_reviewer_configured(settings)),
+        )
+        if configured
+    ]
     if report_configured and planner_configured:
-        return "planner+report-LLM"
-    if report_configured:
-        return "report-LLM"
-    if not planner_configured:
-        return "no-LLM"
-    normalized_provider = settings.llm_provider.strip().lower() or "noop"
-    if normalized_provider == "noop":
-        return "planner-noop"
-    return "planner-LLM"
+        base = "planner+report-LLM"
+    elif report_configured:
+        base = "report-LLM"
+    elif not planner_configured:
+        base = "no-LLM"
+    else:
+        normalized_provider = settings.llm_provider.strip().lower() or "noop"
+        base = "planner-noop" if normalized_provider == "noop" else "planner-LLM"
+    if assistance:
+        return f"{base}+assist-{'-'.join(assistance)}"
+    return base
 
 
 def uses_llm_api(settings: Settings) -> bool:
@@ -292,6 +343,9 @@ def uses_llm_api(settings: Settings) -> bool:
             settings.research_planner_enabled
             or settings.llm_report_writer_enabled
             or settings.llm_source_judge_enabled
+            or settings.llm_query_rewriter_enabled
+            or settings.llm_evidence_reranker_enabled
+            or settings.llm_claim_reviewer_enabled
         )
     )
 
@@ -308,15 +362,68 @@ def llm_source_judge_configured(settings: Settings) -> bool:
     return bool(settings.llm_enabled and settings.llm_source_judge_enabled)
 
 
+def llm_query_rewriter_configured(settings: Settings) -> bool:
+    return bool(settings.llm_enabled and settings.llm_query_rewriter_enabled)
+
+
+def llm_evidence_reranker_configured(settings: Settings) -> bool:
+    return bool(settings.llm_enabled and settings.llm_evidence_reranker_enabled)
+
+
+def llm_claim_reviewer_configured(settings: Settings) -> bool:
+    return bool(settings.llm_enabled and settings.llm_claim_reviewer_enabled)
+
+
 def create_source_judge_service(settings: Settings, *, provider: Any) -> Any:
     from services.orchestrator.app.research_quality import SourceJudgeService
 
     return SourceJudgeService(
         enabled=llm_source_judge_configured(settings),
-        active_rerank=False,
+        active_rerank=bool(
+            settings.llm_source_judge_active_rerank and llm_source_judge_configured(settings)
+        ),
         provider=provider,
         model=settings.llm_model,
         max_candidates=settings.llm_source_judge_max_candidates,
+    )
+
+
+def create_query_rewriter_service(settings: Settings, *, provider: Any) -> Any:
+    from services.orchestrator.app.research_quality import LLMQueryRewriterService
+
+    return LLMQueryRewriterService(
+        enabled=llm_query_rewriter_configured(settings),
+        provider=provider,
+        model=settings.llm_model,
+        max_queries=settings.llm_query_rewriter_max_queries,
+        max_output_tokens=settings.llm_max_output_tokens,
+        input_max_chars=settings.llm_assistance_input_max_chars,
+    )
+
+
+def create_evidence_reranker_service(settings: Settings, *, provider: Any) -> Any:
+    from services.orchestrator.app.research_quality import LLMEvidenceRerankerService
+
+    return LLMEvidenceRerankerService(
+        enabled=llm_evidence_reranker_configured(settings),
+        provider=provider,
+        model=settings.llm_model,
+        max_chunks=settings.llm_evidence_reranker_max_chunks,
+        max_output_tokens=settings.llm_max_output_tokens,
+        input_max_chars=settings.llm_assistance_input_max_chars,
+    )
+
+
+def create_claim_reviewer_service(settings: Settings, *, provider: Any) -> Any:
+    from services.orchestrator.app.research_quality import LLMClaimReviewService
+
+    return LLMClaimReviewService(
+        enabled=llm_claim_reviewer_configured(settings),
+        provider=provider,
+        model=settings.llm_model,
+        max_claims=settings.llm_claim_reviewer_max_claims,
+        max_output_tokens=settings.llm_max_output_tokens,
+        input_max_chars=settings.llm_assistance_input_max_chars,
     )
 
 

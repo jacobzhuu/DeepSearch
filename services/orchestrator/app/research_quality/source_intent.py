@@ -14,6 +14,7 @@ _SUBJECT_SENSITIVE_SOURCE_CATEGORIES = frozenset(
         "official_about",
         "official_home",
         "official_docs_reference",
+        "official_repository",
         "wikipedia_reference",
         "github_readme_or_repo",
     }
@@ -48,7 +49,32 @@ _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
     },
     "searxng": {
         "owned_domains": ("searxng.org",),
-        "github_repos": (("searxng", "searxng"),),
+        "github_repos": (("searxng", "searxng"), ("searxng", "searxng-docker")),
+        "secondary_domains": (),
+    },
+    "fastapi": {
+        "owned_domains": ("fastapi.tiangolo.com", "tiangolo.com"),
+        "github_repos": (("fastapi", "fastapi"),),
+        "secondary_domains": (),
+    },
+    "pytorch": {
+        "owned_domains": ("pytorch.org",),
+        "github_repos": (("pytorch", "pytorch"),),
+        "secondary_domains": (),
+    },
+    "kubernetes": {
+        "owned_domains": ("kubernetes.io",),
+        "github_repos": (("kubernetes", "kubernetes"),),
+        "secondary_domains": (),
+    },
+    "autogen": {
+        "owned_domains": ("microsoft.github.io",),
+        "github_repos": (("microsoft", "autogen"),),
+        "secondary_domains": (),
+    },
+    "lora": {
+        "owned_domains": ("huggingface.co",),
+        "github_repos": (),
         "secondary_domains": (),
     },
     "opensearch": {
@@ -149,9 +175,12 @@ def classify_source_intent(
         in {
             "official_about",
             "official_home",
+            "official_repository",
             "wikipedia_reference",
             "official_docs_reference",
             "github_readme_or_repo",
+            "package_registry",
+            "standards_or_academic",
             "secondary_reference",
             "official_architecture_admin",
             "official_installation_admin",
@@ -188,7 +217,10 @@ def source_intent_priority(category: str, *, query: str | None = None) -> int:
             "wikipedia_reference": 1,
             "official_home": 2,
             "official_docs_reference": 10,
+            "official_repository": 11,
             "github_readme_or_repo": 12,
+            "package_registry": 14,
+            "standards_or_academic": 15,
             "generic_article": 20,
             "secondary_reference": _SECONDARY_REFERENCE_PRIORITY_SCORE,
             "official_architecture_admin": 40,
@@ -199,6 +231,8 @@ def source_intent_priority(category: str, *, query: str | None = None) -> int:
         }.get(category, 50)
 
     if explicit_admin_or_setup:
+        if category == "official_repository" and _query_asks_installation(query):
+            return 0
         if category == "official_architecture_admin" and _query_asks_architecture(query):
             return 0
         if category == "official_installation_admin" and _query_asks_installation(query):
@@ -209,6 +243,9 @@ def source_intent_priority(category: str, *, query: str | None = None) -> int:
     return {
         "official_about": 5,
         "official_docs_reference": 5,
+        "official_repository": 5,
+        "package_registry": 8,
+        "standards_or_academic": 8,
         "official_home": 10,
         "wikipedia_reference": 20,
         "secondary_reference": 30,
@@ -251,7 +288,26 @@ def _source_category(
         return "forum_social_video"
     if normalized_domain.endswith("wikipedia.org") and path.startswith("/wiki/"):
         return "wikipedia_reference"
+    if _is_package_registry_domain(normalized_domain):
+        return "package_registry"
+    if _is_standards_or_academic_domain(normalized_domain):
+        return "standards_or_academic"
+    if normalized_domain == "raw.githubusercontent.com":
+        if _is_official_raw_deployment_repository_path(
+            path=path,
+            subject_terms=subject_terms,
+            query=query,
+        ):
+            return "official_repository"
+        if _is_official_github_project_path(path=path, subject_terms=subject_terms):
+            return "github_readme_or_repo"
     if normalized_domain == "github.com":
+        if _is_official_deployment_repository_path(
+            path=path,
+            subject_terms=subject_terms,
+            query=query,
+        ):
+            return "official_repository"
         if _is_official_github_project_path(path=path, subject_terms=subject_terms):
             return "github_readme_or_repo"
         if _looks_like_github_project_path(path, normalized_title):
@@ -340,7 +396,7 @@ def _fetch_priority_reason(score: int) -> str:
         return "wikipedia_article"
     if score == 2:
         return "project_homepage"
-    if score in {5, 12}:
+    if score in {5, 8, 11, 12, 14, 15}:
         return "official_docs_reference"
     if score == 10:
         return "project_homepage"
@@ -370,7 +426,7 @@ def _source_quality_score_for_fetch_priority(score: int) -> float:
         return 0.78
     if score == 2:
         return 0.72
-    if score in {5, 10, 12}:
+    if score in {5, 8, 10, 11, 12, 14, 15}:
         return 0.72
     if score == 20:
         return 0.6
@@ -398,10 +454,22 @@ def _selected_reason_for_source_category(source_category: str, score: int) -> st
         return "source_selection_guardrail: wikipedia reference allowed for overview query"
     if source_category == "official_home":
         return "source_selection_guardrail: official home page retained as overview source"
+    if source_category == "official_repository":
+        return "source_selection_guardrail: official repository prioritized for deployment query"
     if source_category == "github_readme_or_repo":
         return "source_selection_guardrail: upstream repository kept behind about/reference pages"
     if source_category == "official_docs_reference":
         return "source_selection_guardrail: official reference docs kept behind about/home pages"
+    if source_category == "package_registry":
+        return (
+            "source_selection_guardrail: package registry retained as authoritative "
+            "software metadata"
+        )
+    if source_category == "standards_or_academic":
+        return (
+            "source_selection_guardrail: standards or academic source retained as "
+            "authoritative reference"
+        )
     if source_category == "official_architecture_admin" and score >= 40:
         return "source_selection_guardrail: admin architecture page demoted unless requested"
     if source_category == "official_installation_admin" and score >= 40:
@@ -422,8 +490,11 @@ def _selected_by(source_category: str, known_path_candidate: bool) -> str:
         "official_about",
         "official_home",
         "official_docs_reference",
+        "official_repository",
         "wikipedia_reference",
         "github_readme_or_repo",
+        "package_registry",
+        "standards_or_academic",
     }:
         return "source_quality"
     return "search_rank"
@@ -597,11 +668,10 @@ def _should_downrank_off_subject_source(
     normalized_domain = (domain or "").strip().lower().removeprefix("www.")
     path = urlsplit(canonical_url or "").path.strip().lower().rstrip("/")
     normalized_title = (title or "").strip().lower()
-    profile = _project_profile(subject_terms)
-    if category == "generic_article" and profile is not None:
-        return _domain_matches_owned_profile(
-            normalized_domain,
-            profile,
+    profiles = _project_profiles(subject_terms)
+    if category == "generic_article" and profiles:
+        return any(
+            _domain_matches_owned_profile(normalized_domain, profile) for profile in profiles
         ) and not _candidate_mentions_subject(
             domain=normalized_domain,
             path=path,
@@ -625,13 +695,17 @@ def _has_official_project_context(
     title: str,
     subject_terms: tuple[str, ...],
 ) -> bool:
-    profile = _project_profile(subject_terms)
-    if profile is not None:
-        return _domain_matches_owned_profile(domain, profile) and _candidate_mentions_subject(
-            domain=domain,
-            path=path,
-            title=title,
-            subject_terms=subject_terms,
+    profiles = _project_profiles(subject_terms)
+    if profiles:
+        return any(
+            _domain_matches_owned_profile(domain, profile)
+            and _candidate_mentions_subject(
+                domain=domain,
+                path=path,
+                title=title,
+                subject_terms=subject_terms,
+            )
+            for profile in profiles
         )
     if not subject_terms:
         return _is_strict_docs_domain(domain) or _is_known_project_domain(domain)
@@ -665,11 +739,20 @@ def _domain_matches_subject(domain: str, subject_terms: tuple[str, ...]) -> bool
 
 
 def _project_profile(subject_terms: tuple[str, ...]) -> _ProjectOwnershipProfile | None:
+    profiles = _project_profiles(subject_terms)
+    return profiles[0] if profiles else None
+
+
+def _project_profiles(subject_terms: tuple[str, ...]) -> tuple[_ProjectOwnershipProfile, ...]:
+    profiles: list[_ProjectOwnershipProfile] = []
+    seen_ids: set[int] = set()
     for term in subject_terms:
         profile = _PROJECT_OWNERSHIP.get(term)
-        if profile is not None:
-            return profile
-    return None
+        if profile is None or id(profile) in seen_ids:
+            continue
+        profiles.append(profile)
+        seen_ids.add(id(profile))
+    return tuple(profiles)
 
 
 def _domain_matches_owned_profile(domain: str, profile: _ProjectOwnershipProfile) -> bool:
@@ -681,11 +764,14 @@ def _is_secondary_project_reference_domain(
     domain: str,
     subject_terms: tuple[str, ...],
 ) -> bool:
-    profile = _project_profile(subject_terms)
-    if profile is None:
+    profiles = _project_profiles(subject_terms)
+    if not profiles:
         return False
-    secondary_domains = profile["secondary_domains"]
-    return any(domain == item or domain.endswith(f".{item}") for item in secondary_domains)
+    return any(
+        domain == item or domain.endswith(f".{item}")
+        for profile in profiles
+        for item in profile["secondary_domains"]
+    )
 
 
 def _is_official_github_project_path(
@@ -693,10 +779,9 @@ def _is_official_github_project_path(
     path: str,
     subject_terms: tuple[str, ...],
 ) -> bool:
-    profile = _project_profile(subject_terms)
-    if profile is None:
+    profiles = _project_profiles(subject_terms)
+    if not profiles:
         return False
-    github_repos = profile["github_repos"]
     owner_repo = _github_owner_repo(path)
     if owner_repo is None:
         return False
@@ -705,7 +790,63 @@ def _is_official_github_project_path(
     compact_repo = _compact(repo)
     return any(
         compact_owner == _compact(expected_owner) and compact_repo == _compact(expected_repo)
-        for expected_owner, expected_repo in github_repos
+        for profile in profiles
+        for expected_owner, expected_repo in profile["github_repos"]
+    )
+
+
+def _is_official_deployment_repository_path(
+    *,
+    path: str,
+    subject_terms: tuple[str, ...],
+    query: str | None,
+) -> bool:
+    if not _query_asks_installation(query):
+        return False
+    profiles = _project_profiles(subject_terms)
+    if not profiles:
+        return False
+    owner_repo = _github_owner_repo(path)
+    if owner_repo is None:
+        return False
+    owner, repo = owner_repo
+    compact_owner = _compact(owner)
+    compact_repo = _compact(repo)
+    return any(
+        compact_owner == _compact(expected_owner)
+        and compact_repo == _compact(expected_repo)
+        and any(marker in compact_repo for marker in ("docker", "container", "compose"))
+        for profile in profiles
+        for expected_owner, expected_repo in profile["github_repos"]
+    )
+
+
+def _is_official_raw_deployment_repository_path(
+    *,
+    path: str,
+    subject_terms: tuple[str, ...],
+    query: str | None,
+) -> bool:
+    if not _query_asks_installation(query):
+        return False
+    profiles = _project_profiles(subject_terms)
+    if not profiles:
+        return False
+    raw_owner_repo = _github_raw_owner_repo(path)
+    if raw_owner_repo is None:
+        return False
+    owner, repo = raw_owner_repo
+    compact_owner = _compact(owner)
+    compact_repo = _compact(repo)
+    return any(
+        compact_owner == _compact(expected_owner)
+        and compact_repo == _compact(expected_repo)
+        and (
+            any(marker in compact_repo for marker in ("docker", "container", "compose"))
+            or _raw_path_looks_like_deployment_file(path)
+        )
+        for profile in profiles
+        for expected_owner, expected_repo in profile["github_repos"]
     )
 
 
@@ -714,6 +855,29 @@ def _github_owner_repo(path: str) -> tuple[str, str] | None:
     if len(parts) < 2:
         return None
     return parts[0], parts[1]
+
+
+def _github_raw_owner_repo(path: str) -> tuple[str, str] | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 4:
+        return None
+    return parts[0], parts[1]
+
+
+def _raw_path_looks_like_deployment_file(path: str) -> bool:
+    lower = path.lower()
+    return any(
+        marker in lower
+        for marker in (
+            "docker-compose",
+            "compose.y",
+            "/container/",
+            ".env",
+            "settings.yml",
+            "limiter.toml",
+            "readme.md",
+        )
+    )
 
 
 def _is_strict_docs_domain(domain: str) -> bool:
@@ -726,6 +890,10 @@ def _is_known_project_domain(domain: str) -> bool:
         "opensearch",
         "langchain",
         "langgraph",
+        "fastapi",
+        "pytorch",
+        "kubernetes",
+        "autogen",
         "dify",
         "modelcontextprotocol",
     )
@@ -746,6 +914,7 @@ def _query_subject_terms(query: str | None) -> tuple[str, ...]:
         "and",
         "are",
         "as",
+        "compare",
         "does",
         "for",
         "how",
@@ -757,6 +926,8 @@ def _query_subject_terms(query: str | None) -> tuple[str, ...]:
         "or",
         "the",
         "to",
+        "versus",
+        "vs",
         "what",
         "with",
         "work",
@@ -842,3 +1013,34 @@ def _is_social_video_or_forum_domain(domain: str) -> bool:
         "quora.com",
     )
     return any(domain == item or domain.endswith(f".{item}") for item in social_video_forum_domains)
+
+
+def _is_package_registry_domain(domain: str) -> bool:
+    registries = (
+        "pypi.org",
+        "npmjs.com",
+        "crates.io",
+        "pkg.go.dev",
+        "rubygems.org",
+        "packagist.org",
+        "mvnrepository.com",
+        "repo1.maven.org",
+    )
+    return any(domain == item or domain.endswith(f".{item}") for item in registries)
+
+
+def _is_standards_or_academic_domain(domain: str) -> bool:
+    domains = (
+        "arxiv.org",
+        "doi.org",
+        "ietf.org",
+        "w3.org",
+        "iso.org",
+        "ieee.org",
+        "acm.org",
+        "springer.com",
+        "nature.com",
+        "sciencedirect.com",
+        "semanticscholar.org",
+    )
+    return any(domain == item or domain.endswith(f".{item}") for item in domains)

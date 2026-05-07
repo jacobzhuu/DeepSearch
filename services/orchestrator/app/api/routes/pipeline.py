@@ -80,6 +80,7 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
         "search_provider": search_mode,
         "search_mode": "smoke-search" if search_mode == "smoke" else "real-search",
         "searxng_base_url": settings.searxng_base_url,
+        "yacy_base_url": settings.yacy_base_url,
         "snapshot_storage_backend": settings.snapshot_storage_backend,
         "snapshot_storage_root": settings.snapshot_storage_root,
         "snapshot_storage_bucket": settings.snapshot_storage_bucket,
@@ -97,6 +98,13 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
             settings.research_planner_enabled and settings.llm_enabled
         ),
         "llm_report_writer_enabled": _llm_report_writer_configured(settings),
+        "llm_source_judge_enabled": _llm_source_judge_configured(settings),
+        "llm_source_judge_active_rerank": bool(
+            settings.llm_source_judge_active_rerank and _llm_source_judge_configured(settings)
+        ),
+        "llm_query_rewriter_enabled": _llm_query_rewriter_configured(settings),
+        "llm_evidence_reranker_enabled": _llm_evidence_reranker_configured(settings),
+        "llm_claim_reviewer_enabled": _llm_claim_reviewer_configured(settings),
         "report_writer_mode": (
             "llm-grounded" if _llm_report_writer_configured(settings) else "deterministic"
         ),
@@ -107,23 +115,42 @@ def _dependency_summary(settings: Any) -> dict[str, Any]:
 def _llm_mode(settings: Any) -> str:
     planner_configured = bool(settings.research_planner_enabled and settings.llm_enabled)
     report_configured = _llm_report_writer_configured(settings)
+    assistance = [
+        name
+        for name, configured in (
+            ("rewrite", _llm_query_rewriter_configured(settings)),
+            ("judge", _llm_source_judge_configured(settings)),
+            ("rerank", _llm_evidence_reranker_configured(settings)),
+            ("review", _llm_claim_reviewer_configured(settings)),
+        )
+        if configured
+    ]
     if report_configured and planner_configured:
-        return "planner+report-LLM"
-    if report_configured:
-        return "report-LLM"
-    if not planner_configured:
-        return "no-LLM"
-    normalized_provider = settings.llm_provider.strip().lower() or "noop"
-    if normalized_provider == "noop":
-        return "planner-noop"
-    return "planner-LLM"
+        base = "planner+report-LLM"
+    elif report_configured:
+        base = "report-LLM"
+    elif not planner_configured:
+        base = "no-LLM"
+    else:
+        normalized_provider = settings.llm_provider.strip().lower() or "noop"
+        base = "planner-noop" if normalized_provider == "noop" else "planner-LLM"
+    if assistance:
+        return f"{base}+assist-{'-'.join(assistance)}"
+    return base
 
 
 def _uses_llm_api(settings: Any) -> bool:
     return bool(
         settings.llm_enabled
         and settings.llm_provider.strip().lower() not in {"", "noop"}
-        and (settings.research_planner_enabled or settings.llm_report_writer_enabled)
+        and (
+            settings.research_planner_enabled
+            or settings.llm_report_writer_enabled
+            or settings.llm_source_judge_enabled
+            or settings.llm_query_rewriter_enabled
+            or settings.llm_evidence_reranker_enabled
+            or settings.llm_claim_reviewer_enabled
+        )
     )
 
 
@@ -135,10 +162,28 @@ def _llm_report_writer_configured(settings: Any) -> bool:
     )
 
 
+def _llm_source_judge_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_source_judge_enabled)
+
+
+def _llm_query_rewriter_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_query_rewriter_enabled)
+
+
+def _llm_evidence_reranker_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_evidence_reranker_enabled)
+
+
+def _llm_claim_reviewer_configured(settings: Any) -> bool:
+    return bool(settings.llm_enabled and settings.llm_claim_reviewer_enabled)
+
+
 def _validate_required_configuration(dependencies: dict[str, Any]) -> None:
     missing = []
     if dependencies["search_provider"] == "searxng" and not dependencies["searxng_base_url"]:
         missing.append("SEARXNG_BASE_URL")
+    if dependencies["search_provider"] == "yacy" and not dependencies.get("yacy_base_url"):
+        missing.append("YACY_BASE_URL")
     if not dependencies["snapshot_storage_backend"]:
         missing.append("SNAPSHOT_STORAGE_BACKEND")
     if not dependencies["snapshot_storage_bucket"]:

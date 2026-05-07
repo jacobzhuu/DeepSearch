@@ -23,6 +23,7 @@ from services.orchestrator.app.search import (
     SearXNGSearchProvider,
     SimpleQueryExpansionStrategy,
     SmokeSearchProvider,
+    YaCySearchProvider,
 )
 from services.orchestrator.app.services.research_tasks import TaskNotFoundError
 from services.orchestrator.app.services.search_discovery import (
@@ -41,6 +42,13 @@ def get_search_provider() -> SearchProvider:
     normalized_provider = settings.search_provider.strip().lower()
     if normalized_provider == "smoke":
         return SmokeSearchProvider()
+    if normalized_provider == "yacy":
+        return YaCySearchProvider(
+            base_url=settings.yacy_base_url,
+            timeout_seconds=settings.yacy_timeout_seconds,
+            resource=settings.yacy_resource,
+            verify=settings.yacy_verify,
+        )
     if normalized_provider != "searxng":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -49,7 +57,7 @@ def get_search_provider() -> SearchProvider:
                 "reason": "unsupported_search_provider",
                 "message": f"unsupported search provider: {settings.search_provider}",
                 "next_action": (
-                    "Set SEARCH_PROVIDER to searxng or smoke and restart the orchestrator."
+                    "Set SEARCH_PROVIDER to searxng, yacy, or smoke and restart the orchestrator."
                 ),
             },
         )

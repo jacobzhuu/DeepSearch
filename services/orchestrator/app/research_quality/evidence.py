@@ -43,6 +43,7 @@ EVIDENCE_LINEAGE_FIELDS: tuple[str, ...] = (
     "citation_span_id",
     "claim_evidence_id",
     "source_intent",
+    "evidence_kind",
     "evidence_candidate_id",
     "evidence_quality_score",
     "evidence_salience_score",

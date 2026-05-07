@@ -10,6 +10,13 @@ import httpx
 from packages.observability import get_logger
 
 logger = get_logger(__name__)
+SEARXNG_RESILIENT_FALLBACK_ENGINES: tuple[str, ...] = (
+    "wikipedia",
+    "github",
+    "arxiv",
+    "pypi",
+    "semantic scholar",
+)
 
 
 @dataclass(frozen=True)
@@ -284,7 +291,25 @@ class SearXNGSearchProvider:
         if request.time_range is not None:
             request_params["time_range"] = request.time_range
 
-        payload = self._perform_request(request_params)
+        fallback_metadata: dict[str, Any] = {}
+        try:
+            payload = self._perform_request(request_params)
+        except SearchProviderError as error:
+            if not _should_retry_with_resilient_engines(error, request=request):
+                raise
+            fallback_params = {
+                **request_params,
+                "engines": ",".join(SEARXNG_RESILIENT_FALLBACK_ENGINES),
+            }
+            try:
+                payload = self._perform_request(fallback_params)
+            except SearchProviderError as fallback_error:
+                raise error from fallback_error
+            request_params = fallback_params
+            fallback_metadata = {
+                "fallback_after_provider_error": error.to_payload(),
+                "fallback_source_engines": list(SEARXNG_RESILIENT_FALLBACK_ENGINES),
+            }
         raw_results = payload.get("results", [])
         if not isinstance(raw_results, list):
             raw_results = []
@@ -337,17 +362,39 @@ class SearXNGSearchProvider:
                 "unresponsive_engines": _normalize_unresponsive_engines(
                     payload.get("unresponsive_engines")
                 ),
+                **fallback_metadata,
             },
         )
 
     def _perform_request(self, params: dict[str, str | int]) -> dict[str, Any]:
-        if self.client is not None:
-            response = self.client.get(f"{self.base_url}/search", params=params)
-            return self._validate_endpoint_response(response)
+        try:
+            if self.client is not None:
+                response = self.client.get(f"{self.base_url}/search", params=params)
+                return self._validate_endpoint_response(response)
 
-        with httpx.Client(timeout=self.timeout_seconds, trust_env=False) as client:
-            response = client.get(f"{self.base_url}/search", params=params)
-            return self._validate_endpoint_response(response)
+            with httpx.Client(timeout=self.timeout_seconds, trust_env=False) as client:
+                response = client.get(f"{self.base_url}/search", params=params)
+                return self._validate_endpoint_response(response)
+        except httpx.TimeoutException as error:
+            raise SearchProviderError(
+                reason="searxng_timeout",
+                message=f"SearXNG request timed out: {error}",
+                status_code=None,
+                content_type=None,
+                body_preview=None,
+                unresponsive_engines=[],
+                details={"request_params": params},
+            ) from error
+        except httpx.RequestError as error:
+            raise SearchProviderError(
+                reason="searxng_request_error",
+                message=f"SearXNG request failed: {error}",
+                status_code=None,
+                content_type=None,
+                body_preview=None,
+                unresponsive_engines=[],
+                details={"request_params": params},
+            ) from error
 
     def _validate_endpoint_response(self, response: httpx.Response) -> dict[str, Any]:
         content_type = response.headers.get("content-type", "")
@@ -502,6 +549,183 @@ class SearXNGSearchProvider:
         )
 
 
+class YaCySearchProvider:
+    name = "yacy"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout_seconds: float,
+        resource: str = "local",
+        verify: str = "false",
+        client: httpx.Client | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.resource = resource.strip() or "local"
+        self.verify = verify.strip() or "false"
+        self.client = client
+
+    def search(self, request: SearchRequest) -> SearchResponse:
+        query_text = request.query_text
+        if request.language:
+            query_text = f"{query_text} LANGUAGE:{request.language}"
+        request_params: dict[str, str | int] = {
+            "query": query_text,
+            "contentdom": "text",
+            "maximumRecords": max(1, request.limit),
+            "startRecord": 0,
+            "resource": self.resource,
+            "verify": self.verify,
+            "nav": "none",
+        }
+        payload = self._perform_request(request_params)
+        parsed_results = _parse_yacy_results(payload, limit=request.limit)
+        return SearchResponse(
+            provider=self.name,
+            source_engines=("yacy",),
+            result_count=len(parsed_results),
+            results=tuple(parsed_results),
+            metadata={
+                "request_params": request_params,
+                "resource": self.resource,
+                "verify": self.verify,
+                "raw_result_shape": _yacy_result_shape(payload),
+            },
+        )
+
+    def _perform_request(self, params: dict[str, str | int]) -> dict[str, Any]:
+        try:
+            if self.client is not None:
+                response = self.client.get(f"{self.base_url}/yacysearch.json", params=params)
+                return self._validate_endpoint_response(response)
+
+            with httpx.Client(timeout=self.timeout_seconds, trust_env=False) as client:
+                response = client.get(f"{self.base_url}/yacysearch.json", params=params)
+                return self._validate_endpoint_response(response)
+        except httpx.TimeoutException as error:
+            raise SearchProviderError(
+                reason="yacy_timeout",
+                message=f"YaCy request timed out: {error}",
+                status_code=None,
+                content_type=None,
+                body_preview=None,
+                unresponsive_engines=[],
+                details={"request_params": params},
+            ) from error
+        except httpx.RequestError as error:
+            raise SearchProviderError(
+                reason="yacy_request_error",
+                message=f"YaCy request failed: {error}",
+                status_code=None,
+                content_type=None,
+                body_preview=None,
+                unresponsive_engines=[],
+                details={"request_params": params},
+            ) from error
+
+    def _validate_endpoint_response(self, response: httpx.Response) -> dict[str, Any]:
+        content_type = response.headers.get("content-type", "")
+        body_preview = _body_preview(response)
+        if response.status_code >= 400:
+            raise SearchProviderError(
+                reason="yacy_http_error",
+                message=f"YaCy returned HTTP {response.status_code}.",
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=[],
+            )
+        if _looks_like_html_response(content_type=content_type, body_preview=body_preview):
+            raise SearchProviderError(
+                reason="yacy_html_response",
+                message=(
+                    "YaCy endpoint returned HTML instead of JSON. Point YACY_BASE_URL at a "
+                    "YaCy server exposing /yacysearch.json."
+                ),
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=[],
+            )
+        try:
+            payload = response.json()
+        except (JSONDecodeError, ValueError) as error:
+            raise SearchProviderError(
+                reason="yacy_invalid_json",
+                message=f"YaCy response was not valid JSON: {error}",
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=[],
+            ) from error
+        if not isinstance(payload, dict):
+            raise SearchProviderError(
+                reason="yacy_invalid_json_shape",
+                message="YaCy JSON response was not an object.",
+                status_code=response.status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+                unresponsive_engines=[],
+            )
+        return payload
+
+
+def _parse_yacy_results(payload: dict[str, Any], *, limit: int) -> list[SearchResultItem]:
+    raw_items: list[Any] = []
+    channels = payload.get("channels")
+    if isinstance(channels, list) and channels:
+        first_channel = channels[0]
+        if isinstance(first_channel, dict) and isinstance(first_channel.get("items"), list):
+            raw_items = first_channel["items"]
+    if not raw_items and isinstance(payload.get("items"), list):
+        raw_items = payload["items"]
+    if not raw_items and isinstance(payload.get("results"), list):
+        raw_items = payload["results"]
+
+    parsed_results: list[SearchResultItem] = []
+    for index, raw_item in enumerate(raw_items[:limit], start=1):
+        if not isinstance(raw_item, dict):
+            continue
+        url = _first_string(raw_item, "link", "url", "href", "sku")
+        if url is None:
+            continue
+        parsed_results.append(
+            SearchResultItem(
+                url=url,
+                title=_first_string(raw_item, "title", "dc:title"),
+                snippet=_first_string(raw_item, "description", "snippet", "content"),
+                source_engine="yacy",
+                rank=index,
+                metadata={
+                    "pub_date": _first_string(raw_item, "pubDate", "date", "lastModified"),
+                    "size": raw_item.get("size"),
+                    "ranking": raw_item.get("ranking"),
+                },
+            )
+        )
+    return parsed_results
+
+
+def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _yacy_result_shape(payload: dict[str, Any]) -> str:
+    if isinstance(payload.get("channels"), list):
+        return "channels"
+    if isinstance(payload.get("items"), list):
+        return "items"
+    if isinstance(payload.get("results"), list):
+        return "results"
+    return "unknown"
+
+
 def _body_preview(response: httpx.Response) -> str:
     return response.text[:300]
 
@@ -537,3 +761,15 @@ def _normalize_unresponsive_engines(raw_value: Any) -> list[str]:
         normalized.append(engine)
         seen.add(engine)
     return normalized
+
+
+def _should_retry_with_resilient_engines(
+    error: SearchProviderError,
+    *,
+    request: SearchRequest,
+) -> bool:
+    return (
+        error.reason == "searxng_empty_results_with_unresponsive_engines"
+        and not request.source_engines
+        and not request.categories
+    )

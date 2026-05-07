@@ -438,7 +438,61 @@ def _sort_candidates_for_fetch(
     *,
     query: str | None = None,
 ) -> list[CandidateUrl]:
-    return sorted(candidates, key=lambda candidate: _fetch_priority_key(candidate, query=query))
+    sorted_candidates = sorted(
+        candidates, key=lambda candidate: _fetch_priority_key(candidate, query=query)
+    )
+    if not _query_asks_comparison(query):
+        return sorted_candidates
+    return _interleave_candidates_by_known_entity(sorted_candidates)
+
+
+def _query_asks_comparison(query: str | None) -> bool:
+    if query is None:
+        return False
+    lower = f" {query.lower()} "
+    return " compare " in lower or " vs " in lower or " versus " in lower
+
+
+def _interleave_candidates_by_known_entity(candidates: list[CandidateUrl]) -> list[CandidateUrl]:
+    entity_groups: dict[str, list[CandidateUrl]] = {}
+    passthrough: list[CandidateUrl] = []
+    for candidate in candidates:
+        metadata = candidate.metadata_json or {}
+        entity = metadata.get("known_source_entity")
+        if not isinstance(entity, str) or not entity.strip():
+            passthrough.append(candidate)
+            continue
+        entity_key = entity.strip().lower()
+        entity_groups.setdefault(entity_key, []).append(candidate)
+
+    if len(entity_groups) < 2:
+        return candidates
+
+    interleaved: list[CandidateUrl] = []
+    group_order = sorted(
+        entity_groups,
+        key=lambda key: _fetch_priority_key(entity_groups[key][0], query=None),
+    )
+    while any(entity_groups.values()):
+        for entity_key in group_order:
+            group = entity_groups[entity_key]
+            if group:
+                interleaved.append(group.pop(0))
+
+    passthrough_by_id = {candidate.id: candidate for candidate in passthrough}
+    known_ids = {candidate.id for candidate in interleaved}
+    merged: list[CandidateUrl] = []
+    interleaved_index = 0
+    for candidate in candidates:
+        if candidate.id in known_ids:
+            if interleaved_index < len(interleaved):
+                merged.append(interleaved[interleaved_index])
+                interleaved_index += 1
+            continue
+        passthrough_candidate = passthrough_by_id.get(candidate.id)
+        if passthrough_candidate is not None:
+            merged.append(passthrough_candidate)
+    return merged
 
 
 def _fetch_priority_key(
@@ -455,7 +509,12 @@ def _fetch_priority_key(
 
 def _fetch_priority_score(candidate_url: CandidateUrl, *, query: str | None = None) -> int:
     score = fetch_priority_metadata(candidate_url, query=query).get("fetch_priority_score")
-    return score if isinstance(score, int) else 0
+    base_score = score if isinstance(score, int) else 0
+    metadata = candidate_url.metadata_json or {}
+    adjustment = metadata.get("llm_source_judge_priority_delta")
+    if isinstance(adjustment, int | float):
+        return max(0, min(120, int(round(base_score + float(adjustment)))))
+    return base_score
 
 
 def fetch_priority_metadata(
@@ -464,13 +523,19 @@ def fetch_priority_metadata(
     query: str | None = None,
 ) -> dict[str, Any]:
     known_path_candidate = bool((candidate_url.metadata_json or {}).get("known_path_candidate"))
-    return source_intent_metadata(
+    source_metadata = source_intent_metadata(
         canonical_url=candidate_url.canonical_url,
         domain=candidate_url.domain,
         title=candidate_url.title,
         query=query,
         known_path_candidate=known_path_candidate,
     )
+    metadata = candidate_url.metadata_json or {}
+    adjustment = metadata.get("llm_source_judge_priority_delta")
+    if isinstance(adjustment, int | float):
+        source_metadata["llm_source_judge_priority_delta"] = adjustment
+        source_metadata["llm_source_judge"] = metadata.get("llm_source_judge")
+    return source_metadata
 
 
 def _source_category(candidate_url: CandidateUrl) -> str:

@@ -17,7 +17,16 @@ SUPPORTED_DOCUMENT_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
 }
 
-SUPPORTED_TEXT_MIME_TYPES = {"text/html", "text/plain"}
+SUPPORTED_TEXT_MIME_TYPES = {
+    "application/x-env",
+    "application/x-yaml",
+    "application/yaml",
+    "text/html",
+    "text/markdown",
+    "text/plain",
+    "text/x-yaml",
+    "text/yaml",
+}
 SUPPORTED_MIME_TYPES = SUPPORTED_TEXT_MIME_TYPES | set(SUPPORTED_DOCUMENT_MIME_TYPES)
 
 PDF_PAGE_LOCATOR_FALLBACK_REASON = "pdf_page_stream_mapping_unreliable"

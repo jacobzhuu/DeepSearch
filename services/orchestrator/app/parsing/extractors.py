@@ -27,10 +27,34 @@ class _ParagraphExtractionOptions(TypedDict, total=False):
     body_only: bool
 
 
+_PLAIN_TEXT_MIME_TYPES = {
+    "application/x-env",
+    "application/x-yaml",
+    "application/yaml",
+    "text/markdown",
+    "text/plain",
+    "text/x-yaml",
+    "text/yaml",
+}
+
+_STRUCTURED_TEXT_MIME_TYPES = {
+    "application/x-env",
+    "application/x-yaml",
+    "application/yaml",
+    "text/markdown",
+    "text/x-yaml",
+    "text/yaml",
+}
+
+
 def extract_parsed_content(*, mime_type: str, content: bytes) -> ParsedContent:
     normalized_mime_type = mime_type.split(";", 1)[0].strip().lower()
-    if normalized_mime_type == "text/plain":
-        text = _normalize_plain_text(content.decode("utf-8", errors="replace"))
+    if normalized_mime_type in _PLAIN_TEXT_MIME_TYPES:
+        decoded_text = content.decode("utf-8", errors="replace")
+        if normalized_mime_type in _STRUCTURED_TEXT_MIME_TYPES:
+            text = _normalize_structured_text(decoded_text)
+        else:
+            text = _normalize_plain_text(decoded_text)
         return ParsedContent(
             text=text,
             title=_derive_text_title(text),
@@ -466,6 +490,16 @@ def _normalize_plain_text(text: str) -> str:
         collapsed_lines.append(line)
         blank_pending = False
     return "\n".join(collapsed_lines).strip()
+
+
+def _normalize_structured_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in normalized.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
 
 
 def _normalize_single_line(text: str) -> str:

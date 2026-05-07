@@ -644,18 +644,50 @@ def test_run_endpoint_queue_is_consumed_by_host_local_worker(
         detail_response = client.get(f"/api/v1/research/tasks/{task_id}")
         events_response = client.get(f"/api/v1/research/tasks/{task_id}/events")
         with session_factory() as session:
-            counts = collect_debug_pipeline_counts(session, UUID(task_id))
+            counts = collect_debug_pipeline_counts(
+                session,
+                UUID(task_id),
+                indexed_chunk_counter=lambda: index_backend.list_chunks(
+                    task_id=UUID(task_id),
+                    offset=0,
+                    limit=100,
+                ),
+            )
 
         assert queue_response.status_code == 200
         assert queue_response.json()["status"] == "QUEUED"
         assert processed == 1
         assert detail_response.status_code == 200
-        assert detail_response.json()["status"] == "COMPLETED"
+        detail_payload = detail_response.json()
+        assert detail_payload["status"] == "COMPLETED"
+        observability = detail_payload["progress"]["observability"]
+        pipeline_counts = observability["pipeline_counts"]
+        assert observability["running_mode"].endswith("+no-LLM")
+        assert observability["llm_assistance"]
+        assert all(
+            stage_diagnostics["used"] is False
+            for stage_diagnostics in observability["llm_assistance"].values()
+        )
+        assert pipeline_counts["claims"] > 0
+        assert pipeline_counts["report_artifacts"] > 0
         assert counts.source_documents > 0
         assert counts.source_chunks > 0
         assert counts.claims > 0
         assert counts.claim_evidence > 0
         assert counts.report_artifacts > 0
+        for count_name in (
+            "search_queries",
+            "candidate_urls",
+            "fetch_attempts",
+            "content_snapshots",
+            "source_documents",
+            "source_chunks",
+            "indexed_chunks",
+            "claims",
+            "claim_evidence",
+            "report_artifacts",
+        ):
+            assert pipeline_counts[count_name] == getattr(counts, count_name)
         event_types = [event["event_type"] for event in events_response.json()["events"]]
         assert "pipeline.queued" in event_types
         assert "pipeline.started" in event_types

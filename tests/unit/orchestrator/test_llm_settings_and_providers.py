@@ -13,19 +13,25 @@ from services.orchestrator.app.llm import (
     build_chat_completions_url,
     create_llm_provider,
 )
+from services.orchestrator.app.llm import providers as provider_module
 from services.orchestrator.app.settings import Settings
 
 
 def _settings(**values: object) -> Settings:
-    return Settings.model_validate(values)
+    return Settings(_env_file=None, **values)
 
 
-def test_llm_settings_default_to_no_llm_planner_disabled() -> None:
+def test_llm_settings_default_to_noop_provider_with_local_proxy_disabled() -> None:
     settings = _settings()
 
-    assert settings.llm_enabled is False
+    assert settings.llm_enabled is True
     assert settings.llm_provider == "noop"
-    assert settings.research_planner_enabled is False
+    assert settings.research_planner_enabled is True
+    assert settings.llm_report_writer_enabled is True
+    assert settings.llm_source_judge_enabled is True
+    assert settings.llm_source_judge_active_rerank is True
+    assert settings.llm_trust_env_proxy is False
+    assert settings.llm_claim_reviewer_enabled is True
 
 
 def test_llm_api_key_is_not_in_repr_or_safe_summary() -> None:
@@ -141,6 +147,72 @@ def test_openai_compatible_provider_builds_request_without_api_key_in_body() -> 
     assert request_body["messages"][0]["role"] == "system"
     assert response.raw_response_id == "chatcmpl-test"
     assert response.text == '{"subquestions": ["a"], "search_queries": ["b"]}'
+
+
+def test_research_loop_fetch_more_candidates_setting() -> None:
+    settings = _settings(RESEARCH_LOOP_FETCH_MORE_CANDIDATES_PER_ROUND=5)
+    assert settings.research_loop_fetch_more_candidates_per_round == 5
+    assert settings.llm_safe_summary()["research_loop_fetch_more_candidates_per_round"] == 5
+
+
+def test_openai_compatible_provider_disables_environment_proxy_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured["trust_env"] = kwargs.get("trust_env")
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, object],
+        ) -> httpx.Response:
+            del url, headers, json
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "message": {"content": '{"subquestions": [], "search_queries": []}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:7890")
+    monkeypatch.setattr(provider_module.httpx, "Client", FakeClient)
+    provider = OpenAICompatibleLLMProvider(
+        base_url="https://api.example.com/v1",
+        api_key="test-api-key",
+        model="test-model",
+        timeout_seconds=30,
+        max_retries=0,
+    )
+
+    response = provider.generate(
+        LLMRequest(
+            system_prompt="system",
+            user_prompt="user",
+            model="test-model",
+            max_output_tokens=64,
+        )
+    )
+
+    assert captured["trust_env"] is False
+    assert response.raw_response_id == "chatcmpl-test"
 
 
 @pytest.mark.parametrize(

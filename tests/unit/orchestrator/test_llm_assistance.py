@@ -239,7 +239,7 @@ def test_claim_reviewer_cannot_create_claims() -> None:
 
     assert result.used is True
     assert [item["claim_id"] for item in result.decisions] == [str(claim_id)]
-    assert result.decisions[0]["decision"] == "vague"
+    assert result.decisions[0]["decision"] == "reject"
 
 
 def test_claim_reviewer_accepts_deepseek_review_aliases() -> None:
@@ -269,7 +269,8 @@ def test_claim_reviewer_accepts_deepseek_review_aliases() -> None:
     result = service.review(query="What is LangGraph?", claims=[_claim(claim_id)])
 
     assert result.used is True
-    assert result.decisions[0]["decision"] == "accept"
+    assert result.decisions[0]["decision"] == "keep_main"
+    assert result.decisions[0]["related_answer_slot"] == "definition"
     assert result.decisions[0]["covered_slot_ids"] == ["definition"]
 
 
@@ -300,9 +301,9 @@ def test_claim_reviewer_empty_reasons_do_not_default_to_accept() -> None:
 
     assert result.used is False
     assert result.status == "low_quality_review"
-    assert result.decisions[0]["decision"] == "downrank"
+    assert result.decisions[0]["decision"] == "keep_supporting"
     assert "missing_reasons" in result.decisions[0]["quality_flags"]
-    assert result.diagnostics["decision_counts"] == {"downrank": 1}
+    assert result.diagnostics["decision_counts"] == {"keep_supporting": 1}
 
 
 def test_claim_reviewer_low_confidence_or_malformed_accept_is_not_accept() -> None:
@@ -329,11 +330,96 @@ def test_claim_reviewer_low_confidence_or_malformed_accept_is_not_accept() -> No
 
     result = service.review(query="What is LangGraph?", claims=[_claim(claim_id)])
 
-    assert result.used is False
-    assert result.status == "low_quality_review"
-    assert result.decisions[0]["decision"] == "downrank"
+    assert result.used is True
+    assert result.status == "used"
+    assert result.decisions[0]["decision"] == "keep_supporting"
     assert result.decisions[0]["confidence"] == 0.5
     assert "low_confidence" in result.decisions[0]["quality_flags"]
+
+
+def test_claim_reviewer_accepts_new_schema_and_rejects_context_roles() -> None:
+    main_id = uuid4()
+    context_id = uuid4()
+    service = LLMClaimReviewService(
+        enabled=True,
+        provider=StaticProvider(
+            {
+                "decisions": [
+                    {
+                        "claim_id": str(main_id),
+                        "decision": "keep_main",
+                        "relevance": "direct",
+                        "source_role": "primary_reference",
+                        "claim_role": "definition",
+                        "centrality": "core",
+                        "confidence": 0.92,
+                        "reasons": ["Direct definition evidence."],
+                        "related_planner_subquestion": "What is LangGraph?",
+                        "related_answer_slot": "definition",
+                    },
+                    {
+                        "claim_id": str(context_id),
+                        "decision": "keep_context",
+                        "relevance": "background",
+                        "source_role": "supporting_reference",
+                        "claim_role": "example",
+                        "centrality": "peripheral",
+                        "confidence": 0.78,
+                        "reasons": ["Context only."],
+                    },
+                ]
+            }
+        ),
+        model="deepseek-chat",
+        max_claims=10,
+        max_output_tokens=500,
+        input_max_chars=4000,
+    )
+
+    result = service.review(
+        query="What is LangGraph?",
+        claims=[_claim(main_id), _claim(context_id)],
+    )
+
+    assert result.used is True
+    assert result.decisions[0]["decision"] == "keep_main"
+    assert result.decisions[1]["decision"] == "keep_context"
+    assert result.diagnostics["reviewer_keep_main"] == 1
+    assert result.diagnostics["reviewer_keep_context"] == 1
+
+
+def test_claim_reviewer_keep_main_missing_slot_downgrades_safely() -> None:
+    claim_id = uuid4()
+    service = LLMClaimReviewService(
+        enabled=True,
+        provider=StaticProvider(
+            {
+                "decisions": [
+                    {
+                        "claim_id": str(claim_id),
+                        "decision": "keep_main",
+                        "relevance": "direct",
+                        "source_role": "primary_reference",
+                        "claim_role": "definition",
+                        "centrality": "core",
+                        "confidence": 0.91,
+                        "reasons": ["Direct but unmapped."],
+                    }
+                ]
+            }
+        ),
+        model="deepseek-chat",
+        max_claims=10,
+        max_output_tokens=500,
+        input_max_chars=4000,
+    )
+
+    result = service.review(query="What is LangGraph?", claims=[_claim(claim_id)])
+
+    assert result.used is False
+    assert result.status == "low_quality_review"
+    assert result.decisions[0]["decision"] == "keep_supporting"
+    assert "missing_valid_slot_coverage" in result.decisions[0]["quality_flags"]
 
 
 def test_claim_reviewer_malformed_output_falls_back() -> None:

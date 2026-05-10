@@ -43,6 +43,7 @@ from services.orchestrator.app.research_quality import (
     LLMClaimReviewService,
     LLMEvidenceRerankerService,
     LLMQueryRewriterService,
+    LLMResearchStrategistService,
     SourceJudgeService,
     SourceYieldSummary,
     analyze_required_slot_gaps,
@@ -51,6 +52,7 @@ from services.orchestrator.app.research_quality import (
     build_slot_coverage_summary,
     classify_source_intent,
     contribution_level_for_counts,
+    evaluate_research_coverage,
     normalize_dropped_reasons,
     source_intent_priority,
     summarize_evidence_yield,
@@ -204,6 +206,7 @@ class DebugRealPipelineRunner:
         planner_service: ResearchPlannerService | None = None,
         query_rewriter_service: LLMQueryRewriterService | None = None,
         source_judge_service: SourceJudgeService | None = None,
+        research_strategist_service: LLMResearchStrategistService | None = None,
         evidence_reranker_service: LLMEvidenceRerankerService | None = None,
         claim_reviewer_service: LLMClaimReviewService | None = None,
         dependencies: dict[str, Any],
@@ -218,6 +221,16 @@ class DebugRealPipelineRunner:
         max_supplemental_sources: int = 3,
         max_gap_rounds: int = 2,
         gap_max_queries_per_round: int = 4,
+        research_loop_enabled: bool = False,
+        research_loop_strategist_shadow_mode: bool = True,
+        research_loop_max_total_queries: int = 16,
+        research_loop_max_total_fetch_attempts: int = 20,
+        research_loop_max_strategy_calls: int = 4,
+        research_loop_fetch_more_candidates_per_round: int = 3,
+        research_loop_min_distinct_domains: int = 3,
+        research_loop_min_authoritative_sources: int = 1,
+        research_loop_required_slot_min_status: str = "moderate",
+        research_loop_allow_low_coverage_report: bool = True,
     ) -> None:
         self.session = session
         self.search_service = search_service
@@ -229,6 +242,7 @@ class DebugRealPipelineRunner:
         self.planner_service = planner_service
         self.query_rewriter_service = query_rewriter_service
         self.source_judge_service = source_judge_service
+        self.research_strategist_service = research_strategist_service
         self.evidence_reranker_service = evidence_reranker_service
         self.claim_reviewer_service = claim_reviewer_service
         self.research_plan: ResearchPlan | None = None
@@ -244,6 +258,23 @@ class DebugRealPipelineRunner:
         self.max_supplemental_sources = max(0, max_supplemental_sources)
         self.max_gap_rounds = max(0, max_gap_rounds)
         self.gap_max_queries_per_round = max(1, gap_max_queries_per_round)
+        self.research_loop_enabled = research_loop_enabled
+        self.research_loop_strategist_shadow_mode = research_loop_strategist_shadow_mode
+        self.research_loop_max_total_queries = max(1, research_loop_max_total_queries)
+        self.research_loop_max_total_fetch_attempts = max(1, research_loop_max_total_fetch_attempts)
+        self.research_loop_max_strategy_calls = max(0, research_loop_max_strategy_calls)
+        self.research_loop_fetch_more_candidates_per_round = max(
+            0,
+            research_loop_fetch_more_candidates_per_round,
+        )
+        self.research_loop_min_distinct_domains = max(0, research_loop_min_distinct_domains)
+        self.research_loop_min_authoritative_sources = max(
+            0,
+            research_loop_min_authoritative_sources,
+        )
+        self.research_loop_required_slot_min_status = research_loop_required_slot_min_status
+        self.research_loop_allow_low_coverage_report = research_loop_allow_low_coverage_report
+        self.research_strategy_calls = 0
         self.supplemental_acquisition_ran = False
         self.llm_assistance: dict[str, Any] = {}
         self.task_repository = ResearchTaskRepository(session)
@@ -389,18 +420,65 @@ class DebugRealPipelineRunner:
         round_no = 1
         while True:
             self._ensure_task_can_continue(task_id)
+            slot_coverage_summary = self._current_slot_coverage_summary(task_id)
+            coverage_evaluation = self._current_coverage_evaluation(
+                task_id,
+                slot_coverage_summary=slot_coverage_summary,
+                round_no=round_no,
+                max_rounds=max_rounds,
+            )
+            strategy_payload = self._run_research_strategy_if_configured(
+                task_id,
+                round_no=round_no,
+                max_rounds=max_rounds,
+                slot_coverage_summary=slot_coverage_summary,
+                coverage_evaluation=coverage_evaluation,
+            )
+            if strategy_payload is not None:
+                self._record_research_strategy(task_id, strategy_payload)
+
+            # Active loop break conditions
+            if self.research_loop_enabled:
+                if (
+                    not self.research_loop_strategist_shadow_mode
+                    and strategy_payload is not None
+                    and strategy_payload.get("status") == "used"
+                ):
+                    decision = strategy_payload.get("decision")
+                    if decision in {
+                        "stop_sufficient",
+                        "stop_budget_exhausted",
+                        "stop_unanswerable",
+                    }:
+                        break
+
+                if coverage_evaluation.get("can_stop") is True and (
+                    strategy_payload is None
+                    or strategy_payload.get("decision") in {None, "stop_sufficient"}
+                ):
+                    break
+
             analysis = analyze_required_slot_gaps(
                 task.query,
-                slot_coverage_summary=self._current_slot_coverage_summary(task_id),
+                slot_coverage_summary=slot_coverage_summary,
                 round_no=round_no,
                 max_rounds=max_rounds,
                 max_queries_per_round=self.gap_max_queries_per_round,
                 existing_query_texts=self._existing_search_query_texts(task_id),
             )
-            self._record_gap_analysis(task_id, analysis.to_payload())
-            if not analysis.triggered:
-                break
             analysis_payload = analysis.to_payload()
+            if strategy_payload is not None and self._strategy_should_drive_followup(
+                strategy_payload
+            ):
+                analysis_payload = _gap_analysis_payload_from_strategy(
+                    analysis_payload,
+                    strategy_payload,
+                    round_no=round_no,
+                    max_rounds=max_rounds,
+                )
+            self._record_gap_analysis(task_id, analysis_payload)
+            if not analysis_payload.get("triggered"):
+                break
 
             def run_gap_stage(
                 current_task_id: UUID,
@@ -427,40 +505,56 @@ class DebugRealPipelineRunner:
     ) -> dict[str, Any]:
         task = self._get_task(task_id)
         planned_queries = _planned_queries_from_gap_analysis(gap_analysis)
-        try:
-            search_result = self._run_search(
-                task_id,
-                planned_search_queries=planned_queries,
-                include_default_expansions=False,
-                require_candidates=False,
-            )
-        except SearchProviderError as error:
-            existing_evidence = self._existing_evidence_status_for_gap_fallback(task_id)
-            if not existing_evidence["usable_evidence"]:
-                raise
-            warnings = [
-                GAP_SEARCH_UNAVAILABLE_WARNING,
-                (
-                    f"{SUPPLEMENTAL_SEARCH_FAILED_WARNING}: {error.reason}; "
-                    "continuing to reporting with existing evidence."
-                ),
-            ]
-            return {
-                "gap_analysis": gap_analysis,
-                "search": {
-                    "supplemental_search": True,
-                    "failed": True,
-                    "reason": error.reason,
-                    "error": error.to_payload(),
-                    "planned_queries": [query.to_payload() for query in planned_queries],
-                    "search_query_count": 0,
-                    "search_result_count": 0,
-                },
-                "warnings": warnings,
-                "existing_evidence": existing_evidence,
-                "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
-                "continuing_with_existing_evidence": True,
-            }
+        strategy_decision = gap_analysis.get("strategy_decision")
+
+        search_result: dict[str, Any] = {
+            "search_queries": [],
+            "search_query_count": 0,
+            "search_result_count": 0,
+            "candidate_urls_added": 0,
+            "candidate_urls_available": 0,
+            "selected_sources": [],
+            "source_judgments": [],
+        }
+
+        if strategy_decision == "fetch_more_existing_candidates":
+            search_result["skipped"] = True
+            search_result["reason"] = "fetch_more_existing_candidates_decision"
+        else:
+            try:
+                search_result = self._run_search(
+                    task_id,
+                    planned_search_queries=planned_queries,
+                    include_default_expansions=False,
+                    require_candidates=False,
+                )
+            except SearchProviderError as error:
+                existing_evidence = self._existing_evidence_status_for_gap_fallback(task_id)
+                if not existing_evidence["usable_evidence"]:
+                    raise
+                warnings = [
+                    GAP_SEARCH_UNAVAILABLE_WARNING,
+                    (
+                        f"{SUPPLEMENTAL_SEARCH_FAILED_WARNING}: {error.reason}; "
+                        "continuing to reporting with existing evidence."
+                    ),
+                ]
+                return {
+                    "gap_analysis": gap_analysis,
+                    "search": {
+                        "supplemental_search": True,
+                        "failed": True,
+                        "reason": error.reason,
+                        "error": error.to_payload(),
+                        "planned_queries": [query.to_payload() for query in planned_queries],
+                        "search_query_count": 0,
+                        "search_result_count": 0,
+                    },
+                    "warnings": warnings,
+                    "existing_evidence": existing_evidence,
+                    "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                    "continuing_with_existing_evidence": True,
+                }
         tolerated_failure = _supplemental_search_provider_failure(search_result)
         if tolerated_failure is not None:
             existing_evidence = self._existing_evidence_status_for_gap_fallback(task_id)
@@ -498,11 +592,15 @@ class DebugRealPipelineRunner:
         fallback_sources: list[dict[str, Any]] = []
         skipped_fallback_sources: list[dict[str, Any]] = []
         if not selected_candidate_ids:
+            fetch_more_limit = self.max_supplemental_sources
+            if strategy_decision == "fetch_more_existing_candidates":
+                fetch_more_limit = self.research_loop_fetch_more_candidates_per_round
+
             fallback_candidates, skipped_fallback_sources = _select_supplemental_candidates(
                 self.session,
                 task_id,
                 query=task.query,
-                limit=self.max_supplemental_sources,
+                limit=fetch_more_limit,
                 high_value_only=True,
             )
             selected_candidate_ids = [candidate.id for candidate in fallback_candidates]
@@ -524,10 +622,11 @@ class DebugRealPipelineRunner:
                     "warnings": round_warnings,
                     "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
                 }
-                round_warnings.append(
-                    "Gap round search added no high-value URLs; attempting existing unattempted "
-                    "high-value candidates."
-                )
+                if strategy_decision != "fetch_more_existing_candidates":
+                    round_warnings.append(
+                        "Gap round search added no high-value URLs; attempting existing "
+                        "unattempted high-value candidates."
+                    )
 
         acquisition = self.acquisition_service.acquire_candidates(
             task_id,
@@ -583,6 +682,13 @@ class DebugRealPipelineRunner:
                 "skipped_fallback_sources": skipped_fallback_sources,
                 "warnings": round_warnings,
                 "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                "candidate_counts": _aggregate_candidate_counts(
+                    search_result=search_result,
+                    fallback_sources=fallback_sources,
+                    selected_candidate_ids=selected_candidate_ids,
+                    skipped_gap_search_sources=skipped_gap_search_sources,
+                    skipped_fallback_sources=skipped_fallback_sources,
+                ),
             }
 
         index_result = self.indexing_service.index_source_chunks(
@@ -632,6 +738,13 @@ class DebugRealPipelineRunner:
             "fallback_sources": fallback_sources,
             "skipped_gap_search_sources": skipped_gap_search_sources,
             "skipped_fallback_sources": skipped_fallback_sources,
+            "candidate_counts": _aggregate_candidate_counts(
+                search_result=search_result,
+                fallback_sources=fallback_sources,
+                selected_candidate_ids=selected_candidate_ids,
+                skipped_gap_search_sources=skipped_gap_search_sources,
+                skipped_fallback_sources=skipped_fallback_sources,
+            ),
             "warnings": round_warnings,
             "query": task.query,
         }
@@ -728,7 +841,10 @@ class DebugRealPipelineRunner:
             self.llm_assistance["source_judge"] = _source_judge_assistance_summary(
                 source_judgments,
                 enabled=self.source_judge_service.enabled,
-                active=self.source_judge_service.active_rerank,
+                active=(
+                    self.source_judge_service.active_rerank
+                    or getattr(self.source_judge_service, "active_triage", False)
+                ),
             )
         return {
             "search_queries": search_queries,
@@ -796,6 +912,12 @@ class DebugRealPipelineRunner:
                 and judgment.get("used_in_final_ranking") is True
             ):
                 metadata["llm_source_judge_priority_delta"] = _source_judge_priority_delta(output)
+            if (
+                getattr(self.source_judge_service, "active_triage", False)
+                and isinstance(output, dict)
+                and judgment.get("used_in_final_ranking") is True
+            ):
+                metadata["llm_source_triage_active"] = True
             candidate.metadata_json = metadata
         self.session.flush()
 
@@ -956,6 +1078,13 @@ class DebugRealPipelineRunner:
                 6,
             )
             fetch_limit = max(fetch_limit, 6)
+        elif self._is_recent_official_source_run():
+            target_successful_snapshots = max(
+                target_successful_snapshots,
+                self.min_answer_sources,
+                4,
+            )
+            fetch_limit = max(fetch_limit, 5)
         elif self._is_comparison_run(task_id):
             target_successful_snapshots = max(
                 target_successful_snapshots,
@@ -1003,6 +1132,7 @@ class DebugRealPipelineRunner:
             "skipped_existing": result.skipped_existing,
             "skipped_unsupported": result.skipped_unsupported,
             "failed": result.failed,
+            "rejection_reason_distribution": _aggregate_parse_rejection_reasons(parse_decisions),
             "parse_decisions": parse_decisions,
         }
         if result.created + result.updated + result.skipped_existing <= 0:
@@ -1541,6 +1671,27 @@ class DebugRealPipelineRunner:
         )
         self.session.commit()
 
+    def _record_research_strategy(self, task_id: UUID, strategy: dict[str, Any]) -> None:
+        task = self._get_task(task_id)
+        run = self._get_or_create_current_run(task)
+        self._update_run_checkpoint(
+            run,
+            current_state=task.status,
+            checkpoint_patch={"last_research_strategy": _json_safe(strategy)},
+        )
+        self._record_event(
+            task_id,
+            self._event_type("research_strategy"),
+            {
+                **self._pipeline_payload(from_status=task.status, to_status=task.status),
+                "stage": STAGE_RESEARCHING_MORE,
+                "result": _json_safe(strategy),
+                "warnings": _stage_warnings(strategy),
+            },
+            run_id=run.id,
+        )
+        self.session.commit()
+
     def _record_event(
         self,
         task_id: UUID,
@@ -1668,6 +1819,191 @@ class DebugRealPipelineRunner:
             ),
         )
 
+    def _current_coverage_evaluation(
+        self,
+        task_id: UUID,
+        *,
+        slot_coverage_summary: list[dict[str, Any]],
+        round_no: int,
+        max_rounds: int,
+    ) -> dict[str, Any]:
+        budget_exhausted = (
+            round_no > max_rounds
+            or self._safe_counts(task_id).fetch_attempts
+            >= self.research_loop_max_total_fetch_attempts
+        )
+        source_yield_summary = _build_source_yield_summary(
+            self.session,
+            task_id,
+            query=self._get_task(task_id).query,
+            evidence_candidates=_evidence_candidates_from_claims(self.session, task_id),
+            accepted_candidate_ids=set(),
+        )
+        return evaluate_research_coverage(
+            slot_coverage_summary=slot_coverage_summary,
+            source_yield_summary=source_yield_summary,
+            required_slot_min_status=self.research_loop_required_slot_min_status,
+            min_distinct_domains=self.research_loop_min_distinct_domains,
+            min_authoritative_sources=self.research_loop_min_authoritative_sources,
+            min_source_roles=2,  # Default for now, could be made a setting
+            allow_low_coverage_report=self.research_loop_allow_low_coverage_report,
+            budget_exhausted=budget_exhausted,
+        ).to_payload() | {"source_yield_summary": source_yield_summary}
+
+    def _run_research_strategy_if_configured(
+        self,
+        task_id: UUID,
+        *,
+        round_no: int,
+        max_rounds: int,
+        slot_coverage_summary: list[dict[str, Any]],
+        coverage_evaluation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self.research_strategist_service is None:
+            return None
+        if not self.research_strategist_service.enabled:
+            return None
+        if self.research_strategy_calls >= self.research_loop_max_strategy_calls:
+            return {
+                "status": "skipped",
+                "used": False,
+                "fallback_reason": "strategy_call_budget_exhausted",
+                "decision": None,
+                "planned_queries": [],
+                "diagnostics": {
+                    "strategy_calls": self.research_strategy_calls,
+                    "max_strategy_calls": self.research_loop_max_strategy_calls,
+                },
+                "coverage_evaluation": coverage_evaluation,
+                "round_no": round_no,
+                "max_rounds": max_rounds,
+            }
+        research_state = self._research_strategy_state(
+            task_id,
+            round_no=round_no,
+            max_rounds=max_rounds,
+            slot_coverage_summary=slot_coverage_summary,
+            coverage_evaluation=coverage_evaluation,
+        )
+        self.research_strategy_calls += 1
+        result = self.research_strategist_service.decide(
+            research_state,
+            existing_query_texts=self._existing_search_query_texts(task_id),
+        )
+        payload = result.to_payload()
+        payload["round_no"] = round_no
+        payload["max_rounds"] = max_rounds
+        payload["shadow_mode"] = self.research_loop_strategist_shadow_mode
+        payload["active_loop_enabled"] = self.research_loop_enabled
+        payload["coverage_evaluation"] = coverage_evaluation
+        payload["budget_remaining"] = research_state["budget_remaining"]
+        self.llm_assistance["research_strategist"] = {
+            "enabled": self.research_strategist_service.enabled,
+            "used": result.used,
+            "status": result.status,
+            "fallback_reason": result.fallback_reason,
+            "decision": result.decision,
+            "planned_query_count": len(result.planned_queries),
+        }
+        return payload
+
+    def _research_strategy_state(
+        self,
+        task_id: UUID,
+        *,
+        round_no: int,
+        max_rounds: int,
+        slot_coverage_summary: list[dict[str, Any]],
+        coverage_evaluation: dict[str, Any],
+    ) -> dict[str, Any]:
+        task = self._get_task(task_id)
+        counts = self._safe_counts(task_id)
+        previous_queries = [
+            {
+                "query_text": item.query_text,
+                "round": item.round_no,
+                "provider": item.provider,
+                "result_count": _safe_int((item.raw_response_json or {}).get("result_count")),
+            }
+            for item in SearchQueryRepository(self.session).list_for_task(task_id)
+        ][-20:]
+        fetch_jobs = FetchJobRepository(self.session).list_for_task(task_id)
+        attempted_candidate_ids = {fetch_job.candidate_url_id for fetch_job in fetch_jobs}
+        candidate_summary = []
+        for candidate in CandidateUrlRepository(self.session).list_for_task(task_id)[:30]:
+            candidate_summary.append(
+                {
+                    **_candidate_url_summary(candidate, query=task.query),
+                    "attempt_status": (
+                        "ATTEMPTED" if candidate.id in attempted_candidate_ids else "UNATTEMPTED"
+                    ),
+                }
+            )
+        verified_claim_summary = []
+        for claim in ClaimRepository(self.session).list_for_task(task_id)[:30]:
+            if claim.verification_status == "draft":
+                continue
+            notes = claim.notes_json if isinstance(claim.notes_json, dict) else {}
+            verified_claim_summary.append(
+                {
+                    "claim": claim.statement,
+                    "verification_status": claim.verification_status,
+                    "covered_slots": [
+                        item for item in notes.get("slot_ids", []) if isinstance(item, str)
+                    ],
+                    "support_level": _claim_support_level_from_notes(notes),
+                }
+            )
+        return {
+            "question": task.query,
+            "normalized_question": (
+                self.research_plan.normalized_question
+                if self.research_plan is not None
+                else task.query
+            ),
+            "round_index": round_no,
+            "budget_remaining": {
+                "max_rounds_remaining": max(0, max_rounds - round_no + 1),
+                "search_queries_remaining": max(
+                    0,
+                    self.research_loop_max_total_queries - counts.search_queries,
+                ),
+                "fetch_attempts_remaining": max(
+                    0,
+                    self.research_loop_max_total_fetch_attempts - counts.fetch_attempts,
+                ),
+                "llm_calls_remaining": max(
+                    0,
+                    self.research_loop_max_strategy_calls - self.research_strategy_calls,
+                ),
+            },
+            "answer_slots": slot_coverage_summary,
+            "coverage_evaluation": coverage_evaluation,
+            "previous_queries": previous_queries,
+            "candidate_summary": candidate_summary,
+            "verified_claim_summary": verified_claim_summary,
+            "constraints": {
+                "max_queries_per_round": self.gap_max_queries_per_round,
+                "required_slot_min_status": self.research_loop_required_slot_min_status,
+                "min_distinct_domains": self.research_loop_min_distinct_domains,
+                "min_authoritative_sources": self.research_loop_min_authoritative_sources,
+            },
+        }
+
+    def _strategy_should_drive_followup(self, strategy_payload: dict[str, Any] | None) -> bool:
+        if strategy_payload is None:
+            return False
+        if not self.research_loop_enabled or self.research_loop_strategist_shadow_mode:
+            return False
+        if strategy_payload.get("status") != "used":
+            return False
+        decision = strategy_payload.get("decision")
+        if decision == "continue_search":
+            return bool(strategy_payload.get("planned_queries"))
+        if decision == "fetch_more_existing_candidates":
+            return True
+        return False
+
     def _existing_evidence_status_for_gap_fallback(self, task_id: UUID) -> dict[str, Any]:
         counts = self._safe_counts(task_id)
         slot_coverage_summary = self._current_slot_coverage_summary(task_id)
@@ -1701,6 +2037,14 @@ class DebugRealPipelineRunner:
             self.research_plan is not None
             and self.research_plan.intent_classification == "overview_definition_intent"
         )
+
+    def _is_recent_official_source_run(self) -> bool:
+        if self.research_plan is None:
+            return False
+        warnings = set(self.research_plan.planner_guardrail_warnings) | set(
+            self.research_plan.warnings
+        )
+        return "planner_queries_supplemented_for_recent_nvidia_official_sources" in warnings
 
     def _is_deployment_run(self, task_id: UUID) -> bool:
         if self.research_plan is not None:
@@ -1744,7 +2088,7 @@ def collect_debug_pipeline_counts(
     )
 
 
-def _counts_to_dict(counts: DebugPipelineCounts) -> dict[str, int]:
+def _counts_to_dict(counts: DebugPipelineCounts) -> dict[str, Any]:
     return {
         "search_queries": counts.search_queries,
         "candidate_urls": counts.candidate_urls,
@@ -1756,6 +2100,13 @@ def _counts_to_dict(counts: DebugPipelineCounts) -> dict[str, int]:
         "claims": counts.claims,
         "claim_evidence": counts.claim_evidence,
         "report_artifacts": counts.report_artifacts,
+        "yield_breakdown": (
+            f"fetch_succeeded({counts.content_snapshots}) -> "
+            f"source_documents({counts.source_documents}) -> "
+            f"source_chunks({counts.source_chunks}) -> "
+            f"claims({counts.claims}) -> "
+            f"evidence({counts.claim_evidence})"
+        ),
     }
 
 
@@ -1873,6 +2224,13 @@ def _acquisition_stage_result(result: Any) -> dict[str, Any]:
         _unattempted_candidate_summary(candidate_url, query=task_query)
         for candidate_url in result.unattempted_candidates
     ]
+    skipped_by_triage_sources = [
+        {
+            **_unattempted_candidate_summary(candidate_url, query=task_query),
+            "skip_reason": "llm_source_triage_skip",
+        }
+        for candidate_url in getattr(result, "skipped_by_triage_candidates", [])
+    ]
     failed_sources = [
         source for source in attempted_sources if source.get("fetch_status") == "FAILED"
     ]
@@ -1881,11 +2239,18 @@ def _acquisition_stage_result(result: Any) -> dict[str, Any]:
         for source in attempted_sources
         if source.get("fetch_status") == "SUCCEEDED" and source.get("snapshot_id") is not None
     ]
-    selected_sources = [*attempted_sources, *unattempted_sources]
+    selected_sources = [*attempted_sources, *unattempted_sources, *skipped_by_triage_sources]
     dropped_sources = [
         {**source, "dropped_reasons": [_fetch_dropped_reason(source)]}
-        for source in [*failed_sources, *unattempted_sources]
+        for source in [*failed_sources, *unattempted_sources, *skipped_by_triage_sources]
     ]
+    per_domain_attempt_distribution: dict[str, int] = {}
+    for source in attempted_sources:
+        domain = source.get("domain")
+        if isinstance(domain, str) and domain:
+            per_domain_attempt_distribution[domain] = (
+                per_domain_attempt_distribution.get(domain, 0) + 1
+            )
     return {
         "created": result.created,
         "skipped_existing": result.skipped_existing,
@@ -1901,6 +2266,11 @@ def _acquisition_stage_result(result: Any) -> dict[str, Any]:
         "selected_sources": selected_sources,
         "attempted_sources": attempted_sources,
         "unattempted_sources": unattempted_sources,
+        "skipped_by_triage_sources": skipped_by_triage_sources,
+        "selected_but_unattempted_count": len(unattempted_sources),
+        "skipped_by_budget_count": len(unattempted_sources),
+        "skipped_by_triage_count": len(skipped_by_triage_sources),
+        "per_domain_attempt_distribution": dict(sorted(per_domain_attempt_distribution.items())),
         "dropped_sources": dropped_sources,
         "failed_sources": failed_sources,
         "fetch_attempts_summary": selected_sources,
@@ -2103,6 +2473,78 @@ def _planned_queries_from_gap_analysis(gap_analysis: dict[str, Any]) -> list[Pla
             )
         )
     return planned
+
+
+def _gap_analysis_payload_from_strategy(
+    fallback_gap_analysis: dict[str, Any],
+    strategy_payload: dict[str, Any],
+    *,
+    round_no: int,
+    max_rounds: int,
+) -> dict[str, Any]:
+    decision = strategy_payload.get("decision")
+    planned_queries = [
+        query
+        for query in strategy_payload.get("planned_queries", [])
+        if isinstance(query, dict) and isinstance(query.get("query_text"), str)
+    ]
+    if decision == "continue_search" and not planned_queries:
+        return fallback_gap_analysis
+
+    triggered = False
+    reason = None
+    if decision == "continue_search":
+        triggered = True
+        reason = "llm_research_strategy_continue_search"
+    elif decision == "fetch_more_existing_candidates":
+        triggered = True
+        reason = "llm_research_strategy_fetch_more_existing_candidates"
+
+    if not triggered:
+        return fallback_gap_analysis
+
+    return {
+        **fallback_gap_analysis,
+        "round_no": round_no,
+        "max_rounds": max_rounds,
+        "triggered": True,
+        "reason": reason,
+        "strategy_status": strategy_payload.get("status"),
+        "strategy_decision": decision,
+        "coverage_evaluation": strategy_payload.get("coverage_evaluation"),
+        "supplemental_queries": [
+            {
+                **query,
+                "query_source": "llm_research_strategist",
+                "round_no": round_no,
+                "slot_ids": (
+                    query.get("metadata", {}).get("target_slots")
+                    if isinstance(query.get("metadata"), dict)
+                    else []
+                ),
+            }
+            for query in planned_queries
+        ],
+        "fallback_gap_analysis": fallback_gap_analysis,
+    }
+
+
+def _claim_support_level_from_notes(notes: dict[str, Any]) -> str:
+    verification = notes.get("verification")
+    if not isinstance(verification, dict):
+        return "unknown"
+    strong = _safe_int(verification.get("strong_support_evidence_count"))
+    weak = _safe_int(verification.get("weak_support_evidence_count"))
+    contradict = _safe_int(verification.get("contradict_evidence_count"))
+    if strong and contradict:
+        return "mixed"
+    if strong:
+        return "strong"
+    if weak:
+        return "weak"
+    if contradict:
+        return "contradicted"
+    return "unsupported"
 
 
 def _select_claim_drafting_chunk_ids(
@@ -2548,6 +2990,7 @@ def _build_source_yield_summary(
     source_documents = SourceDocumentRepository(session).list_for_task(task_id)
     source_chunks = SourceChunkRepository(session).list_for_task(task_id)
     claims = ClaimRepository(session).list_for_task(task_id)
+    search_queries = SearchQueryRepository(session).list_for_task(task_id)
 
     fetch_job_by_candidate_id = {fetch_job.candidate_url_id: fetch_job for fetch_job in fetch_jobs}
     latest_attempt_by_fetch_job_id = {attempt.fetch_job_id: attempt for attempt in fetch_attempts}
@@ -2555,6 +2998,7 @@ def _build_source_yield_summary(
         snapshot.fetch_attempt_id: snapshot for snapshot in content_snapshots
     }
     source_document_by_url = {item.canonical_url: item for item in source_documents}
+    search_queries_by_id = {item.id: item for item in search_queries}
     chunks_by_source_document_id: dict[UUID, list[SourceChunk]] = {}
     for chunk in source_chunks:
         chunks_by_source_document_id.setdefault(chunk.source_document_id, []).append(chunk)
@@ -2629,6 +3073,12 @@ def _build_source_yield_summary(
                 else False
             ),
         )
+        search_query = search_queries_by_id.get(candidate.search_query_id)
+        target_slot_ids = _target_slot_ids_from_candidate_or_search_query(
+            candidate.metadata_json,
+            search_query,
+        )
+
         rows.append(
             SourceYieldSummary(
                 source_document_id=str(source_document.id) if source_document is not None else None,
@@ -2654,6 +3104,7 @@ def _build_source_yield_summary(
                 "domain": candidate.domain,
                 "title": candidate.title,
                 "rank": candidate.rank,
+                "target_slot_ids": target_slot_ids,
             }
         )
         seen_urls.add(candidate.canonical_url)
@@ -2756,6 +3207,44 @@ def _source_yield_dropped_reasons(
     elif accepted_evidence_count <= 0 and claim_count <= 0:
         reasons.append("off_intent")
     return normalize_dropped_reasons(reasons)
+
+
+def _target_slot_ids_from_candidate_or_search_query(
+    candidate_metadata: dict[str, Any] | None,
+    search_query: Any | None,
+) -> list[str]:
+    candidate_slots = _normalize_slot_id_list(
+        (candidate_metadata or {}).get("target_slots")
+        or (candidate_metadata or {}).get("slot_ids")
+    )
+    if candidate_slots:
+        return candidate_slots
+
+    raw_response = getattr(search_query, "raw_response_json", None) if search_query else None
+    if not isinstance(raw_response, dict):
+        return []
+
+    search_slots = _normalize_slot_id_list(
+        raw_response.get("target_slots") or raw_response.get("slot_ids")
+    )
+    if search_slots:
+        return search_slots
+
+    expansion_metadata = raw_response.get("expansion_metadata")
+    if not isinstance(expansion_metadata, dict):
+        return []
+    return _normalize_slot_id_list(
+        expansion_metadata.get("target_slots") or expansion_metadata.get("slot_ids")
+    )
+
+
+def _normalize_slot_id_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _fetch_job_blocked_by_policy(
@@ -3136,6 +3625,16 @@ def _format_parse_no_documents_message(parse_decisions: list[dict[str, Any]]) ->
     return "parse produced no source documents; parse decisions: " + " | ".join(formatted_decisions)
 
 
+def _aggregate_parse_rejection_reasons(parse_decisions: list[dict[str, Any]]) -> dict[str, int]:
+    distribution: dict[str, int] = {}
+    for decision in parse_decisions:
+        reason = str(decision.get("reason") or "unknown")
+        if decision.get("decision") == "created":
+            continue
+        distribution[reason] = distribution.get(reason, 0) + 1
+    return distribution
+
+
 def _source_judge_priority_delta(output: dict[str, Any]) -> int:
     label = str(output.get("label") or "uncertain")
     confidence = output.get("confidence")
@@ -3291,3 +3790,37 @@ def _json_safe(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             safe_payload[key] = value
     return safe_payload
+
+
+def _aggregate_candidate_counts(
+    *,
+    search_result: dict[str, Any],
+    fallback_sources: list[dict[str, Any]],
+    selected_candidate_ids: list[UUID],
+    skipped_gap_search_sources: list[dict[str, Any]],
+    skipped_fallback_sources: list[dict[str, Any]],
+) -> dict[str, int]:
+    all_skipped = skipped_gap_search_sources + skipped_fallback_sources
+    rejected_by_triage_count = sum(
+        1
+        for s in all_skipped
+        if s.get("skip_reason")
+        in {
+            "low_value_gap_search_result",
+            "low_priority_for_overview_supplemental_acquisition",
+            "not_a_high_value_supplemental_source",
+        }
+    )
+    skipped_budget = sum(
+        1
+        for s in all_skipped
+        if s.get("skip_reason")
+        in {"acquisition_limit_reached", "supplemental_acquisition_limit_reached"}
+    )
+    return {
+        "newly_discovered": search_result.get("candidate_urls_added", 0),
+        "existing_unattempted_reused": len(fallback_sources),
+        "skipped_budget_limit": skipped_budget,
+        "rejected_by_triage": rejected_by_triage_count,
+        "attempted_in_round": len(selected_candidate_ids),
+    }

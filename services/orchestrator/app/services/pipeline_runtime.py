@@ -74,6 +74,9 @@ def create_pipeline_runner(
     llm_source_judge_provider = (
         create_llm_provider(settings) if llm_source_judge_configured(settings) else None
     )
+    llm_research_strategist_provider = (
+        create_llm_provider(settings) if llm_research_strategist_configured(settings) else None
+    )
     llm_query_rewriter_provider = (
         create_llm_provider(settings) if llm_query_rewriter_configured(settings) else None
     )
@@ -97,6 +100,7 @@ def create_pipeline_runner(
             snapshot_object_store=object_store,
             snapshot_bucket=settings.snapshot_storage_bucket,
             max_candidates_per_request=settings.acquisition_max_candidates_per_request,
+            max_must_fetch_per_round=settings.research_acquisition_max_must_fetch_per_round,
             allowed_statuses=ACQUISITION_ALLOWED_STATUSES,
         ),
         parsing_service=create_parsing_service(
@@ -145,6 +149,10 @@ def create_pipeline_runner(
             settings,
             provider=llm_source_judge_provider,
         ),
+        research_strategist_service=create_research_strategist_service(
+            settings,
+            provider=llm_research_strategist_provider,
+        ),
         evidence_reranker_service=create_evidence_reranker_service(
             settings,
             provider=llm_evidence_reranker_provider,
@@ -155,16 +163,34 @@ def create_pipeline_runner(
         ),
         dependencies=dependencies,
         fetch_limit=settings.acquisition_max_candidates_per_request,
-        parse_limit=3,
+        parse_limit=settings.research_parse_limit,
         index_limit=10,
-        claim_limit=5,
+        claim_limit=settings.research_claim_limit,
         event_source=event_source,
         event_prefix=event_prefix,
         target_successful_snapshots=settings.acquisition_target_successful_snapshots,
         min_answer_sources=settings.acquisition_min_answer_sources,
         max_supplemental_sources=settings.acquisition_max_supplemental_sources,
-        max_gap_rounds=settings.research_gap_max_rounds,
-        gap_max_queries_per_round=settings.research_gap_max_queries_per_round,
+        max_gap_rounds=(
+            settings.research_loop_max_rounds
+            if settings.research_loop_enabled
+            else settings.research_gap_max_rounds
+        ),
+        gap_max_queries_per_round=(
+            settings.research_loop_max_queries_per_round
+            if settings.research_loop_enabled
+            else settings.research_gap_max_queries_per_round
+        ),
+        research_loop_enabled=settings.research_loop_enabled,
+        research_loop_strategist_shadow_mode=settings.research_loop_strategist_shadow_mode,
+        research_loop_max_total_queries=settings.research_loop_max_total_queries,
+        research_loop_max_total_fetch_attempts=settings.research_loop_max_total_fetch_attempts,
+        research_loop_max_strategy_calls=settings.research_loop_max_strategy_calls,
+        research_loop_fetch_more_candidates_per_round=settings.research_loop_fetch_more_candidates_per_round,
+        research_loop_min_distinct_domains=settings.research_loop_min_distinct_domains,
+        research_loop_min_authoritative_sources=settings.research_loop_min_authoritative_sources,
+        research_loop_required_slot_min_status=settings.research_loop_required_slot_min_status,
+        research_loop_allow_low_coverage_report=settings.research_loop_allow_low_coverage_report,
     )
 
 
@@ -220,6 +246,15 @@ def pipeline_dependency_summary(settings: Settings) -> dict[str, Any]:
         "llm_source_judge_active_rerank": bool(
             settings.llm_source_judge_active_rerank and llm_source_judge_configured(settings)
         ),
+        "llm_source_triage_active": bool(
+            settings.llm_source_triage_active and llm_source_judge_configured(settings)
+        ),
+        "research_loop_enabled": settings.research_loop_enabled,
+        "research_loop_strategist_enabled": llm_research_strategist_configured(settings),
+        "research_loop_strategist_shadow_mode": settings.research_loop_strategist_shadow_mode,
+        "research_loop_max_rounds": settings.research_loop_max_rounds,
+        "research_loop_max_total_queries": settings.research_loop_max_total_queries,
+        "research_loop_max_total_fetch_attempts": settings.research_loop_max_total_fetch_attempts,
         "llm_query_rewriter_enabled": llm_query_rewriter_configured(settings),
         "llm_evidence_reranker_enabled": llm_evidence_reranker_configured(settings),
         "llm_claim_reviewer_enabled": llm_claim_reviewer_configured(settings),
@@ -278,6 +313,8 @@ def build_runtime_http_client(settings: Settings) -> HttpAcquisitionClient:
         max_redirects=settings.acquisition_max_redirects,
         max_response_bytes=settings.acquisition_max_response_bytes,
         user_agent=settings.acquisition_user_agent,
+        accept_language=settings.acquisition_accept_language,
+        trust_env_proxy=settings.acquisition_trust_env_proxy,
     )
 
 
@@ -316,6 +353,7 @@ def llm_mode(settings: Settings) -> str:
         for name, configured in (
             ("rewrite", llm_query_rewriter_configured(settings)),
             ("judge", llm_source_judge_configured(settings)),
+            ("strategy", llm_research_strategist_configured(settings)),
             ("rerank", llm_evidence_reranker_configured(settings)),
             ("review", llm_claim_reviewer_configured(settings)),
         )
@@ -343,6 +381,7 @@ def uses_llm_api(settings: Settings) -> bool:
             settings.research_planner_enabled
             or settings.llm_report_writer_enabled
             or settings.llm_source_judge_enabled
+            or settings.research_loop_strategist_enabled
             or settings.llm_query_rewriter_enabled
             or settings.llm_evidence_reranker_enabled
             or settings.llm_claim_reviewer_enabled
@@ -360,6 +399,10 @@ def llm_report_writer_configured(settings: Settings) -> bool:
 
 def llm_source_judge_configured(settings: Settings) -> bool:
     return bool(settings.llm_enabled and settings.llm_source_judge_enabled)
+
+
+def llm_research_strategist_configured(settings: Settings) -> bool:
+    return bool(settings.llm_enabled and settings.research_loop_strategist_enabled)
 
 
 def llm_query_rewriter_configured(settings: Settings) -> bool:
@@ -382,9 +425,25 @@ def create_source_judge_service(settings: Settings, *, provider: Any) -> Any:
         active_rerank=bool(
             settings.llm_source_judge_active_rerank and llm_source_judge_configured(settings)
         ),
+        active_triage=bool(
+            settings.llm_source_triage_active and llm_source_judge_configured(settings)
+        ),
         provider=provider,
         model=settings.llm_model,
         max_candidates=settings.llm_source_judge_max_candidates,
+    )
+
+
+def create_research_strategist_service(settings: Settings, *, provider: Any) -> Any:
+    from services.orchestrator.app.research_quality import LLMResearchStrategistService
+
+    return LLMResearchStrategistService(
+        enabled=llm_research_strategist_configured(settings),
+        provider=provider,
+        model=settings.llm_model,
+        max_queries=settings.research_loop_max_queries_per_round,
+        max_output_tokens=settings.llm_max_output_tokens,
+        input_max_chars=settings.llm_assistance_input_max_chars,
     )
 
 

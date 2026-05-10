@@ -27,5 +27,6 @@ def create_llm_provider(
             timeout_seconds=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
             client=client,
+            trust_env_proxy=settings.llm_trust_env_proxy,
         )
     return UnsupportedLLMProvider(settings.llm_provider.strip())

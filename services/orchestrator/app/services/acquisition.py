@@ -65,6 +65,7 @@ class AcquisitionBatchResult:
     task: ResearchTask
     selected_candidates_from_search: list[CandidateUrl]
     selected_candidates_for_fetch: list[CandidateUrl]
+    skipped_by_triage_candidates: list[CandidateUrl]
     unattempted_candidates: list[CandidateUrl]
     entries: list[AcquisitionLedgerEntry]
     created: int
@@ -94,6 +95,7 @@ class AcquisitionService:
         snapshot_object_store: SnapshotObjectStore,
         snapshot_bucket: str,
         max_candidates_per_request: int,
+        max_must_fetch_per_round: int = 3,
         allowed_statuses: tuple[str, ...] = (PHASE2_ACTIVE_STATUS,),
     ) -> None:
         self.session = session
@@ -106,6 +108,7 @@ class AcquisitionService:
         self.snapshot_object_store = snapshot_object_store
         self.snapshot_bucket = snapshot_bucket
         self.max_candidates_per_request = max_candidates_per_request
+        self.max_must_fetch_per_round = max(0, max_must_fetch_per_round)
         self.allowed_statuses = allowed_statuses
 
     def acquire_candidates(
@@ -128,11 +131,17 @@ class AcquisitionService:
             task.id,
             candidate_url_ids=candidate_url_ids,
         )
-        selected_candidates_for_fetch = (
-            selected_candidates_from_search
-            if candidate_url_ids is not None
-            else _sort_candidates_for_fetch(selected_candidates_from_search, query=task.query)
-        )
+        skipped_by_triage_candidates: list[CandidateUrl] = []
+        if candidate_url_ids is not None:
+            selected_candidates_for_fetch = selected_candidates_from_search
+        else:
+            selected_candidates_for_fetch, skipped_by_triage_candidates = (
+                _sort_candidates_for_fetch(
+                    selected_candidates_from_search,
+                    query=task.query,
+                    max_must_fetch_per_round=self.max_must_fetch_per_round,
+                )
+            )
         success_target = (
             max(target_successful_snapshots, 1) if target_successful_snapshots is not None else None
         )
@@ -213,6 +222,7 @@ class AcquisitionService:
             task=task,
             selected_candidates_from_search=selected_candidates_from_search,
             selected_candidates_for_fetch=selected_candidates_for_fetch,
+            skipped_by_triage_candidates=skipped_by_triage_candidates,
             unattempted_candidates=unattempted_candidates,
             entries=entries,
             created=created,
@@ -403,6 +413,7 @@ def create_acquisition_service(
     snapshot_object_store: SnapshotObjectStore,
     snapshot_bucket: str,
     max_candidates_per_request: int,
+    max_must_fetch_per_round: int = 3,
     allowed_statuses: tuple[str, ...] = (PHASE2_ACTIVE_STATUS,),
 ) -> AcquisitionService:
     return AcquisitionService(
@@ -416,6 +427,7 @@ def create_acquisition_service(
         snapshot_object_store=snapshot_object_store,
         snapshot_bucket=snapshot_bucket,
         max_candidates_per_request=max_candidates_per_request,
+        max_must_fetch_per_round=max_must_fetch_per_round,
         allowed_statuses=allowed_statuses,
     )
 
@@ -437,13 +449,44 @@ def _sort_candidates_for_fetch(
     candidates: list[CandidateUrl],
     *,
     query: str | None = None,
-) -> list[CandidateUrl]:
+    max_must_fetch_per_round: int = 3,
+) -> tuple[list[CandidateUrl], list[CandidateUrl]]:
+    fetchable_candidates: list[CandidateUrl] = []
+    skipped_by_triage: list[CandidateUrl] = []
+    for candidate in candidates:
+        triage_decision = _active_triage_decision(candidate)
+        if triage_decision in {"skip_duplicate", "skip_low_value", "skip_unsafe_or_invalid"}:
+            skipped_by_triage.append(candidate)
+            continue
+        fetchable_candidates.append(candidate)
     sorted_candidates = sorted(
-        candidates, key=lambda candidate: _fetch_priority_key(candidate, query=query)
+        fetchable_candidates, key=lambda candidate: _fetch_priority_key(candidate, query=query)
+    )
+    sorted_candidates = _prioritize_must_fetch_candidates(
+        sorted_candidates,
+        max_must_fetch_per_round=max_must_fetch_per_round,
     )
     if not _query_asks_comparison(query):
-        return sorted_candidates
-    return _interleave_candidates_by_known_entity(sorted_candidates)
+        return sorted_candidates, skipped_by_triage
+    return _interleave_candidates_by_known_entity(sorted_candidates), skipped_by_triage
+
+
+def _prioritize_must_fetch_candidates(
+    candidates: list[CandidateUrl],
+    *,
+    max_must_fetch_per_round: int,
+) -> list[CandidateUrl]:
+    if max_must_fetch_per_round <= 0:
+        return candidates
+    must_fetch = [
+        candidate for candidate in candidates if _active_triage_decision(candidate) == "must_fetch"
+    ]
+    if not must_fetch:
+        return candidates
+    must_fetch_ids = {candidate.id for candidate in must_fetch[:max_must_fetch_per_round]}
+    prioritized = [candidate for candidate in candidates if candidate.id in must_fetch_ids]
+    remainder = [candidate for candidate in candidates if candidate.id not in must_fetch_ids]
+    return prioritized + remainder
 
 
 def _query_asks_comparison(query: str | None) -> bool:
@@ -508,6 +551,16 @@ def _fetch_priority_key(
 
 
 def _fetch_priority_score(candidate_url: CandidateUrl, *, query: str | None = None) -> int:
+    triage_decision = _active_triage_decision(candidate_url)
+    if triage_decision == "must_fetch":
+        priority = _active_triage_fetch_priority(candidate_url)
+        return priority if priority is not None else 0
+    if triage_decision == "fetch_if_budget_allows":
+        priority = _active_triage_fetch_priority(candidate_url)
+        return priority if priority is not None else 20
+    if triage_decision == "defer":
+        priority = _active_triage_fetch_priority(candidate_url)
+        return priority if priority is not None else 70
     score = fetch_priority_metadata(candidate_url, query=query).get("fetch_priority_score")
     base_score = score if isinstance(score, int) else 0
     metadata = candidate_url.metadata_json or {}
@@ -535,7 +588,54 @@ def fetch_priority_metadata(
     if isinstance(adjustment, int | float):
         source_metadata["llm_source_judge_priority_delta"] = adjustment
         source_metadata["llm_source_judge"] = metadata.get("llm_source_judge")
+    triage = _active_triage_payload(candidate_url)
+    if triage:
+        source_metadata.update(triage)
     return source_metadata
+
+
+def _active_triage_decision(candidate_url: CandidateUrl) -> str | None:
+    payload = _active_triage_payload(candidate_url)
+    decision = payload.get("triage_decision") if payload else None
+    return decision if isinstance(decision, str) else None
+
+
+def _active_triage_fetch_priority(candidate_url: CandidateUrl) -> int | None:
+    payload = _active_triage_payload(candidate_url)
+    priority = payload.get("fetch_priority") if payload else None
+    return priority if isinstance(priority, int) else None
+
+
+def _active_triage_payload(candidate_url: CandidateUrl) -> dict[str, Any]:
+    metadata = candidate_url.metadata_json or {}
+    if metadata.get("llm_source_triage_active") is not True:
+        return {}
+    source_judge = metadata.get("llm_source_judge")
+    if not isinstance(source_judge, dict):
+        return {}
+    output = source_judge.get("output_judgment")
+    if not isinstance(output, dict):
+        return {}
+    decision = output.get("triage_decision")
+    if not isinstance(decision, str):
+        return {}
+    payload: dict[str, Any] = {
+        "triage_decision": decision,
+        "llm_source_triage_active": True,
+    }
+    for key in (
+        "topic_fit",
+        "authority",
+        "novelty",
+        "expected_covered_slots",
+        "source_role",
+        "fetch_priority",
+        "risk_flags",
+    ):
+        value = output.get(key)
+        if value is not None:
+            payload[key] = value
+    return payload
 
 
 def _source_category(candidate_url: CandidateUrl) -> str:

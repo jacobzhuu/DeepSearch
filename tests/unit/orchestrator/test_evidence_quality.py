@@ -90,6 +90,8 @@ def test_evidence_yield_and_slot_coverage_summaries_are_structured() -> None:
 
     assert evidence_summary["total_candidates"] == 3
     assert evidence_summary["accepted_candidates"] == 1
+    assert evidence_summary["unselected_candidates"] == 1
+    assert evidence_summary["rejected_candidates"] == 1
     assert evidence_summary["top_rejection_reasons"] == [{"reason": "off_intent", "count": 1}]
     definition = next(row for row in slot_summary if row["slot_id"] == "definition")
     mechanism = next(row for row in slot_summary if row["slot_id"] == "mechanism")

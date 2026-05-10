@@ -4,8 +4,15 @@ import { PageLayout } from '../../components/layout/PageLayout';
 import { LoadingState } from '../../components/common/LoadingState';
 import { ErrorState } from '../../components/common/ErrorState';
 import { RuntimeModeBanner } from '../../components/common/RuntimeModeBanner';
+import { SectionCard } from '../../components/common/SectionCard';
+import { MetricCard } from '../../components/common/MetricCard';
+import { StatusBadge } from '../../components/common/StatusBadge';
+import { Button } from '../../components/common/Button';
+import { Badge } from '../../components/common/Badge';
+import { PipelineStepper } from '../../components/common/PipelineStepper';
 import { PipelineCounts, PipelineFailure, PipelineRunResponse, ResearchTask, TaskEvent } from '../../features/tasks/types';
 import { useCreateTask, useRunTask, useTask, useTaskAction, useTaskEvents } from '../../features/tasks/hooks';
+import { formatChinaDateTime, formatChinaTime } from '../../lib/datetime';
 
 export const TaskDetailPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
@@ -61,16 +68,18 @@ export const TaskDetailPage: React.FC = () => {
     await refetchEvents();
   };
 
-  if (isLoading) return <PageLayout title="任务详情"><LoadingState /></PageLayout>;
-  
+  if (isLoading) return <PageLayout title="研究详情"><LoadingState /></PageLayout>;
+
   if (error) return (
-    <PageLayout title="任务详情">
+    <PageLayout title="研究详情">
       <ErrorState error={error} onRetry={refetch} />
-      <Link to="/tasks">返回任务列表</Link>
+      <div style={{ marginTop: '1rem', textAlign: 'center' }}>
+        <Link to="/tasks">返回任务列表</Link>
+      </div>
     </PageLayout>
   );
 
-  if (!task) return <PageLayout title="任务详情"><p>未找到任务。</p></PageLayout>;
+  if (!task) return <PageLayout title="研究详情"><p>未找到任务。</p></PageLayout>;
 
   const canRun = task.status === 'PLANNED';
   const canPause = task.status === 'PLANNED' || activeTaskStatuses.has(task.status);
@@ -78,68 +87,49 @@ export const TaskDetailPage: React.FC = () => {
   const canCancel = task.status === 'PLANNED' || task.status === 'PAUSED' || activeTaskStatuses.has(task.status);
   const canCreateReplacement = task.status === 'FAILED';
   const actionBusy = isRunning || isCreating || isMutating;
-  const actionNote = canRun
-    ? null
-    : canCreateReplacement
-      ? '该任务已失败并保留在审计账本中，不能原地重跑。可以用相同查询创建一个新任务重新运行。'
-      : '只有处于 PLANNED 状态的任务才能运行。请在运行前创建一个新任务或修改该任务。';
+
   const observability = task.progress?.observability || null;
   const authoritativePipelineResult = pipelineResultFromTaskDetail(task, observability, eventsData?.events || []);
   const pipelineResult = authoritativePipelineResult || queuedPipelineResult;
   const latestPipelineFailure = pipelineResult?.failure || latestFailureFromEvents(eventsData?.events || []);
+
   const primaryActionLabel = canCreateReplacement
     ? isCreating || isRunning
       ? '新任务运行中...'
-      : '用相同查询新建任务'
+      : '重新创建并运行'
     : isRunning
       ? '运行中...'
-      : '运行 DeepSearch';
+      : '开始研究';
+
   const primaryActionDisabled = actionBusy || (!canRun && !canCreateReplacement);
   const handlePrimaryAction = canCreateReplacement ? handleCreateReplacementAndRun : handleRun;
 
+  const counts = pipelineResult?.counts || emptyCounts;
+
   return (
-    <PageLayout 
-      title="任务详情"
+    <PageLayout
+      title="研究详情"
       actions={
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', alignItems: 'flex-end' }}>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            <span style={{ padding: '0.25rem 0.75rem', backgroundColor: '#eee', borderRadius: '1rem', fontSize: '0.875rem', fontWeight: 'bold' }}>
-              {task.status}
-            </span>
-            <button
-              onClick={handlePrimaryAction}
-              disabled={primaryActionDisabled}
-              aria-describedby={actionNote ? 'run-disabled-reason' : undefined}
-              style={{ ...buttonStyle, border: 0, opacity: primaryActionDisabled ? 0.65 : 1, cursor: primaryActionDisabled ? 'not-allowed' : 'pointer' }}
-            >
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          {canPause && (
+            <Button variant="outline" size="sm" onClick={() => void handleTaskAction('pause')} disabled={actionBusy}>
+              暂停
+            </Button>
+          )}
+          {canResume && (
+            <Button variant="outline" size="sm" onClick={() => void handleTaskAction('resume')} disabled={actionBusy}>
+              继续
+            </Button>
+          )}
+          {canCancel && (
+            <Button variant="danger" size="sm" onClick={() => void handleTaskAction('cancel')} disabled={actionBusy}>
+              取消
+            </Button>
+          )}
+          {(canRun || canCreateReplacement) && (
+            <Button size="sm" onClick={handlePrimaryAction} disabled={primaryActionDisabled} isLoading={isRunning || isCreating}>
               {primaryActionLabel}
-            </button>
-            <button
-              onClick={() => void handleTaskAction('pause')}
-              disabled={actionBusy || !canPause}
-              style={taskControlButtonStyle(actionBusy || !canPause)}
-            >
-              Pause
-            </button>
-            <button
-              onClick={() => void handleTaskAction('resume')}
-              disabled={actionBusy || !canResume}
-              style={taskControlButtonStyle(actionBusy || !canResume)}
-            >
-              Resume
-            </button>
-            <button
-              onClick={() => void handleTaskAction('cancel')}
-              disabled={actionBusy || !canCancel}
-              style={taskControlButtonStyle(actionBusy || !canCancel, true)}
-            >
-              Cancel
-            </button>
-          </div>
-          {actionNote && (
-            <div id="run-disabled-reason" style={{ maxWidth: '22rem', fontSize: '0.8rem', color: '#7a4b00', textAlign: 'right' }}>
-              {actionNote}
-            </div>
+            </Button>
           )}
         </div>
       }
@@ -148,47 +138,133 @@ export const TaskDetailPage: React.FC = () => {
         <ErrorState error={createError} />
         <ErrorState error={runError} />
         <ErrorState error={actionError} />
-        <RuntimeModeBanner
-          runningMode={pipelineResult?.running_mode || observability?.running_mode}
-          dependencies={pipelineResult?.dependencies || observability?.dependencies || null}
-          warnings={observability?.warnings || []}
-        />
-        <PipelineFailureHelp failure={latestPipelineFailure} dependencies={pipelineResult?.dependencies || null} />
-        <PipelineResultPanel result={pipelineResult} />
-        
-        <section style={{ backgroundColor: '#f9f9f9', padding: '1.5rem', borderRadius: '8px' }}>
-          <h2 style={{ marginTop: 0, fontSize: '1.25rem' }}>查询内容</h2>
-          <p style={{ margin: 0, fontSize: '1.1rem' }}>{task.query}</p>
-        </section>
 
-        <section>
-          <h3 style={{ borderBottom: '1px solid #eee', paddingBottom: '0.5rem' }}>元数据</h3>
-          <ul style={{ listStyle: 'none', padding: 0, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-            <li><strong>任务 ID:</strong> <br/><span style={{ fontFamily: 'monospace', fontSize: '0.9em' }}>{task.task_id}</span></li>
-            <li><strong>修订版本:</strong> <br/>{task.revision_no}</li>
-            <li><strong>进度:</strong> <br/>{task.progress?.current_state || task.status}</li>
-            <li><strong>事件总数:</strong> <br/>{task.progress?.events_total ?? 0}</li>
-            <li><strong>创建时间:</strong> <br/>{new Date(task.created_at).toLocaleString()}</li>
-            <li><strong>更新时间:</strong> <br/>{new Date(task.updated_at).toLocaleString()}</li>
-          </ul>
-        </section>
-
-        <TaskObservabilityPanel observability={observability} />
-
-        <section>
-          <h3 style={{ borderBottom: '1px solid #eee', paddingBottom: '0.5rem' }}>探索</h3>
-          <div style={{ display: 'flex', gap: '1rem' }}>
-            <Link to={`/tasks/${taskId}/sources`} style={buttonStyle}>来源</Link>
-            <Link to={`/tasks/${taskId}/claims`} style={buttonStyle}>结论声明</Link>
-            <Link to={`/tasks/${taskId}/report`} style={buttonStyle}>报告</Link>
+        <SectionCard>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '2rem', marginBottom: '1.5rem' }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.5rem' }}>
+                研究课题
+              </div>
+              <h2 style={{ fontSize: '1.5rem', fontWeight: 700, margin: 0, lineHeight: 1.3 }}>{task.query}</h2>
+            </div>
+            <div style={{ textAlign: 'right' }}>
+              <StatusBadge status={task.status} />
+              <div style={{ marginTop: '0.5rem', color: 'var(--text-secondary)', fontSize: '0.75rem', fontFamily: 'monospace' }}>
+                {task.task_id}
+              </div>
+            </div>
           </div>
-        </section>
 
-        <section>
-          <h3 style={{ borderBottom: '1px solid #eee', paddingBottom: '0.5rem' }}>事件日志</h3>
-          <TaskEventList events={eventsData?.events || []} />
-        </section>
+          <PipelineStepper 
+            currentStatus={task.status} 
+            dependencies={pipelineResult?.dependencies || observability?.dependencies}
+            counts={counts}
+          />
+        </SectionCard>
 
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '1rem' }}>
+          <MetricCard label="搜索查询" value={counts.search_queries} />
+          <MetricCard label="发现 URL" value={counts.candidate_urls} />
+          <MetricCard label="获取尝试" value={counts.fetch_attempts} />
+          <MetricCard label="源码文档" value={counts.source_documents} />
+          <MetricCard label="结论声明" value={counts.claims} />
+          <MetricCard label="支持证据" value={counts.claim_evidence} />
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '1.5rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            <RuntimeModeBanner
+              runningMode={pipelineResult?.running_mode || observability?.running_mode}
+              dependencies={pipelineResult?.dependencies || observability?.dependencies || null}
+              warnings={observability?.warnings || []}
+            />
+
+            <PipelineFailureHelp failure={latestPipelineFailure} dependencies={pipelineResult?.dependencies || null} />
+
+            <SectionCard title="研究工具箱">
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem' }}>
+                <Link
+                  to={`/tasks/${taskId}/sources`}
+                  className="card-solid"
+                  style={{ display: 'flex', alignItems: 'center', gap: '1rem', textDecoration: 'none', color: 'inherit' }}
+                >
+                  <div style={{ fontSize: '1.5rem' }}>📄</div>
+                  <div>
+                    <div style={{ fontWeight: 600 }}>研究来源</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>查看网页源码与抓取详情</div>
+                  </div>
+                </Link>
+                <Link
+                  to={`/tasks/${taskId}/claims`}
+                  className="card-solid"
+                  style={{ display: 'flex', alignItems: 'center', gap: '1rem', textDecoration: 'none', color: 'inherit' }}
+                >
+                  <div style={{ fontSize: '1.5rem' }}>⚖️</div>
+                  <div>
+                    <div style={{ fontWeight: 600 }}>结论声明</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>查看提取的声明与验证逻辑</div>
+                  </div>
+                </Link>
+                <Link
+                  to={`/tasks/${taskId}/report`}
+                  className="card-solid"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '1rem',
+                    textDecoration: 'none',
+                    color: 'inherit',
+                    backgroundColor: task.status === 'COMPLETED' ? 'var(--primary-container)' : 'white',
+                    borderColor: task.status === 'COMPLETED' ? 'var(--primary-color)' : 'var(--border-color)',
+                  }}
+                >
+                  <div style={{ fontSize: '1.5rem' }}>📊</div>
+                  <div>
+                    <div style={{ fontWeight: 600 }}>完整报告</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>阅读最终生成的研究报告</div>
+                  </div>
+                </Link>
+              </div>
+            </SectionCard>
+
+            <TaskObservabilityPanel observability={observability} taskId={taskId!} counts={counts} />
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            <SectionCard title="研究进度日志">
+              <TaskEventList events={eventsData?.events || []} />
+            </SectionCard>
+
+            <SectionCard title="元数据">
+              <div style={{ display: 'grid', gap: '1rem', fontSize: '0.875rem' }}>
+                <div>
+                  <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>修订版本</div>
+                  <div style={{ fontWeight: 500 }}>v{task.revision_no}</div>
+                </div>
+                <div>
+                  <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>创建时间</div>
+                  <div style={{ fontWeight: 500 }}>{formatChinaDateTime(task.created_at)}</div>
+                </div>
+                <div>
+                  <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>最后更新</div>
+                  <div style={{ fontWeight: 500 }}>{formatChinaDateTime(task.updated_at)}</div>
+                </div>
+                {task.started_at && (
+                  <div>
+                    <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>开始时间</div>
+                    <div style={{ fontWeight: 500 }}>{formatChinaDateTime(task.started_at)}</div>
+                  </div>
+                )}
+                {task.ended_at && (
+                  <div>
+                    <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>结束时间</div>
+                    <div style={{ fontWeight: 500 }}>{formatChinaDateTime(task.ended_at)}</div>
+                  </div>
+                )}
+              </div>
+            </SectionCard>
+          </div>
+        </div>
       </div>
     </PageLayout>
   );
@@ -297,72 +373,44 @@ const PipelineFailureHelp: React.FC<{ failure: PipelineFailure | null; dependenc
   if (!failure) return null;
 
   const isSearxngHtmlResponse = failure.reason === 'searxng_html_response';
-  const isPrecondition = failure.reason === 'pipeline_precondition_failed' && failure.failed_stage === 'PRECONDITION';
-  if (!isSearxngHtmlResponse && !isPrecondition) return null;
 
   return (
-    <section style={{ border: '1px solid #f3c27a', borderRadius: '8px', padding: '1rem', backgroundColor: '#fff8ed' }}>
-      <h3 style={{ marginTop: 0 }}>运行失败处理</h3>
-      {isSearxngHtmlResponse ? (
-        <>
-          <p style={{ marginTop: 0 }}>
-            搜索阶段收到 HTML 页面，而不是 SearXNG JSON。常见原因是 `SEARXNG_BASE_URL` 指到了前端或普通网页服务。
+    <SectionCard title="诊断与帮助" style={{ border: '1px solid #fce8e6', backgroundColor: '#fffbfa' }}>
+      <div style={{ color: '#d93025', fontWeight: 600, marginBottom: '0.5rem' }}>
+        研究中断: {failure.failed_stage} - {failure.reason}
+      </div>
+      <p style={{ margin: '0.5rem 0', fontSize: '0.875rem' }}>{failure.message}</p>
+
+      {isSearxngHtmlResponse && (
+        <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: 'white', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-sm)' }}>
+          <p style={{ marginTop: 0, fontSize: '0.875rem' }}>
+            搜索阶段收到 HTML 页面，而不是 SearXNG JSON。常见原因是 SEARXNG_BASE_URL 配置错误。
           </p>
-          <p style={{ margin: '0.5rem 0' }}>
+          <div style={{ fontFamily: 'monospace', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
             当前搜索配置: {dependencies?.search_provider || 'searxng'} / {dependencies?.searxng_base_url || '未记录'}
-          </p>
-          <div style={{ fontFamily: 'monospace', fontSize: '0.85rem', backgroundColor: '#fff', border: '1px solid #f3d6ad', borderRadius: '6px', padding: '0.75rem', overflowX: 'auto' }}>
-            SEARCH_PROVIDER=smoke INDEX_BACKEND=local SNAPSHOT_STORAGE_BACKEND=filesystem ./dev.sh restart
           </div>
-        </>
-      ) : (
-        <p style={{ margin: 0 }}>
-          失败任务是审计记录，不能直接再次运行。请用相同查询新建任务，或从创建页提交一个新任务。
-        </p>
+        </div>
       )}
-      <p style={{ marginBottom: 0, color: '#7a4b00' }}>
-        后端建议: {failure.next_action}
-      </p>
-    </section>
+
+      <div style={{ marginTop: '1rem', fontSize: '0.875rem', fontWeight: 600 }}>
+        后端建议: <span style={{ fontWeight: 400 }}>{failure.next_action}</span>
+      </div>
+    </SectionCard>
   );
 };
 
 type TaskObservability = NonNullable<NonNullable<ResearchTask['progress']>['observability']>;
 
-const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null }> = ({ observability }) => {
+const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null, taskId: string, counts: PipelineCounts }> = ({ observability, taskId, counts }) => {
   if (!observability) return null;
 
+  const researchPlan = observability.research_plan || null;
+  const planSubquestions = Array.isArray(researchPlan?.subquestions) ? researchPlan.subquestions : [];
   const selectedSources = Array.isArray(observability.selected_sources) ? observability.selected_sources : [];
-  const sourceJudgments = asObjectArray(observability.source_judgments);
-  const llmAssistance = observability.llm_assistance || null;
   const attemptedSources = Array.isArray(observability.attempted_sources) ? observability.attempted_sources : [];
   const unattemptedSources = Array.isArray(observability.unattempted_sources) ? observability.unattempted_sources : [];
   const failedSources = Array.isArray(observability.failed_sources) ? observability.failed_sources : [];
-  const droppedSources = asObjectArray(observability.dropped_sources);
-  const parseDecisions = Array.isArray(observability.parse_decisions) ? observability.parse_decisions : [];
-  const warnings = Array.isArray(observability.warnings) ? observability.warnings : [];
-  const qualitySummary = observability.source_quality_summary || null;
-  const sourceYieldSummary = asObjectArray(observability.source_yield_summary);
-  const slotCoverageSummary = asObjectArray(observability.slot_coverage_summary);
-  const evidenceYieldSummary = observability.evidence_yield_summary || null;
-  const verificationSummary = observability.verification_summary || null;
-  const researchPlan = observability.research_plan || null;
-  const rawPlannerQueries = asObjectArray(observability.raw_planner_queries);
-  const finalSearchQueries = asObjectArray(observability.final_search_queries);
-  const droppedPlannerQueries = asObjectArray(observability.dropped_or_downweighted_planner_queries);
-  const guardrailWarnings = Array.isArray(observability.planner_guardrail_warnings) ? observability.planner_guardrail_warnings : [];
-  const answerCoverage = observability.answer_coverage || null;
-  const answerSlots = asObjectArray(observability.answer_slots || observability.report_slot_coverage);
-  const answerYield = asObjectArray(observability.answer_yield);
-  const supplementalAcquisition = observability.supplemental_acquisition || null;
-  const gapAnalysis = observability.gap_analysis || null;
-  const gapRounds = asObjectArray(observability.gap_rounds);
-  const failureDiagnostics = observability.failure_diagnostics || null;
-  const planSubquestions = Array.isArray(researchPlan?.subquestions) ? researchPlan.subquestions : [];
-  const planSearchQueries = Array.isArray(researchPlan?.search_queries) ? researchPlan.search_queries : [];
-  const sourcePreferences = researchPlan?.source_preferences || {};
-  const preferredDomains = Array.isArray(sourcePreferences.preferred_domains) ? sourcePreferences.preferred_domains : [];
-  const avoidDomains = Array.isArray(sourcePreferences.avoid_domains) ? sourcePreferences.avoid_domains : [];
+
   const sourceRows = buildSourceSelectionRows({
     selectedSources,
     attemptedSources,
@@ -370,531 +418,120 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
     failedSources,
   });
 
+  const evidenceYield = observability.evidence_yield_summary;
+  const verification = observability.verification_summary;
+  const gapAnalysis = observability.gap_analysis;
+
+  // Use pipeline counts for the top 3 metrics as they are more reliable after completion
+  const searchFoundCount = counts.candidate_urls || observability.search_result_count || 0;
+  const fetchSucceededCount = observability.fetch_succeeded ?? counts.source_documents ?? 0;
+  // If fetch_failed is not in counts, we use observability or derived value
+  const fetchFailedCount = observability.fetch_failed ?? Math.max(0, counts.fetch_attempts - fetchSucceededCount);
+
   return (
-    <section style={{ border: '1px solid #e2e8f0', borderRadius: '8px', padding: '1rem', backgroundColor: '#fbfdff' }}>
-      <h3 style={{ marginTop: 0 }}>运行监控 (Observability)</h3>
-      <ul style={{ listStyle: 'none', padding: 0, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '0.5rem' }}>
-        <li><strong>搜索结果:</strong><br />{observability.search_result_count ?? '无'}</li>
-        <li><strong>获取成功:</strong><br />{observability.fetch_succeeded ?? '无'}</li>
-        <li><strong>获取失败:</strong><br />{observability.fetch_failed ?? '无'}</li>
-      </ul>
-      {warnings.length > 0 && (
-        <div style={{ marginTop: '0.75rem', color: '#7a4b00' }}>
-          {warnings.map((warning: string) => (
-            <div key={warning}><strong>警告:</strong> {warning}</div>
-          ))}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+      <SectionCard title="实时观测器">
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '1rem' }}>
+          <div>
+            <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>搜索发现</div>
+            <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>{searchFoundCount}</div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>获取成功</div>
+            <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e8e3e' }}>{fetchSucceededCount}</div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>获取失败</div>
+            <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#d93025' }}>{fetchFailedCount}</div>
+          </div>
         </div>
-      )}
-      <div style={{ marginTop: '0.75rem' }}>
-        <strong>研究计划</strong>
-        {researchPlan ? (
-          <div style={{ marginTop: '0.5rem', display: 'grid', gap: '0.75rem' }}>
-            <div>
-              <span style={{ color: '#475569' }}>意图:</span>{' '}
-              <span>{researchPlan.intent || '无'}</span>
-              {observability.planner_mode ? (
-                <span style={{ color: '#64748b' }}> / {observability.planner_mode}</span>
-              ) : null}
+
+        {researchPlan && (
+          <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.5rem' }}>
+            <div style={{ fontWeight: 600, marginBottom: '0.75rem' }}>研究规划</div>
+            <div style={{ fontSize: '0.875rem', backgroundColor: '#f8f9fa', padding: '1rem', borderRadius: 'var(--radius-sm)' }}>
+              <div style={{ marginBottom: '0.5rem' }}><span style={{ color: 'var(--text-secondary)' }}>意图:</span> {researchPlan.intent}</div>
+              {planSubquestions.length > 0 && (
+                <div style={{ marginBottom: '0.5rem' }}>
+                  <span style={{ color: 'var(--text-secondary)' }}>分解:</span> {planSubquestions.join('; ')}
+                </div>
+              )}
             </div>
-            {(observability.intent_classification || observability.extracted_entity) && (
+          </div>
+        )}
+      </SectionCard>
+
+      {(evidenceYield || verification || gapAnalysis) && (
+        <SectionCard title="研究深度指标">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1.5rem' }}>
+            {evidenceYield && (
               <div>
-                <span style={{ color: '#475569' }}>护栏:</span>{' '}
-                <span>{observability.intent_classification || '无'}</span>
-                {observability.extracted_entity ? (
-                  <span style={{ color: '#64748b' }}> / 实体 {observability.extracted_entity}</span>
-                ) : null}
+                <div style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.5rem' }}>证据产出</div>
+                <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
+                  候选 {evidenceYield.total_candidates ?? 0} <br />
+                  接受 {evidenceYield.accepted_candidates ?? 0} <br />
+                  硬拒绝 {evidenceYield.rejected_candidates ?? 0} <br />
+                  未选 {evidenceYield.unselected_candidates ?? 0}
+                </div>
               </div>
             )}
-            {planSubquestions.length > 0 && (
+            {verification && (
               <div>
-                <div style={{ color: '#475569' }}>子问题</div>
-                <ul style={{ marginTop: '0.35rem', paddingLeft: '1.25rem' }}>
-                  {planSubquestions.map((item: string) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
+                <div style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.5rem' }}>验证质量</div>
+                <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
+                  强支持 {verification.strong_support_evidence_count ?? verification.strong_supported_claim_count ?? 0} <br />
+                  弱支持 {verification.weak_support_evidence_count ?? verification.weak_supported_claim_count ?? 0} <br />
+                  反驳 {verification.contradict_evidence_count ?? 0}
+                </div>
               </div>
             )}
-            {planSearchQueries.length > 0 && (
+            {gapAnalysis && (
               <div>
-                <div style={{ color: '#475569' }}>搜索查询</div>
-                <ul style={{ marginTop: '0.35rem', paddingLeft: '1.25rem' }}>
-                  {planSearchQueries.map((item: any) => (
-                    <li key={`${item.priority || ''}-${item.query_text || item}`}>
-                      <span>{item.query_text || item}</span>
-                      {item.expected_source_type ? (
-                        <span style={{ color: '#64748b' }}> ({item.expected_source_type})</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {(preferredDomains.length > 0 || avoidDomains.length > 0) && (
-              <div style={{ display: 'grid', gap: '0.35rem' }}>
-                {preferredDomains.length > 0 && (
-                  <div><span style={{ color: '#475569' }}>首选来源:</span> {preferredDomains.join(', ')}</div>
-                )}
-                {avoidDomains.length > 0 && (
-                  <div><span style={{ color: '#475569' }}>避免来源:</span> {avoidDomains.join(', ')}</div>
-                )}
+                <div style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.5rem' }}>缺口分析</div>
+                <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
+                  触发补充: {gapAnalysis.triggered ? '是' : '否'} <br />
+                  轮次: {gapAnalysis.round_no ?? 0} <br />
+                  缺失槽位: {Array.isArray(gapAnalysis.required_slots_missing) ? gapAnalysis.required_slots_missing.length : 0}
+                </div>
               </div>
             )}
           </div>
-        ) : (
-          <p style={{ margin: '0.5rem 0 0', color: '#64748b' }}>未生成研究计划。</p>
-        )}
-      </div>
-      {(finalSearchQueries.length > 0 || rawPlannerQueries.length > 0 || droppedPlannerQueries.length > 0 || guardrailWarnings.length > 0) && (
-        <div style={{ marginTop: '0.75rem' }}>
-          <strong>最终搜索查询</strong>
-          {finalSearchQueries.length > 0 ? (
-            <ol style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-              {finalSearchQueries.map((item: any, index: number) => (
-                <li key={`${index}-${item.query_text || item.query || item}`}>
-                  {item.query_text || item.query || String(item)}
-                  {item.query_source ? <span style={{ color: '#64748b' }}> / {item.query_source}</span> : null}
-                </li>
+        </SectionCard>
+      )}
+
+      <SectionCard title="来源审阅详情">
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
+            <thead>
+              <tr>
+                <th style={thStyle}>域名</th>
+                <th style={thStyle}>类别</th>
+                <th style={thStyle}>状态</th>
+                <th style={thStyle}>质量</th>
+                <th style={thStyle}>贡献度</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sourceRows.slice(0, 10).map((source: any) => (
+                <tr key={source.row_key}>
+                  <td style={tdStyle}>{source.domain || '未知'}</td>
+                  <td style={tdStyle}>{source.category || '-'}</td>
+                  <td style={tdStyle}><Badge variant="info">{source.state}</Badge></td>
+                  <td style={tdStyle}>{formatOptionalNumber(source.quality)}</td>
+                  <td style={tdStyle}>{source.source_yield?.contribution_level || '-'}</td>
+                </tr>
               ))}
-            </ol>
-          ) : (
-            <p style={{ margin: '0.5rem 0 0', color: '#64748b' }}>没有记录到规划器搜索查询护栏数据。</p>
-          )}
-          {droppedPlannerQueries.length > 0 && (
-            <div style={{ marginTop: '0.5rem' }}>
-              <span style={{ color: '#475569' }}>已丢弃或降权:</span>{' '}
-              {droppedPlannerQueries.map((item: any) => item.query_text || item.query || '规划器查询').join(', ')}
+            </tbody>
+          </table>
+          {sourceRows.length > 10 && (
+            <div style={{ marginTop: '0.75rem', textAlign: 'center' }}>
+              <Link to={`/tasks/${taskId}/sources`} style={{ fontSize: '0.875rem' }}>查看全部 {sourceRows.length} 个来源</Link>
             </div>
           )}
-          {guardrailWarnings.length > 0 && (
-            <div style={{ marginTop: '0.5rem', color: '#7a4b00' }}>
-              {guardrailWarnings.map((warning: string) => (
-                <div key={warning}><strong>规划器护栏:</strong> {warning}</div>
-              ))}
-            </div>
-          )}
         </div>
-      )}
-      {qualitySummary && (
-        <div style={{ marginTop: '0.75rem' }}>
-          <strong>来源质量</strong>
-          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-            <li>来源: {qualitySummary.source_count ?? '无'} / 高质量 {qualitySummary.high_quality_source_count ?? '无'}</li>
-            <li>证据域名: {qualitySummary.evidence_domain_count ?? '无'}</li>
-            <li>排除的分块: {qualitySummary.excluded_chunk_count ?? '无'}</li>
-          </ul>
-        </div>
-      )}
-      <SourceSelectionTable rows={sourceRows} />
-      {sourceJudgments.length > 0 && (
-        <div style={{ marginTop: '0.75rem' }}>
-          <strong>LLM 来源审阅 (shadow)</strong>
-          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-            {sourceJudgments.slice(0, 5).map((item: any) => (
-              <li key={`${item.canonical_url}-${item.fallback_status}`}>
-                <span style={{ wordBreak: 'break-all' }}>{item.canonical_url}</span>
-                <span style={{ color: '#64748b' }}>
-                  {' '} / {item.output_judgment?.label || 'uncertain'} / fallback {item.fallback_status}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      <LLMAssistancePanel assistance={llmAssistance} />
-      <SourceYieldSummaryPanel rows={sourceYieldSummary} />
-      <DroppedSourcesPanel rows={droppedSources} />
-      <AnswerSlotCoveragePanel rows={answerSlots} />
-      <SlotCoverageSummaryPanel rows={slotCoverageSummary} />
-      <GapAnalysisPanel analysis={gapAnalysis} rounds={gapRounds} />
-      <EvidenceYieldSummaryPanel summary={evidenceYieldSummary} />
-      <VerificationSummaryPanel summary={verificationSummary} />
-      <AnswerYieldPanel rows={answerYield} />
-      <AnswerCoveragePanel coverage={answerCoverage} />
-      <SupplementalAcquisitionPanel supplemental={supplementalAcquisition} />
-      <FailureDiagnosticsPanel diagnostics={failureDiagnostics} />
-      {failedSources.length > 0 && (
-        <div style={{ marginTop: '0.75rem' }}>
-          <strong>获取失败</strong>
-          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-            {failedSources.slice(0, 5).map((source: any) => (
-              <li key={source.fetch_attempt_id || source.canonical_url}>
-                <a href={source.canonical_url} target="_blank" rel="noreferrer">{source.canonical_url}</a>
-                {' '}状态 {source.http_status ?? '无'} / {source.error_code || source.error_reason || '未知'}
-                {source.trace?.exception_type ? ` / ${source.trace.exception_type}` : ''}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {parseDecisions.length > 0 && (
-        <div style={{ marginTop: '0.75rem' }}>
-          <strong>解析决策</strong>
-          <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-            {parseDecisions.slice(0, 5).map((decision: any) => (
-              <li key={decision.snapshot_id || decision.content_snapshot_id}>
-                <span style={{ fontFamily: 'monospace' }}>{decision.decision || '未知'}</span>
-                {' '}关于 <a href={decision.canonical_url} target="_blank" rel="noreferrer">{decision.canonical_url || '未知 URL'}</a>
-                {' '}({decision.mime_type || '未知 MIME'}, 正文 {decision.body_length ?? '无'} 字节)
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </section>
-  );
-};
-
-const SourceSelectionTable: React.FC<{ rows: any[] }> = ({ rows }) => {
-  if (rows.length === 0) return null;
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>来源选择表</strong>
-      <div style={{ marginTop: '0.5rem', overflowX: 'auto' }}>
-        <table style={tableStyle}>
-          <thead>
-            <tr>
-              <th style={thStyle}>域名</th>
-              <th style={thStyle}>标题</th>
-              <th style={thStyle}>类别</th>
-              <th style={thStyle}>状态</th>
-              <th style={thStyle}>原因</th>
-              <th style={thStyle}>LLM 审阅</th>
-              <th style={thStyle}>质量</th>
-              <th style={thStyle}>最终 URL</th>
-              <th style={thStyle}>来源产出</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.slice(0, 12).map((source: any) => (
-              <tr key={source.row_key}>
-                <td style={tdStyle}>{source.domain || '未知'}</td>
-                <td style={tdStyle}>{source.title || '无'}</td>
-                <td style={tdStyle}>{source.category || '无'}</td>
-                <td style={tdStyle}>{source.state}</td>
-                <td style={tdStyle}>{source.reason || source.downrank_reason || '无'}</td>
-                <td style={tdStyle}>{formatSourceJudge(source)}</td>
-                <td style={tdStyle}>{formatOptionalNumber(source.quality)}</td>
-                <td style={tdStyle}>
-                  {source.final_url ? (
-                    <a href={source.final_url} target="_blank" rel="noreferrer">{source.final_url}</a>
-                  ) : '无'}
-                </td>
-                <td style={tdStyle}>{formatSourceYield(source.source_yield)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      </SectionCard>
     </div>
   );
-};
-
-const AnswerYieldPanel: React.FC<{ rows: any[] }> = ({ rows }) => {
-  if (rows.length === 0) return null;
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>答案产出</strong>
-      <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-        {rows.slice(0, 6).map((item: any) => (
-          <li key={item.source_document_id || item.canonical_url}>
-            {item.domain || domainFromUrl(item.canonical_url) || '未知'}:{' '}
-            {formatSourceYield(item)}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-};
-
-const SourceYieldSummaryPanel: React.FC<{ rows: any[] }> = ({ rows }) => {
-  if (rows.length === 0) return null;
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>来源产出摘要</strong>
-      <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-        {rows.slice(0, 8).map((source: any) => (
-          <li key={source.source_document_id || source.candidate_url_id || source.canonical_url}>
-            {source.domain || domainFromUrl(source.canonical_url) || '未知'}:{' '}
-            {source.contribution_level || '无'} 贡献度, 结论声明 {source.claim_count ?? 0}, 证据 {source.accepted_evidence_count ?? 0}
-            {Array.isArray(source.dropped_reasons) && source.dropped_reasons.length > 0 ? ` / ${source.dropped_reasons.join(', ')}` : ''}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-};
-
-const LLMAssistancePanel: React.FC<{ assistance: Record<string, any> | null }> = ({ assistance }) => {
-  if (!assistance || Object.keys(assistance).length === 0) return null;
-  const rows = Object.entries(assistance)
-    .filter(([, value]) => value && typeof value === 'object')
-    .map(([stage, value]) => ({ stage, ...(value as Record<string, any>) }));
-
-  if (rows.length === 0) return null;
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>LLM 辅助阶段</strong>
-      <div style={{ marginTop: '0.5rem', overflowX: 'auto' }}>
-        <table style={tableStyle}>
-          <thead>
-            <tr>
-              <th style={thStyle}>阶段</th>
-              <th style={thStyle}>状态</th>
-              <th style={thStyle}>使用</th>
-              <th style={thStyle}>计数</th>
-              <th style={thStyle}>回退</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row: any) => (
-              <tr key={row.stage}>
-                <td style={tdStyle}>{formatLLMStage(row.stage)}</td>
-                <td style={tdStyle}>{row.status || '未知'}</td>
-                <td style={tdStyle}>{row.used ? '是' : row.enabled === false ? '禁用' : '否'}</td>
-                <td style={tdStyle}>{formatLLMAssistanceCounts(row)}</td>
-                <td style={tdStyle}>{formatLLMFallback(row)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-};
-
-const DroppedSourcesPanel: React.FC<{ rows: any[] }> = ({ rows }) => {
-  if (rows.length === 0) return null;
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>丢弃的来源</strong>
-      <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-        {rows.slice(0, 6).map((source: any) => (
-          <li key={source.source_document_id || source.candidate_url_id || source.canonical_url}>
-            <a href={source.canonical_url || source.url} target="_blank" rel="noreferrer">
-              {source.domain || domainFromUrl(source.canonical_url || source.url) || '来源'}
-            </a>
-            {' '}({Array.isArray(source.dropped_reasons) ? source.dropped_reasons.join(', ') : '未知'})
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-};
-
-const SlotCoverageSummaryPanel: React.FC<{ rows: any[] }> = ({ rows }) => {
-  if (rows.length === 0) return null;
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>槽位质量摘要</strong>
-      <ul style={{ listStyle: 'none', padding: 0, marginTop: '0.5rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-        {rows.map((slot: any) => (
-          <li key={slot.slot_id || slot.label} style={{ ...coveragePillStyle, backgroundColor: slot.status === 'covered' ? '#e8f5ed' : slot.status === 'weak' ? '#fffbe6' : '#fff2e8', color: slot.status === 'covered' ? '#166534' : slot.status === 'weak' ? '#854d0e' : '#9a3412' }}>
-            {slot.label || slot.slot_id}: {slot.status === 'covered' ? '已覆盖' : slot.status === 'weak' ? '弱覆盖' : slot.status || '未知'} / 结论声明 {slot.supported_claim_count ?? 0} 强支持, {slot.weak_supported_claim_count ?? 0} 弱支持
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-};
-
-const EvidenceYieldSummaryPanel: React.FC<{ summary: Record<string, any> | null }> = ({ summary }) => {
-  if (!summary) return null;
-  const topReasons = asObjectArray(summary.top_rejection_reasons);
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>证据产出摘要</strong>
-      <div style={{ marginTop: '0.5rem', color: '#475569' }}>
-        候选 {summary.total_candidates ?? 0}, 已接受 {summary.accepted_candidates ?? 0}, 已拒绝 {summary.rejected_candidates ?? 0}
-      </div>
-      {topReasons.length > 0 && (
-        <div style={{ marginTop: '0.35rem', color: '#64748b' }}>
-          拒绝原因: {topReasons.slice(0, 4).map((item: any) => `${item.reason}: ${item.count}`).join(', ')}
-        </div>
-      )}
-    </div>
-  );
-};
-
-const VerificationSummaryPanel: React.FC<{ summary: Record<string, any> | null }> = ({ summary }) => {
-  if (!summary) return null;
-  const methods = Array.isArray(summary.verifier_methods) ? summary.verifier_methods : [];
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>验证摘要</strong>
-      <div style={{ marginTop: '0.5rem', color: '#475569' }}>
-        强支持 {summary.strong_support_evidence_count ?? summary.strong_supported_claim_count ?? 0}, 弱支持 {summary.weak_support_evidence_count ?? summary.weak_supported_claim_count ?? 0}, 反驳 {summary.contradict_evidence_count ?? 0}
-      </div>
-      {methods.length > 0 && (
-        <div style={{ marginTop: '0.35rem', color: '#64748b' }}>验证方法: {methods.join(', ')}</div>
-      )}
-    </div>
-  );
-};
-
-const AnswerSlotCoveragePanel: React.FC<{ rows: any[] }> = ({ rows }) => {
-  if (rows.length === 0) return null;
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>答案槽位</strong>
-      <ul style={{ listStyle: 'none', padding: 0, marginTop: '0.5rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-        {rows.map((slot: any) => (
-          <li key={slot.slot_id || slot.label} style={{ ...coveragePillStyle, backgroundColor: slot.covered ? '#e8f5ed' : '#fff2e8', color: slot.covered ? '#166534' : '#9a3412' }}>
-            {slot.label || slot.slot_id}: {slot.covered ? '已覆盖' : '缺失'}
-            {slot.required === false ? ' / 可选' : ''}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-};
-
-const AnswerCoveragePanel: React.FC<{ coverage: Record<string, boolean> | null }> = ({ coverage }) => {
-  if (!coverage) return null;
-  const categories = ['definition', 'mechanism', 'privacy', 'feature'];
-  const categoryMap: Record<string, string> = {
-    'definition': '定义',
-    'mechanism': '机制',
-    'privacy': '隐私',
-    'feature': '特征'
-  };
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>答案覆盖率</strong>
-      <ul style={{ listStyle: 'none', padding: 0, marginTop: '0.5rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-        {categories.map((category) => (
-          <li key={category} style={{ ...coveragePillStyle, backgroundColor: coverage[category] ? '#e8f5ed' : '#fff2e8', color: coverage[category] ? '#166534' : '#9a3412' }}>
-            {categoryMap[category]}: {coverage[category] ? '已覆盖' : '缺失'}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-};
-
-const SupplementalAcquisitionPanel: React.FC<{ supplemental: Record<string, any> | null }> = ({ supplemental }) => {
-  if (!supplemental) return null;
-  const attempted = asObjectArray(supplemental.attempted_sources);
-  const skipped = asObjectArray(supplemental.skipped_sources || supplemental.supplemental_sources_skipped);
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>补充获取</strong>
-      <div style={{ marginTop: '0.5rem', color: '#475569' }}>
-        触发: {String(Boolean(supplemental.triggered))}
-        {supplemental.reason ? ` / ${supplemental.reason}` : ''}
-      </div>
-      {attempted.length > 0 && (
-        <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-          {attempted.slice(0, 5).map((source: any) => (
-            <li key={source.candidate_url_id || source.canonical_url}>
-              尝试 <a href={source.canonical_url} target="_blank" rel="noreferrer">{source.canonical_url}</a>
-            </li>
-          ))}
-        </ul>
-      )}
-      {skipped.length > 0 && (
-        <div style={{ marginTop: '0.35rem', color: '#64748b' }}>
-          已跳过: {skipped.slice(0, 3).map((source: any) => source.skip_reason || source.canonical_url || '来源').join(', ')}
-        </div>
-      )}
-    </div>
-  );
-};
-
-const GapAnalysisPanel: React.FC<{ analysis: Record<string, any> | null; rounds: Array<Record<string, any>> }> = ({ analysis, rounds }) => {
-  if (!analysis && rounds.length === 0) return null;
-  const missing = asObjectArray(analysis?.required_slots_missing);
-  const weak = asObjectArray(analysis?.required_slots_weak);
-  const queries = asObjectArray(analysis?.supplemental_queries);
-
-  return (
-    <div style={{ marginTop: '0.75rem' }}>
-      <strong>缺口分析</strong>
-      {analysis && (
-        <div style={{ marginTop: '0.5rem', color: '#475569' }}>
-          触发: {String(Boolean(analysis.triggered))}
-          {analysis.reason ? ` / ${analysis.reason}` : ''}
-          {typeof analysis.round_no === 'number' ? ` / 第 ${analysis.round_no} 轮` : ''}
-        </div>
-      )}
-      {(missing.length > 0 || weak.length > 0) && (
-        <div style={{ marginTop: '0.35rem', color: '#7a4b00' }}>
-          缺失: {missing.map((slot: any) => slot.label || slot.slot_id).join(', ') || '无'}
-          {weak.length > 0 ? ` / 弱覆盖: ${weak.map((slot: any) => slot.label || slot.slot_id).join(', ')}` : ''}
-        </div>
-      )}
-      {queries.length > 0 && (
-        <ol style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-          {queries.slice(0, 5).map((query: any, index: number) => (
-            <li key={`${index}-${query.query_text || query.slot_ids}`}>
-              {query.query_text || '补充查询'}
-              {Array.isArray(query.slot_ids) ? <span style={{ color: '#64748b' }}> / {query.slot_ids.join(', ')}</span> : null}
-            </li>
-          ))}
-        </ol>
-      )}
-      {rounds.length > 0 && (
-        <div style={{ marginTop: '0.35rem', color: '#64748b' }}>
-          已执行补充轮次: {rounds.length}
-        </div>
-      )}
-    </div>
-  );
-};
-
-const FailureDiagnosticsPanel: React.FC<{ diagnostics: Record<string, any> | null }> = ({ diagnostics }) => {
-  if (!diagnostics) return null;
-  const topRejected = asObjectArray(diagnostics.top_rejected_candidates);
-  const unattemptedHighQuality = asObjectArray(diagnostics.unattempted_high_quality_sources);
-  const whyReferenceNotAttempted = diagnostics.why_wikipedia_or_about_not_attempted;
-
-  return (
-    <div style={{ marginTop: '0.75rem', borderTop: '1px solid #e2e8f0', paddingTop: '0.75rem' }}>
-      <strong>失败诊断</strong>
-      {diagnostics.next_action && (
-        <div style={{ marginTop: '0.5rem' }}><strong>下一步操作:</strong> {diagnostics.next_action}</div>
-      )}
-      {diagnostics.why_supplemental_acquisition_triggered && (
-        <div><strong>补充获取触发原因:</strong> {diagnostics.why_supplemental_acquisition_triggered}</div>
-      )}
-      {whyReferenceNotAttempted && typeof whyReferenceNotAttempted === 'object' && (
-        <div style={{ marginTop: '0.5rem' }}>
-          <strong>关于/维基百科:</strong>{' '}
-          {Object.entries(whyReferenceNotAttempted).map(([key, value]) => `${key}: ${String(value)}`).join('; ')}
-        </div>
-      )}
-      {unattemptedHighQuality.length > 0 && (
-        <div style={{ marginTop: '0.5rem' }}>
-          <strong>未尝试的高质量来源:</strong>{' '}
-          {unattemptedHighQuality.slice(0, 4).map((source: any) => source.canonical_url || source.domain || '来源').join(', ')}
-        </div>
-      )}
-      {topRejected.length > 0 && (
-        <ul style={{ marginTop: '0.5rem', paddingLeft: '1.25rem' }}>
-          {topRejected.slice(0, 5).map((item: any, index: number) => (
-            <li key={`${index}-${item.statement || item.text || item.rejected_reason}`}>
-              {item.rejected_reason || item.reason || '已拒绝'}: {item.statement || item.text || item.excerpt || '候选'}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-};
-
-const asObjectArray = (value: unknown): Array<Record<string, any>> => {
-  return Array.isArray(value) ? value.filter((item): item is Record<string, any> => item && typeof item === 'object') : [];
 };
 
 const buildSourceSelectionRows = ({
@@ -929,18 +566,12 @@ const buildSourceSelectionRows = ({
 
 const normalizeSourceRow = (source: any) => {
   const finalUrl = source.final_url || source.canonical_url || source.url;
-  const sourceYield = source.source_yield || null;
   return {
     ...source,
     final_url: finalUrl,
     domain: source.domain || domainFromUrl(finalUrl),
     category: source.source_category || source.source_intent || source.category || source.metadata?.source_category,
-    reason: source.source_selection_reason || source.selected_reason || source.fetch_priority_reason || source.reason,
-    downrank_reason: source.downrank_reason,
     quality: source.source_quality_score || source.final_source_score || source.quality_score,
-    source_judge: source.source_judge || source.llm_source_judge || null,
-    source_judge_delta: source.llm_source_judge_priority_delta,
-    source_yield: sourceYield,
   };
 };
 
@@ -954,181 +585,45 @@ const domainFromUrl = (value: unknown): string | null => {
 };
 
 const formatOptionalNumber = (value: unknown): string => {
-  if (typeof value !== 'number') return '无';
-  return value.toFixed(value > 1 ? 0 : 2);
+  if (typeof value !== 'number') return '-';
+  return value.toFixed(2);
 };
-
-const formatSourceYield = (value: any): string => {
-  if (!value || typeof value !== 'object') return '无';
-  const chunks = value.chunk_count ?? '无';
-  const eligible = value.eligible_chunk_count ?? '无';
-  const candidates = value.candidate_sentence_count ?? '无';
-  const answerRelevant = value.answer_relevant_candidate_count ?? '无';
-  const accepted = value.accepted_claim_candidate_count ?? '无';
-  const lowYield = value.low_yield_reason ? ` / ${value.low_yield_reason}` : '';
-  return `分块 ${chunks}, 符合条件 ${eligible}, 句子 ${candidates}, 答案相关 ${answerRelevant}, 已接受 ${accepted}${lowYield}`;
-};
-
-const formatSourceJudge = (source: any): string => {
-  const judgment = source.source_judge;
-  if (!judgment || typeof judgment !== 'object') return '无';
-  const output = judgment.output_judgment && typeof judgment.output_judgment === 'object' ? judgment.output_judgment : {};
-  const label = output.label || 'uncertain';
-  const fallback = judgment.fallback_status || 'none';
-  const used = judgment.used_in_final_ranking ? '参与排序' : '未参与排序';
-  const delta = typeof source.source_judge_delta === 'number' ? ` / Δ ${source.source_judge_delta}` : '';
-  return `${label} / ${fallback} / ${used}${delta}`;
-};
-
-const formatLLMStage = (value: string): string => {
-  const labels: Record<string, string> = {
-    query_rewriter: '查询改写',
-    source_judge: '来源审阅',
-    evidence_reranker: '证据重排',
-    claim_reviewer: '结论审阅',
-  };
-  return labels[value] || value;
-};
-
-const formatLLMAssistanceCounts = (row: Record<string, any>): string => {
-  const counts: string[] = [];
-  const countMap: Array<[string, string]> = [
-    ['added_query_count', '新增查询'],
-    ['judged_candidate_count', '审阅来源'],
-    ['used_in_final_ranking_count', '参与排序'],
-    ['reranked_chunk_count', '重排分块'],
-    ['candidate_chunk_count', '候选分块'],
-    ['reviewed_claim_count', '审阅结论'],
-    ['accepted_count', '接受'],
-    ['rejected_count', '拒绝'],
-  ];
-  countMap.forEach(([key, label]) => {
-    if (typeof row[key] === 'number') counts.push(`${label} ${row[key]}`);
-  });
-  return counts.join(', ') || '无';
-};
-
-const formatLLMFallbackCounts = (row: Record<string, any>): string | null => {
-  const fallbackCounts = row.fallback_counts;
-  if (!fallbackCounts || typeof fallbackCounts !== 'object') return null;
-  const entries = Object.entries(fallbackCounts)
-    .filter(([, value]) => typeof value === 'number')
-    .map(([key, value]) => `${key}: ${value}`);
-  return entries.length > 0 ? entries.join(', ') : null;
-};
-
-const formatLLMFallback = (row: Record<string, any>): string => {
-  const parts = [
-    row.fallback_reason,
-    row.error_type,
-    row.message,
-    row.active_rerank_reason,
-    formatLLMFallbackCounts(row),
-  ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
-  return parts.length > 0 ? parts.join(' / ') : '无';
-};
-
-const PipelineResultPanel: React.FC<{ result: PipelineRunResponse | null }> = ({ result }) => {
-  if (!result) return null;
-
-  return (
-    <section style={{ border: '1px solid #ddd', borderRadius: '8px', padding: '1rem', backgroundColor: result.completed ? '#f1fff4' : '#fff8f1' }}>
-      <h3 style={{ marginTop: 0 }}>流程执行结果</h3>
-      <p style={{ marginTop: 0 }}>
-        <strong>模式:</strong> {result.running_mode}
-        <br />
-        <strong>状态:</strong> {result.status}
-      </p>
-      <CountsGrid counts={result.counts} />
-      {result.failure && (
-        <div style={{ marginTop: '1rem', borderTop: '1px solid #e0d0c0', paddingTop: '1rem' }}>
-          <div><strong>失败阶段:</strong> {result.failure.failed_stage}</div>
-          <div><strong>原因:</strong> {result.failure.reason}</div>
-          <div><strong>消息:</strong> {result.failure.message}</div>
-          <div><strong>下一步操作:</strong> {result.failure.next_action}</div>
-          <FailureDiagnosticsPanel diagnostics={result.failure.details || null} />
-        </div>
-      )}
-    </section>
-  );
-};
-
-const CountsGrid: React.FC<{ counts: PipelineCounts }> = ({ counts }) => (
-  <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '0.5rem' }}>
-    {Object.entries(counts).map(([key, value]) => (
-      <li key={key} style={{ backgroundColor: '#fff', border: '1px solid #eee', borderRadius: '4px', padding: '0.5rem' }}>
-        <strong>{key}:</strong> {value}
-      </li>
-    ))}
-  </ul>
-);
 
 const TaskEventList: React.FC<{ events: TaskEvent[] }> = ({ events }) => {
   if (events.length === 0) {
-    return <p style={{ color: '#777' }}>没有记录事件。</p>;
+    return <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>等待研究开始...</p>;
   }
 
   return (
-    <ol style={{ margin: 0, paddingLeft: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-      {events.slice().reverse().slice(0, 12).map((event) => (
-        <li key={event.event_id}>
-          <div><strong>{event.event_type}</strong> #{event.sequence_no}</div>
-          <div style={{ color: '#666', fontSize: '0.875rem' }}>
-            {new Date(event.created_at).toLocaleString()}
-            {event.payload?.stage ? ` | ${event.payload.stage}` : ''}
-            {event.payload?.reason ? ` | ${event.payload.reason}` : ''}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+      {events.slice().reverse().slice(0, 10).map((event) => (
+        <div key={event.event_id} style={{ display: 'flex', gap: '0.75rem' }}>
+          <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: 'var(--primary-color)', marginTop: '0.4rem', flexShrink: 0 }} />
+          <div>
+            <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{event.event_type}</div>
+            <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem' }}>
+              {formatChinaTime(event.created_at)}
+              {event.payload?.stage ? ` · ${event.payload.stage}` : ''}
+            </div>
           </div>
-        </li>
+        </div>
       ))}
-    </ol>
+    </div>
   );
-};
-
-const buttonStyle = {
-  display: 'inline-block',
-  padding: '0.5rem 1rem',
-  backgroundColor: '#0066cc',
-  color: 'white',
-  textDecoration: 'none',
-  borderRadius: '4px',
-  fontWeight: 'bold',
-};
-
-const taskControlButtonStyle = (disabled: boolean, danger = false): React.CSSProperties => ({
-  padding: '0.45rem 0.75rem',
-  border: `1px solid ${danger ? '#b91c1c' : '#d1d5db'}`,
-  backgroundColor: danger ? '#fff5f5' : '#fff',
-  color: danger ? '#991b1b' : '#111827',
-  borderRadius: '4px',
-  fontWeight: 700,
-  opacity: disabled ? 0.45 : 1,
-  cursor: disabled ? 'not-allowed' : 'pointer',
-});
-
-const tableStyle: React.CSSProperties = {
-  width: '100%',
-  borderCollapse: 'collapse',
-  fontSize: '0.875rem',
 };
 
 const thStyle: React.CSSProperties = {
   textAlign: 'left',
-  borderBottom: '1px solid #cbd5e1',
-  padding: '0.45rem',
-  color: '#334155',
-  whiteSpace: 'nowrap',
+  borderBottom: '1px solid var(--border-color)',
+  padding: '0.75rem 0.5rem',
+  color: 'var(--text-secondary)',
+  fontSize: '0.75rem',
+  textTransform: 'uppercase',
+  fontWeight: 700,
 };
 
 const tdStyle: React.CSSProperties = {
-  borderBottom: '1px solid #e2e8f0',
-  padding: '0.45rem',
+  borderBottom: '1px solid var(--border-color)',
+  padding: '0.75rem 0.5rem',
   verticalAlign: 'top',
-  maxWidth: '20rem',
-  overflowWrap: 'anywhere',
-};
-
-const coveragePillStyle: React.CSSProperties = {
-  borderRadius: '999px',
-  padding: '0.2rem 0.55rem',
-  border: '1px solid #e2e8f0',
 };

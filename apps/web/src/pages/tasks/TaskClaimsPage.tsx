@@ -4,18 +4,22 @@ import { PageLayout } from '../../components/layout/PageLayout';
 import { LoadingState } from '../../components/common/LoadingState';
 import { ErrorState } from '../../components/common/ErrorState';
 import { EmptyState } from '../../components/common/EmptyState';
+import { SectionCard } from '../../components/common/SectionCard';
+import { Badge } from '../../components/common/Badge';
 import { useClaims } from '../../features/claims/hooks';
 
 export const TaskClaimsPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
   const { claimsData, evidenceData, isLoading, error, refetch } = useClaims(taskId);
 
-  if (isLoading) return <PageLayout title="任务结论与声明"><LoadingState message="正在加载结论和证据..." /></PageLayout>;
+  if (isLoading) return <PageLayout title="结论与声明"><LoadingState message="正在加载结论和证据..." /></PageLayout>;
   
   if (error) return (
-    <PageLayout title="任务结论与声明">
+    <PageLayout title="结论与声明">
       <ErrorState error={error} onRetry={refetch} />
-      <Link to={`/tasks/${taskId}`}>返回任务</Link>
+      <div style={{ marginTop: '1rem', textAlign: 'center' }}>
+        <Link to={`/tasks/${taskId}`}>返回研究详情</Link>
+      </div>
     </PageLayout>
   );
 
@@ -24,65 +28,76 @@ export const TaskClaimsPage: React.FC = () => {
 
   if (claims.length === 0) {
     return (
-      <PageLayout title="任务结论与声明">
+      <PageLayout title="结论与声明">
         <EmptyState message="此任务尚未生成任何结论声明。" />
-        <Link to={`/tasks/${taskId}`}>返回任务</Link>
+        <div style={{ marginTop: '1rem', textAlign: 'center' }}>
+          <Link to={`/tasks/${taskId}`}>返回研究详情</Link>
+        </div>
       </PageLayout>
     );
   }
 
   return (
     <PageLayout 
-      title="任务结论与声明"
-      actions={<Link to={`/tasks/${taskId}`}>返回任务</Link>}
+      title="结论与声明"
+      actions={<Link to={`/tasks/${taskId}`}>返回研究详情</Link>}
     >
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
         {claims.map((claim) => {
           const claimEvidence = evidenceList.filter((e) => e.claim_id === claim.claim_id);
 
           return (
-            <div key={claim.claim_id} style={{ border: '1px solid #e0e0e0', borderRadius: '8px', padding: '1.5rem' }}>
-              <h3 style={{ marginTop: 0, color: '#333' }}>{claim.statement}</h3>
-              
-              <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem', fontSize: '0.9rem' }}>
-                <span style={getStatusStyle(claim.verification_status)}>
-                  状态: {formatClaimStatus(claim.verification_status)}
-                </span>
-                <span>置信度: {claim.confidence !== null ? (claim.confidence * 100).toFixed(1) + '%' : '无'}</span>
-                <span>支持证据: {claim.support_evidence_count}</span>
-                <span>弱证据: {claim.weak_support_evidence_count || 0}</span>
-                <span>反驳证据: {claim.contradict_evidence_count}</span>
-              </div>
-
-              {claim.rationale && (
-                <div style={{ backgroundColor: '#f9f9f9', padding: '0.75rem', borderRadius: '4px', marginBottom: '1rem' }}>
-                  <strong>基本原理:</strong> {claim.rationale}
+            <SectionCard key={claim.claim_id}>
+              <div style={{ marginBottom: '1rem' }}>
+                <h3 style={{ fontSize: '1.25rem', marginBottom: '1rem', lineHeight: 1.4 }}>{claim.statement}</h3>
+                
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
+                  <Badge variant={getClaimStatusVariant(claim.verification_status)}>
+                    {formatClaimStatus(claim.verification_status)}
+                  </Badge>
+                  {claim.confidence !== null && (
+                    <Badge variant="info">置信度: {(claim.confidence * 100).toFixed(0)}%</Badge>
+                  )}
+                  <Badge variant="secondary">支持: {claim.support_evidence_count}</Badge>
+                  {claim.contradict_evidence_count > 0 && (
+                    <Badge variant="error">反驳: {claim.contradict_evidence_count}</Badge>
+                  )}
                 </div>
-              )}
 
-              {claimEvidence.length > 0 ? (
+                {claim.rationale && (
+                  <div style={{ backgroundColor: 'var(--bg-color)', padding: '1rem', borderRadius: 'var(--radius-sm)', marginBottom: '1.5rem', fontSize: '0.9375rem', borderLeft: '4px solid var(--border-color)' }}>
+                    <div style={{ fontWeight: 600, fontSize: '0.75rem', textTransform: 'uppercase', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>推理过程</div>
+                    {claim.rationale}
+                  </div>
+                )}
+
                 <div>
-                  <h4 style={{ fontSize: '1rem', marginBottom: '0.5rem' }}>证据链接:</h4>
-                  <ul style={{ margin: 0, paddingLeft: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    {claimEvidence.map((ev) => (
-                      <li key={ev.claim_evidence_id} style={{ fontSize: '0.9rem' }}>
-                        <strong style={{ color: getRelationColor(ev.relation_type) }}>
-                          [{formatEvidenceRelation(ev.relation_type)}]
-                        </strong>{' '}
-                        {ev.relation_detail && <span>{ev.relation_detail} </span>}
-                        {typeof ev.quality?.evidence_rank_score === 'number' && (
-                          <span>score {ev.quality.evidence_rank_score.toFixed(2)} </span>
-                        )}
-                        {ev.citation_precision && <span>span {ev.citation_precision} </span>}
-                        <span>{ev.excerpt}</span>
-                      </li>
-                    ))}
-                  </ul>
+                  <div style={{ fontSize: '0.875rem', fontWeight: 600, marginBottom: '0.75rem', color: 'var(--text-secondary)' }}>证据来源:</div>
+                  {claimEvidence.length > 0 ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                      {claimEvidence.map((ev) => (
+                        <div key={ev.claim_evidence_id} className="card-solid" style={{ padding: '1rem', fontSize: '0.875rem' }}>
+                          <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                            <Badge variant={getRelationVariant(ev.relation_type)}>
+                              {formatEvidenceRelation(ev.relation_type)}
+                            </Badge>
+                            {ev.relation_detail && <span style={{ color: 'var(--text-secondary)' }}>{ev.relation_detail}</span>}
+                          </div>
+                          <p style={{ margin: 0, lineHeight: 1.5, color: 'var(--text-primary)' }}>
+                            <span style={{ backgroundColor: 'var(--primary-container)', padding: '0 0.2rem' }}>{ev.excerpt}</span>
+                          </p>
+                          <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                            来源 ID: {ev.source_document_id.substring(0, 8)}...
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', fontStyle: 'italic' }}>此声明目前没有直接绑定的证据。</p>
+                  )}
                 </div>
-              ) : (
-                <p style={{ color: '#888', fontSize: '0.9rem' }}>此声明没有绑定的证据。</p>
-              )}
-            </div>
+              </div>
+            </SectionCard>
           );
         })}
       </div>
@@ -90,40 +105,39 @@ export const TaskClaimsPage: React.FC = () => {
   );
 };
 
-const getStatusStyle = (status: string) => {
-  const baseStyle = { fontWeight: 'bold', padding: '0.1rem 0.4rem', borderRadius: '4px' };
+const getClaimStatusVariant = (status: string): any => {
   switch (status) {
-    case 'supported': return { ...baseStyle, backgroundColor: '#e6ffe6', color: '#006600' };
-    case 'mixed': return { ...baseStyle, backgroundColor: '#fff0e6', color: '#b35900' };
-    case 'contradicted': return { ...baseStyle, backgroundColor: '#ffe6e6', color: '#990000' };
-    case 'unsupported': return { ...baseStyle, backgroundColor: '#ffe6e6', color: '#cc0000' };
-    default: return { ...baseStyle, backgroundColor: '#f0f0f0', color: '#666' };
+    case 'supported': return 'success';
+    case 'mixed': return 'warning';
+    case 'contradicted':
+    case 'unsupported': return 'error';
+    default: return 'default';
   }
 };
 
 const formatClaimStatus = (status: string) => {
   switch (status) {
-    case 'supported': return '已支持';
-    case 'mixed': return '混合';
-    case 'contradicted': return '被反驳';
-    case 'unsupported': return '未支持';
+    case 'supported': return '证据充分';
+    case 'mixed': return '证据混合';
+    case 'contradicted': return '证据反驳';
+    case 'unsupported': return '缺乏证据';
     default: return status;
   }
 };
 
 const formatEvidenceRelation = (relation: string) => {
   switch (relation) {
-    case 'support': return '支持';
+    case 'support': return '直接支持';
     case 'weak_support': return '弱支持';
     case 'contradict': return '反驳';
-    case 'candidate_support': return '候选';
+    case 'candidate_support': return '候选支持';
     default: return relation;
   }
 };
 
-const getRelationColor = (relation: string) => {
-  if (relation === 'support') return 'green';
-  if (relation === 'weak_support') return '#997000';
-  if (relation === 'contradict') return 'red';
-  return '#666';
+const getRelationVariant = (relation: string): any => {
+  if (relation === 'support') return 'success';
+  if (relation === 'weak_support') return 'info';
+  if (relation === 'contradict') return 'error';
+  return 'default';
 };

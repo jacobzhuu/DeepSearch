@@ -14,6 +14,7 @@ from packages.db.repositories import (
     ClaimRepository,
     ReportArtifactRepository,
     ResearchTaskRepository,
+    TaskEventRepository,
 )
 from packages.observability import get_logger, record_report_result
 from services.orchestrator.app.claims import (
@@ -29,6 +30,8 @@ from services.orchestrator.app.claims import (
     score_claim_statement,
 )
 from services.orchestrator.app.llm import LLMError, LLMProvider
+from services.orchestrator.app.planning import ResearchPlan
+from services.orchestrator.app.planning.planner import research_plan_from_serialized_payload
 from services.orchestrator.app.reporting import (
     DEFAULT_REPORT_LANGUAGE,
     ClaimStatus,
@@ -57,13 +60,15 @@ from services.orchestrator.app.storage import SnapshotObjectStore
 REPORT_FORMAT_MARKDOWN = "markdown"
 logger = get_logger(__name__)
 _REPORT_REVIEW_EXCLUDE_DECISIONS = {
-    "downrank",
     "reject",
     "duplicate",
     "vague",
     "split_needed",
+    "keep_example",
+    "keep_context",
 }
 _REPORT_ACCEPT_MIN_CONFIDENCE = 0.65
+_REPORT_SUPPORTING_MIN_CONFIDENCE = 0.55
 _EVENT_OR_ANNOUNCEMENT_MARKERS = {
     "conference",
     "conf ",
@@ -177,6 +182,7 @@ class ReportSynthesisService:
         claim_repository: ClaimRepository,
         claim_evidence_repository: ClaimEvidenceRepository,
         report_artifact_repository: ReportArtifactRepository,
+        task_event_repository: TaskEventRepository,
         object_store: SnapshotObjectStore,
         report_storage_bucket: str,
         llm_provider: LLMProvider | None = None,
@@ -190,6 +196,7 @@ class ReportSynthesisService:
         self.claim_repository = claim_repository
         self.claim_evidence_repository = claim_evidence_repository
         self.report_artifact_repository = report_artifact_repository
+        self.task_event_repository = task_event_repository
         self.object_store = object_store
         self.report_storage_bucket = report_storage_bucket
         self.llm_provider = llm_provider
@@ -365,6 +372,10 @@ class ReportSynthesisService:
         report_claims: list[ReportClaimItem] = []
         source_items: dict[UUID, ReportSourceItem] = {}
         excluded_low_quality_claim_count = 0
+        report_filter_counts: dict[str, int] = {
+            "excluded_from_report_example_misaligned": 0,
+            "excluded_from_report_weak_support": 0,
+        }
         for claim in claims:
             notes = claim.notes_json or {}
             claim_score = _report_claim_score(claim, query=task.query)
@@ -378,6 +389,11 @@ class ReportSynthesisService:
                     slot_ids=slot_ids,
                     review_decision=review_decision,
                 )
+                _record_report_exclusion_counts(
+                    report_filter_counts,
+                    reasons=["not_claimable_statement"],
+                    review_decision=review_decision,
+                )
                 excluded_low_quality_claim_count += 1
                 continue
             if not _report_claim_answer_relevant(claim_score, query=task.query):
@@ -386,6 +402,11 @@ class ReportSynthesisService:
                     eligible=False,
                     reasons=["low_quality_or_off_query_score"],
                     slot_ids=slot_ids,
+                    review_decision=review_decision,
+                )
+                _record_report_exclusion_counts(
+                    report_filter_counts,
+                    reasons=["low_quality_or_off_query_score"],
                     review_decision=review_decision,
                 )
                 excluded_low_quality_claim_count += 1
@@ -471,6 +492,11 @@ class ReportSynthesisService:
                 review_decision=review_decision,
             )
             if not eligibility["eligible"]:
+                _record_report_exclusion_counts(
+                    report_filter_counts,
+                    reasons=cast(list[str], eligibility["reasons"]),
+                    review_decision=review_decision,
+                )
                 excluded_low_quality_claim_count += 1
                 continue
             for evidence in support_evidence + contradict_evidence:
@@ -523,7 +549,14 @@ class ReportSynthesisService:
             "status": "used",
             "language": report_language,
         }
+        report_filter_counts["excluded_from_report_weak_support"] = sum(
+            1
+            for claim in report_claims
+            if claim.verification_status == "supported" and claim.support_level == "weak"
+        )
         if self.llm_report_writer_enabled and self.llm_provider is not None:
+            research_plan = self._latest_existing_research_plan(task)
+            research_plan_payload = research_plan.to_payload() if research_plan else None
             try:
                 llm_report = render_grounded_llm_report(
                     task_id=task.id,
@@ -538,6 +571,8 @@ class ReportSynthesisService:
                     llm_model=self.llm_model,
                     max_output_tokens=self.llm_report_max_output_tokens,
                     include_ledger_debug_appendix=self.include_ledger_debug_appendix,
+                    original_user_question=task.query,
+                    research_plan=research_plan_payload,
                 )
             except LLMError as error:
                 report_writer = {
@@ -572,6 +607,10 @@ class ReportSynthesisService:
                 rendered = llm_report.rendered
                 report_writer = dict(llm_report.metadata)
                 report_writer["language"] = report_language
+        report_writer = {
+            **report_writer,
+            "report_filter_summary": dict(report_filter_counts),
+        }
         return PreparedReport(
             rendered=rendered,
             claims=report_claims,
@@ -649,6 +688,27 @@ class ReportSynthesisService:
             return normalized_status
         return "draft"
 
+    def _latest_existing_research_plan(self, task: ResearchTask) -> ResearchPlan | None:
+        for event in reversed(self.task_event_repository.list_for_task(task.id)):
+            if event.event_type != "research_plan.created":
+                continue
+            payload = event.payload_json or {}
+            if not isinstance(payload, dict):
+                continue
+            changes = payload.get("changes")
+            if isinstance(changes, dict):
+                revision_no = changes.get("revision_no")
+                if isinstance(revision_no, int) and revision_no != task.revision_no:
+                    continue
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                continue
+            plan_payload = result.get("research_plan")
+            if not isinstance(plan_payload, dict):
+                continue
+            return research_plan_from_serialized_payload(plan_payload)
+        return None
+
 
 def create_report_synthesis_service(
     session: Session,
@@ -667,6 +727,7 @@ def create_report_synthesis_service(
         claim_repository=ClaimRepository(session),
         claim_evidence_repository=ClaimEvidenceRepository(session),
         report_artifact_repository=ReportArtifactRepository(session),
+        task_event_repository=TaskEventRepository(session),
         object_store=object_store,
         report_storage_bucket=report_storage_bucket,
         llm_provider=llm_provider,
@@ -752,23 +813,46 @@ def _report_claim_eligibility(
     decision = _string_or_none(review_decision.get("decision"))
     if decision in _REPORT_REVIEW_EXCLUDE_DECISIONS:
         reasons.append(f"claim_review_{decision}")
-    if decision == "accept":
+    if decision in {"keep_main", "keep_supporting"}:
         confidence = _numeric_note(review_decision.get("confidence"))
         review_reasons = review_decision.get("reasons")
+        related_answer_slot = _string_or_none(review_decision.get("related_answer_slot"))
         covered_slot_ids = review_decision.get("covered_slot_ids")
         quality_flags = review_decision.get("quality_flags")
-        if confidence is None or confidence < _REPORT_ACCEPT_MIN_CONFIDENCE:
-            reasons.append("claim_review_low_confidence_accept")
+        minimum_confidence = (
+            _REPORT_ACCEPT_MIN_CONFIDENCE
+            if decision == "keep_main"
+            else _REPORT_SUPPORTING_MIN_CONFIDENCE
+        )
+        if confidence is None or confidence < minimum_confidence:
+            reasons.append(f"claim_review_low_confidence_{decision}")
         if not isinstance(review_reasons, list) or not any(
             isinstance(item, str) and item.strip() for item in review_reasons
         ):
             reasons.append("claim_review_missing_reasons")
-        if not isinstance(covered_slot_ids, list) or not any(
-            isinstance(item, str) and item.strip() for item in covered_slot_ids
-        ):
+        valid_review_slot = bool(related_answer_slot and related_answer_slot in set(slot_ids))
+        if not valid_review_slot and isinstance(covered_slot_ids, list):
+            valid_review_slot = any(
+                isinstance(item, str) and item.strip() and item in set(slot_ids)
+                for item in covered_slot_ids
+            )
+        if slot_ids and not valid_review_slot:
             reasons.append("claim_review_missing_slot_coverage")
         if isinstance(quality_flags, list) and quality_flags:
             reasons.append("claim_review_quality_flags")
+        if decision == "keep_main" and review_decision.get("relevance") not in {
+            "direct",
+            "partial",
+        }:
+            reasons.append("claim_review_main_not_direct")
+        if review_decision.get("source_role") == "unsuitable":
+            reasons.append("claim_review_unsuitable_source")
+    elif decision in {"accept", "downrank"}:
+        confidence = _numeric_note(review_decision.get("confidence"))
+        if decision == "accept" and (
+            confidence is None or confidence < _REPORT_ACCEPT_MIN_CONFIDENCE
+        ):
+            reasons.append("claim_review_low_confidence_accept")
     if _event_or_announcement_noise_claim(claim.statement, query=query):
         reasons.append("event_or_announcement_noise")
     if claim_score.rejected_reason:
@@ -801,6 +885,26 @@ def _set_report_eligibility(
     }
 
 
+def _record_report_exclusion_counts(
+    counts: dict[str, int],
+    *,
+    reasons: list[str],
+    review_decision: dict[str, object],
+) -> None:
+    decision = _string_or_none(review_decision.get("decision"))
+    claim_role = _string_or_none(review_decision.get("claim_role"))
+    centrality = _string_or_none(review_decision.get("centrality"))
+    if (
+        decision == "keep_example"
+        or claim_role == "example"
+        or centrality == "example"
+        or "claim_review_keep_example" in reasons
+    ):
+        counts["excluded_from_report_example_misaligned"] = (
+            counts.get("excluded_from_report_example_misaligned", 0) + 1
+        )
+
+
 def _report_claim_slot_ids(
     claim: Claim,
     *,
@@ -818,7 +922,92 @@ def _report_claim_slot_ids(
 
 def _claim_review_decision(notes: dict[str, object]) -> dict[str, object]:
     review = notes.get("llm_claim_review")
-    return review if isinstance(review, dict) else {}
+    if not isinstance(review, dict):
+        return {}
+    return _normalize_report_review_decision(review)
+
+
+def _normalize_report_review_decision(review: dict[str, object]) -> dict[str, object]:
+    raw_decision = _string_or_none(review.get("decision")) or ""
+    normalized_decision = raw_decision.strip().lower().replace(" ", "_")
+    decision_aliases = {
+        "accept": "keep_main",
+        "accepted": "keep_main",
+        "approve": "keep_main",
+        "approved": "keep_main",
+        "downrank": "keep_supporting",
+        "lower_priority": "keep_supporting",
+        "duplicate": "reject",
+        "split_needed": "reject",
+        "too_vague": "reject",
+        "vague": "reject",
+    }
+    decision = decision_aliases.get(normalized_decision, normalized_decision)
+    if decision not in {"keep_main", "keep_supporting", "keep_example", "keep_context", "reject"}:
+        decision = (
+            normalized_decision if normalized_decision in _REPORT_REVIEW_EXCLUDE_DECISIONS else ""
+        )
+    reasons = _string_list_note(review.get("reasons"))
+    if not reasons:
+        reason = _string_or_none(review.get("reason")) or _string_or_none(review.get("rationale"))
+        reasons = [reason] if reason else []
+    covered_slot_ids = _string_list_note(review.get("covered_slot_ids"))
+    if not covered_slot_ids:
+        covered_slot_ids = _string_list_note(review.get("slots"))
+    related_answer_slot = _string_or_none(review.get("related_answer_slot"))
+    if related_answer_slot is None and covered_slot_ids:
+        related_answer_slot = covered_slot_ids[0]
+    normalized = {
+        **review,
+        "decision": decision,
+        "reasons": reasons,
+        "covered_slot_ids": covered_slot_ids,
+        "related_answer_slot": related_answer_slot,
+        "relevance": _normalized_review_enum(
+            review.get("relevance"),
+            allowed={"direct", "partial", "background", "off_topic"},
+            default=("direct" if decision == "keep_main" else "partial"),
+        ),
+        "source_role": _normalized_review_enum(
+            review.get("source_role"),
+            allowed={"primary_reference", "supporting_reference", "example_only", "unsuitable"},
+            default=("primary_reference" if decision == "keep_main" else "supporting_reference"),
+        ),
+        "claim_role": _normalized_review_enum(
+            review.get("claim_role"),
+            allowed={
+                "definition",
+                "component",
+                "mechanism",
+                "application",
+                "comparison",
+                "limitation",
+                "example",
+            },
+            default="mechanism",
+        ),
+        "centrality": _normalized_review_enum(
+            review.get("centrality"),
+            allowed={"core", "supporting", "example", "peripheral"},
+            default=("core" if decision == "keep_main" else "supporting"),
+        ),
+    }
+    if normalized["relevance"] == "off_topic" or normalized["source_role"] == "unsuitable":
+        normalized["decision"] = "reject"
+    return normalized
+
+
+def _normalized_review_enum(
+    value: object,
+    *,
+    allowed: set[str],
+    default: str,
+) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace(" ", "_")
+        if normalized in allowed:
+            return normalized
+    return default
 
 
 def _claim_focus_matches_query(statement: str, *, query: str) -> bool:
@@ -911,6 +1100,17 @@ def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | N
     rejected_reason = notes.get("rejected_reason")
     answer_role = notes.get("answer_role")
     answer_relevant = notes.get("answer_relevant")
+    
+    from services.orchestrator.app.claims.drafting import CandidateTriageStatus
+    triage_status_val = notes.get("triage_status")
+    if isinstance(triage_status_val, str):
+        try:
+            triage_status = CandidateTriageStatus(triage_status_val)
+        except ValueError:
+            triage_status = CandidateTriageStatus.REJECT_FATAL if rejected_reason else CandidateTriageStatus.ACCEPT_CANDIDATE
+    else:
+        triage_status = CandidateTriageStatus.REJECT_FATAL if rejected_reason else CandidateTriageStatus.ACCEPT_CANDIDATE
+
     return ClaimCandidateScore(
         claim_category=claim_category if isinstance(claim_category, str) else "other",
         answer_role=answer_role if isinstance(answer_role, str) else "non_answer",
@@ -920,8 +1120,20 @@ def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | N
         claim_quality_score=claim_quality_score,
         query_answer_score=query_answer_score,
         source_quality_score=_numeric_note(notes.get("source_quality_score")) or 0.5,
+        source_suitability_score=_numeric_note(notes.get("source_suitability_score")) or 0.5,
         final_score=_numeric_note(notes.get("claim_selection_score")) or 0.0,
+        candidate_tier=(
+            notes.get("candidate_tier")
+            if isinstance(notes.get("candidate_tier"), str)
+            else "main_candidate"
+        ),
         rejected_reason=rejected_reason if isinstance(rejected_reason, str) else None,
+        triage_status=triage_status,
+        analysis_flags=tuple(
+            item
+            for item in notes.get("analysis_flags", [])
+            if isinstance(item, str) and item.strip()
+        ),
     )
 
 
@@ -929,6 +1141,14 @@ def _numeric_note(value: object) -> float | None:
     if isinstance(value, int | float):
         return float(value)
     return None
+
+
+def _string_list_note(value: object) -> list[str]:
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
 def _int_note(value: object) -> int | None:

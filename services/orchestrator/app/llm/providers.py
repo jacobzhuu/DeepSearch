@@ -56,6 +56,7 @@ class OpenAICompatibleLLMProvider:
         timeout_seconds: float,
         max_retries: int,
         client: httpx.Client | None = None,
+        trust_env_proxy: bool = False,
     ) -> None:
         self.base_url = sanitize_openai_compatible_base_url(base_url)
         self.chat_completions_url = build_chat_completions_url(self.base_url)
@@ -64,6 +65,7 @@ class OpenAICompatibleLLMProvider:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, max_retries)
         self.client = client
+        self.trust_env_proxy = trust_env_proxy
 
     def generate(self, request: LLMRequest) -> LLMResponse:
         self._validate_configuration()
@@ -129,7 +131,10 @@ class OpenAICompatibleLLMProvider:
                     headers=headers,
                     json=payload,
                 )
-            with httpx.Client(timeout=self.timeout_seconds, trust_env=True) as client:
+            with httpx.Client(
+                timeout=self.timeout_seconds,
+                trust_env=self.trust_env_proxy,
+            ) as client:
                 return client.post(
                     self.chat_completions_url,
                     headers=headers,

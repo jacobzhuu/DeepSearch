@@ -36,10 +36,10 @@ from services.orchestrator.app.services.research_tasks import create_research_ta
 from services.orchestrator.app.storage import FilesystemSnapshotObjectStore
 
 DEFAULT_HTML_CONTENT = (
-    b"<html><head><title>Example</title></head>" b"<body><p>Alpha.</p><p>Beta.</p></body></html>"
+    b"<html><head><title>Example</title></head><body><p>Alpha.</p><p>Beta.</p></body></html>"
 )
 UPDATED_HTML_CONTENT = (
-    b"<html><head><title>New Title</title></head>" b"<body><p>Updated body text.</p></body></html>"
+    b"<html><head><title>New Title</title></head><body><p>Updated body text.</p></body></html>"
 )
 
 
@@ -393,6 +393,91 @@ def test_parsing_service_records_parser_exception_decision(
     assert result.entries[0].body_length == len(DEFAULT_HTML_CONTENT)
     assert result.entries[0].parser_error == "parser exploded"
     assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
+
+
+def test_parsing_service_default_selection_skips_failed_fetch_snapshots_before_limit(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    failed_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        canonical_url="https://blocked.example/source",
+        content=b"<html><body>Forbidden</body></html>",
+        fetch_status="FAILED",
+        fetch_error_code="http_error_status",
+    )
+    task_id = failed_snapshot.fetch_attempt.fetch_job.task_id
+    search_query_id = failed_snapshot.fetch_attempt.fetch_job.candidate_url.search_query_id
+    candidate_url = CandidateUrlRepository(db_session).add(
+        CandidateUrl(
+            task_id=task_id,
+            search_query_id=search_query_id,
+            original_url="https://example.com/success",
+            canonical_url="https://example.com/success",
+            domain="example.com",
+            title="Successful source",
+            rank=2,
+            selected=False,
+            metadata_json={},
+        )
+    )
+    fetch_job = FetchJobRepository(db_session).add(
+        FetchJob(
+            task_id=task_id,
+            candidate_url_id=candidate_url.id,
+            mode="HTTP",
+            status="SUCCEEDED",
+            scheduled_at=datetime(2026, 4, 23, 12, 3, tzinfo=UTC),
+        )
+    )
+    fetch_attempt = FetchAttemptRepository(db_session).add(
+        FetchAttempt(
+            fetch_job_id=fetch_job.id,
+            attempt_no=1,
+            http_status=200,
+            error_code=None,
+            started_at=datetime(2026, 4, 23, 12, 3, tzinfo=UTC),
+            finished_at=datetime(2026, 4, 23, 12, 4, tzinfo=UTC),
+            trace_json={},
+        )
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path))
+    success_content = (
+        b"<html><head><title>Success</title></head><body><p>Useful text.</p></body></html>"
+    )
+    stored_object = object_store.put_bytes(
+        bucket="snapshots",
+        key=f"task/{task_id}/success-snapshot.bin",
+        content=success_content,
+        content_type="text/html",
+    )
+    success_snapshot = ContentSnapshotRepository(db_session).add(
+        ContentSnapshot(
+            fetch_attempt_id=fetch_attempt.id,
+            storage_bucket=stored_object.bucket,
+            storage_key=stored_object.key,
+            content_hash="sha256:success",
+            mime_type="text/html",
+            bytes=len(success_content),
+            extracted_title=None,
+            fetched_at=datetime(2026, 4, 23, 12, 4, tzinfo=UTC),
+        )
+    )
+    db_session.commit()
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(task_id, content_snapshot_ids=None, limit=1)
+
+    assert [entry.content_snapshot.id for entry in result.entries] == [success_snapshot.id]
+    assert result.created == 1
+    assert source_document_repo.get_for_content_snapshot(failed_snapshot.id) is None
+    success_document = source_document_repo.get_for_content_snapshot(success_snapshot.id)
+    assert success_document is not None
+    assert source_chunk_repo.list_for_document(success_document.id)[0].text == "Useful text."
 
 
 def test_parsing_service_short_html_with_title_creates_source_document(

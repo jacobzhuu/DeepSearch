@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from typing import Any, Literal
 from uuid import UUID
@@ -77,6 +78,8 @@ ExpectedSourceType = Literal[
 
 USER_PROMPT_TEMPLATE = """Create a bounded research plan for this query.
 
+Current date: {current_date}
+
 Query:
 {query}
 
@@ -100,6 +103,8 @@ freshness_required must be a JSON boolean true or false.
 answer_outline, risk_notes, and warnings must be arrays of strings.
 priority must be a JSON integer.
 Prefer official and reference sources when possible.
+For time-sensitive queries such as "last 30 days", "recent", "latest", or "近30天",
+keep search queries anchored to the current date and do not use stale years.
 
 Schema-conforming compact example:
 {example_json}"""
@@ -238,6 +243,7 @@ class ResearchPlannerService:
         request = LLMRequest(
             system_prompt=SYSTEM_PROMPT,
             user_prompt=USER_PROMPT_TEMPLATE.format(
+                current_date=_current_date_iso(),
                 query=normalized_query,
                 max_subquestions=self.max_subquestions,
                 max_search_queries=self.max_search_queries,
@@ -1023,7 +1029,11 @@ def _apply_research_plan_guardrails(
     max_search_queries: int,
 ) -> ResearchPlan:
     intent_classification = _classify_research_intent(query=query, intent=plan.intent)
-    overview_query = intent_classification == "overview_definition_intent"
+    recent_nvidia_open_model_query = _is_recent_nvidia_open_model_query(query)
+    overview_query = (
+        intent_classification == "overview_definition_intent"
+        and not recent_nvidia_open_model_query
+    )
     deployment_query = intent_classification == "deployment_intent"
     extracted_entity = _extract_entity_from_overview_query(query) if overview_query else None
     searxng_query = _is_searxng_query(query)
@@ -1200,6 +1210,96 @@ def _apply_research_plan_guardrails(
                     "Treat secrets, public exposure, storage, and reverse-proxy settings as "
                     "operational risk areas."
                 ),
+            ],
+            risk_notes,
+        )
+    elif recent_nvidia_open_model_query:
+        current_year = _current_year()
+        preferred_domains = _string_list(source_preferences.get("preferred_domains"))
+        source_preferences["preferred_domains"] = _prepend_unique_strings(
+            [
+                "nvidia.com",
+                "blogs.nvidia.com",
+                "developer.nvidia.com",
+                "nvidianews.nvidia.com",
+                "huggingface.co/nvidia",
+                "github.com/NVIDIA",
+            ],
+            preferred_domains,
+        )
+        guardrail_queries = [
+            PlannedSearchQuery(
+                query_text=query,
+                rationale="Preserve the user's original time-sensitive NVIDIA research question.",
+                expected_source_type="general_web",
+                priority=1,
+                query_source="original_user_query",
+            ),
+            PlannedSearchQuery(
+                query_text=(
+                    f"NVIDIA open source model release last 30 days {current_year} "
+                    "site:nvidia.com"
+                ),
+                rationale="Force current official NVIDIA release material into the plan.",
+                expected_source_type="official_docs",
+                priority=2,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=(
+                    f"NVIDIA open weights model {current_year} site:blogs.nvidia.com"
+                ),
+                rationale="Prioritize NVIDIA official blog posts about open model releases.",
+                expected_source_type="official_about",
+                priority=3,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=(
+                    f"NVIDIA Nemotron open model {current_year} site:developer.nvidia.com"
+                ),
+                rationale="Prioritize NVIDIA developer material for model details and impact.",
+                expected_source_type="official_or_reference",
+                priority=4,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=(
+                    f"NVIDIA open AI model {current_year} site:nvidianews.nvidia.com"
+                ),
+                rationale="Prioritize NVIDIA newsroom announcements for release dates.",
+                expected_source_type="official_docs",
+                priority=5,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"NVIDIA open models {current_year} site:huggingface.co/nvidia",
+                rationale="Check NVIDIA's model hub for released open weights and adoption context.",
+                expected_source_type="reference",
+                priority=6,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"NVIDIA open source model GitHub release {current_year} site:github.com/NVIDIA",
+                rationale="Check NVIDIA-owned GitHub repositories for recent release evidence.",
+                expected_source_type="official_repository",
+                priority=7,
+                query_source="guardrail_query",
+            ),
+        ]
+        search_queries, dropped_or_downweighted = _merge_and_rank_planned_queries(
+            guardrail_queries,
+            [_normalize_recent_query_year(item) for item in plan.search_queries],
+            max_search_queries=max_search_queries,
+            demote_architecture_or_setup=False,
+        )
+        warning = "planner_queries_supplemented_for_recent_nvidia_official_sources"
+        guardrail_warnings.append(warning)
+        warnings.append(warning)
+        risk_notes = _prepend_unique_strings(
+            [
+                "Treat recency as an evidence requirement and verify announcement dates.",
+                "Prefer NVIDIA-owned release, developer, model hub, and repository sources.",
             ],
             risk_notes,
         )
@@ -1503,6 +1603,60 @@ def _merge_and_rank_planned_queries(
             deduped_diagnostics.append(item)
             seen_diagnostics.add(key)
     return final_queries, deduped_diagnostics
+
+
+def _current_date_iso() -> str:
+    return datetime.now(UTC).date().isoformat()
+
+
+def _current_year() -> int:
+    return datetime.now(UTC).year
+
+
+def _is_recent_nvidia_open_model_query(query: str) -> bool:
+    lower = query.lower()
+    return (
+        "nvidia" in lower
+        and _is_recent_query(query)
+        and any(term in lower for term in ("open source", "open-source", "opensource", "开源"))
+        and any(term in lower for term in ("model", "models", "模型"))
+    )
+
+
+def _is_recent_query(query: str) -> bool:
+    lower = query.lower()
+    return any(
+        term in lower
+        for term in (
+            "last 30 days",
+            "past 30 days",
+            "recent",
+            "latest",
+            "this month",
+            "近30天",
+            "最近30天",
+            "近一个月",
+            "最近一个月",
+            "近期",
+            "最新",
+        )
+    )
+
+
+def _normalize_recent_query_year(query: PlannedSearchQuery) -> PlannedSearchQuery:
+    current_year = _current_year()
+    normalized_text = re.sub(
+        r"\b20\d{2}\b",
+        str(current_year),
+        query.query_text,
+    )
+    return PlannedSearchQuery(
+        query_text=normalized_text,
+        rationale=query.rationale,
+        expected_source_type=query.expected_source_type,
+        priority=query.priority,
+        query_source=query.query_source,
+    )
 
 
 def _planner_query_guardrail_penalty(query: PlannedSearchQuery) -> int:

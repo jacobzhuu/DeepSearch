@@ -27,15 +27,18 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 - product run queueing uses existing `research_task.status = QUEUED`; the host-local worker writes runtime progress to existing `task_event` rows and `research_run.checkpoint_json`
 - task listing is an API/query-layer addition over existing `research_task` and `task_event` rows; it adds no relational schema
 - planner guardrail, LLM query-rewrite, source-selection, LLM source-judge, answer-slot coverage,
-  LLM evidence-rerank, LLM claim-review, source-yield, evidence-yield, dropped-source,
-  verifier-detail, supplemental-acquisition, gap-analysis, deployment-evidence, and
+  LLM research-strategist, coverage-evaluator, LLM evidence-rerank, LLM claim-review, source-yield,
+  evidence-yield, dropped-source, verifier-detail, supplemental-acquisition, gap-analysis,
+  deployment-evidence, and
   failure-diagnostic fields are stored in existing `task_event.payload_json`,
   `search_query.raw_response_json`, `candidate_url.metadata_json`, `source_chunk.metadata_json`,
   `claim.notes_json`, `research_run.checkpoint_json`, `report_artifact.manifest_json`, and API
   observability payloads; gap supplemental query metadata such as
   `query_source = "gap_analyzer"`, `gap_round_no`, and `slot_ids` stays in existing search
-  metadata; no new planner, source-quality, answer-slot, evidence-candidate, deployment-step,
-  gap-analyzer, worker-queue, source-judge, LLM-assistance, or acquisition-retry table exists
+  metadata, while strategist-generated follow-up queries use
+  `query_source = "llm_research_strategist"` in the same existing metadata seam; no new planner,
+  source-quality, answer-slot, evidence-candidate, deployment-step, gap-analyzer, strategist,
+  worker-queue, source-judge, LLM-assistance, or acquisition-retry table exists
 - query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `answer_role`, `answer_relevant`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`
 - claim drafting now also stores code-contract lineage fields in `claim.notes_json`, including `slot_ids`, `source_document_id`, `source_chunk_id`, `citation_span_id`, `claim_evidence_id`, `source_intent`, `evidence_kind`, `evidence_candidate_id`, `evidence_quality_score`, `evidence_salience_score`, `evidence_rejection_reasons`, and a serialized `evidence_candidate` payload; deployment command/config records use `evidence_kind = "deployment_code_or_config"` and deployment-specific `slot_ids`, preserve the full drafted evidence excerpt in that existing payload for rendering, while archived/superseded official-repository caveats use ordinary verified claim metadata and a deployment maintenance slot
 - source quality uses existing `source_document` score columns and `source_chunk.metadata_json`; current metadata records final source score, authority, relevance, crawlability, information density, safety, explicit `freshness_state`, chunk content quality, query relevance, boilerplate score, and quality reasons such as `deployment_code_or_config`
@@ -47,6 +50,7 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
   readability/debug-appendix settings live in report writer metadata/configuration
 - host-local operational closeout, optional compose wiring, init scripts, and smoke validation all reuse the existing Phase 10 schema as-is
 - `services/orchestrator/app/research_quality/` provides the current code-level source-intent, answer-slot, evidence-candidate, source-yield, evidence-yield, dropped-source reason, slot-coverage, and gap-analysis contracts; these are not relational schema entities yet
+- `evidence_yield_summary` distinguishes accepted, hard-rejected, and unselected candidates in the existing task-event/report JSON contracts; no relational column or table was added for that compatibility field
 - the stable code-level diagnostics field names are `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, `evidence_yield_summary`, `slot_coverage_summary`, `gap_analysis`, `gap_rounds`, and `verification_summary`; older rows that lack these fields are interpreted as empty summaries rather than requiring a data migration
 - the latest relational schema change remains `20260424_0005_report_artifact_manifest_and_hash`
 - the current functional ledger loop is complete through:

@@ -98,9 +98,17 @@ class _ClaimReviewItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim_id: str
-    decision: Literal["accept", "downrank", "reject", "duplicate", "vague", "split_needed"]
+    decision: Literal["keep_main", "keep_supporting", "keep_example", "keep_context", "reject"]
+    relevance: Literal["direct", "partial", "background", "off_topic"]
+    source_role: Literal["primary_reference", "supporting_reference", "example_only", "unsuitable"]
+    claim_role: Literal[
+        "definition", "component", "mechanism", "application", "comparison", "limitation", "example"
+    ]
+    centrality: Literal["core", "supporting", "example", "peripheral"]
     confidence: float = Field(ge=0.0, le=1.0)
     reasons: list[str] = Field(default_factory=list)
+    related_planner_subquestion: str | None = None
+    related_answer_slot: str | None = None
     covered_slot_ids: list[str] = Field(default_factory=list)
 
 
@@ -434,21 +442,34 @@ class LLMClaimReviewService:
             "rules": [
                 "Review only supplied claim_id values.",
                 "Do not create new claims.",
-                "Evaluate main-entity relevance, user-question relevance, answer-slot coverage, "
-                "adjacent-entity or ecosystem drift, usefulness for the main report, evidence "
-                "support, and whether the claim is too generic or vague.",
-                "Reject or downrank vague, duplicate, unsupported-looking, adjacent, ecosystem, "
-                "off-topic, or off-slot claims.",
-                "An accept decision must include concrete reasons and covered_slot_ids.",
-                "Do not mark unsupported claims as supported.",
+                (
+                    "Evaluate relevance (direct/partial/background), source suitability "
+                    "(primary/supporting/example/unsuitable), claim role "
+                    "(definition/component/mechanism/etc.), and centrality "
+                    "(core/supporting/example/peripheral)."
+                ),
+                (
+                    "Decide: keep_main (high relevance), keep_supporting, keep_example, "
+                    "keep_context, or reject."
+                ),
+                (
+                    "Be inclusive: accept claims that provide partial but useful information "
+                    "or context as keep_supporting or keep_context."
+                ),
+                (
+                    "Map each claim to the most relevant related_planner_subquestion and "
+                    "related_answer_slot."
+                ),
             ],
         }
         try:
             response_text = self.provider.generate(
                 LLMRequest(
                     system_prompt=(
-                        "You review candidate claims for an evidence-first research ledger. "
-                        "Return JSON only with a decisions array. Do not create claims."
+                        "You are an expert research reviewer. Review candidate claims for "
+                        "relevance and utility. Be reasonably inclusive—retaining supporting "
+                        "evidence is better than over-filtering. Return JSON only with a "
+                        "decisions array."
                     ),
                     user_prompt=_bounded_json(request_payload, self.input_max_chars),
                     model=self.model,
@@ -480,7 +501,7 @@ class LLMClaimReviewService:
             if item.claim_id in allowed_ids
         ]
         low_quality_decision_count = sum(
-            1 for decision in decisions if decision.get("quality_flags")
+            1 for decision in decisions if decision.get("blocking_quality_flags")
         )
         if decisions and low_quality_decision_count == len(decisions):
             return ClaimReviewResult(
@@ -492,6 +513,7 @@ class LLMClaimReviewService:
                     "reviewed_claim_count": len(decisions),
                     "input_claim_count": len(bounded_claims),
                     "decision_counts": _decision_counts(decisions),
+                    **_reviewer_decision_count_fields(decisions),
                     "low_quality_decision_count": low_quality_decision_count,
                 },
                 decisions,
@@ -505,6 +527,7 @@ class LLMClaimReviewService:
                 "reviewed_claim_count": len(decisions),
                 "input_claim_count": len(bounded_claims),
                 "decision_counts": _decision_counts(decisions),
+                **_reviewer_decision_count_fields(decisions),
                 "low_quality_decision_count": low_quality_decision_count,
             },
             decisions,
@@ -636,24 +659,123 @@ def _normalize_claim_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
             claim_id = _first_string(item, "claim_id", "id")
             if not claim_id:
                 continue
-            decision = _normalize_claim_decision(
-                _first_string(item, "decision", "action", "recommendation", "status")
-            )
+            raw_decision = _first_string(item, "decision", "action", "recommendation", "status")
+            decision = _normalize_claim_decision(raw_decision)
             reasons = item.get("reasons", item.get("reason", item.get("rationale", [])))
-            slot_ids = item.get(
-                "covered_slot_ids",
-                item.get("slot_ids", item.get("answer_slot_ids", item.get("slots", []))),
+            covered_slot_ids = _string_list(
+                item.get("covered_slot_ids", item.get("slots", item.get("slot_ids", [])))
             )
+            related_answer_slot = _first_string(item, "related_answer_slot", "slot", "answer_slot")
+            if related_answer_slot is None and covered_slot_ids:
+                related_answer_slot = covered_slot_ids[0]
             normalized_decisions.append(
                 {
                     "claim_id": claim_id,
                     "decision": decision,
+                    "relevance": _normalize_relevance(
+                        _first_string(item, "relevance"),
+                        decision=decision,
+                        raw_decision=raw_decision,
+                    ),
+                    "source_role": _normalize_source_role(
+                        _first_string(item, "source_role"),
+                        decision=decision,
+                        raw_decision=raw_decision,
+                    ),
+                    "claim_role": _normalize_claim_role(
+                        _first_string(item, "claim_role"),
+                        covered_slot_ids=covered_slot_ids,
+                    ),
+                    "centrality": _normalize_centrality(
+                        _first_string(item, "centrality"),
+                        decision=decision,
+                    ),
                     "confidence": _coerce_score(item.get("confidence"), default=0.5),
                     "reasons": _string_list(reasons),
-                    "covered_slot_ids": _string_list(slot_ids),
+                    "related_planner_subquestion": _first_string(
+                        item, "related_planner_subquestion", "subquestion"
+                    ),
+                    "related_answer_slot": related_answer_slot,
+                    "covered_slot_ids": covered_slot_ids,
                 }
             )
     return {"decisions": normalized_decisions}
+
+
+def _normalize_relevance(
+    value: str | None,
+    *,
+    decision: str,
+    raw_decision: str | None,
+) -> str:
+    default = "background"
+    raw = (raw_decision or "").strip().lower().replace(" ", "_")
+    if value is None and decision == "keep_main" and raw in {"accept", "accepted", "keep"}:
+        default = "direct"
+    elif value is None and decision == "keep_supporting":
+        default = "partial"
+    elif value is None and decision == "reject":
+        default = "off_topic"
+    normalized = (value or default).strip().lower()
+    allowed = {"direct", "partial", "background", "off_topic"}
+    return normalized if normalized in allowed else "background"
+
+
+def _normalize_source_role(
+    value: str | None,
+    *,
+    decision: str,
+    raw_decision: str | None,
+) -> str:
+    default = "supporting_reference"
+    raw = (raw_decision or "").strip().lower().replace(" ", "_")
+    if value is None and decision == "keep_main" and raw in {"accept", "accepted", "keep"}:
+        default = "primary_reference"
+    elif value is None and decision == "reject":
+        default = "unsuitable"
+    normalized = (value or default).strip().lower().replace(" ", "_")
+    allowed = {"primary_reference", "supporting_reference", "example_only", "unsuitable"}
+    return normalized if normalized in allowed else "supporting_reference"
+
+
+def _normalize_claim_role(value: str | None, *, covered_slot_ids: list[str]) -> str:
+    default = "mechanism"
+    if covered_slot_ids:
+        first_slot = covered_slot_ids[0].strip().lower()
+        if first_slot in {
+            "definition",
+            "component",
+            "mechanism",
+            "application",
+            "comparison",
+            "limitation",
+            "example",
+        }:
+            default = first_slot
+    normalized = (value or default).strip().lower()
+    allowed = {
+        "definition",
+        "component",
+        "mechanism",
+        "application",
+        "comparison",
+        "limitation",
+        "example",
+    }
+    return normalized if normalized in allowed else "mechanism"
+
+
+def _normalize_centrality(value: str | None, *, decision: str) -> str:
+    default = "supporting"
+    if decision == "keep_main":
+        default = "core"
+    elif decision == "keep_example":
+        default = "example"
+    elif decision in {"keep_context", "reject"}:
+        default = "peripheral"
+    normalized = (value or default).strip().lower()
+    allowed = {"core", "supporting", "example", "peripheral"}
+    return normalized if normalized in allowed else "supporting"
 
 
 def _evidence_rerank_quality(
@@ -721,28 +843,40 @@ def _normalize_claim_review_decision_quality(
 ) -> dict[str, Any]:
     normalized = dict(decision)
     reasons = _string_list(normalized.get("reasons"))
-    covered_slot_ids = [
-        slot_id
-        for slot_id in _string_list(normalized.get("covered_slot_ids"))
-        if not valid_slot_ids or slot_id in valid_slot_ids
-    ]
+    slot_id = normalized.get("related_answer_slot")
     confidence = _coerce_score(normalized.get("confidence"), default=0.0)
     original_decision = str(normalized.get("decision") or "")
     quality_flags: list[str] = []
+    blocking_quality_flags: list[str] = []
     if not reasons:
         quality_flags.append("missing_reasons")
-    if original_decision in {"accept", "downrank"} and not covered_slot_ids:
-        quality_flags.append("missing_slot_coverage")
+        blocking_quality_flags.append("missing_reasons")
+    if original_decision != "reject" and (
+        normalized.get("relevance") == "off_topic" or normalized.get("source_role") == "unsuitable"
+    ):
+        quality_flags.append("off_topic_or_unsuitable")
+        blocking_quality_flags.append("off_topic_or_unsuitable")
+        normalized["decision"] = "reject"
+    if original_decision in {"keep_main", "keep_supporting"} and not (
+        slot_id and (not valid_slot_ids or slot_id in valid_slot_ids)
+    ):
+        quality_flags.append("missing_valid_slot_coverage")
+        if original_decision == "keep_main":
+            blocking_quality_flags.append("missing_valid_slot_coverage")
     if confidence < MIN_CLAIM_REVIEW_ACCEPT_CONFIDENCE:
         quality_flags.append("low_confidence")
 
-    if original_decision == "accept" and quality_flags:
-        normalized["decision"] = "downrank"
+    if (
+        original_decision == "keep_main"
+        and normalized.get("decision") != "reject"
+        and quality_flags
+    ):
+        normalized["decision"] = "keep_supporting"
         normalized["original_decision"] = original_decision
         reasons = [
             *reasons,
             (
-                "LLM accept decision was downranked because the structured review "
+                "LLM keep_main decision was downranked to keep_supporting because the review "
                 f"was incomplete or low-confidence: {', '.join(quality_flags)}."
             ),
         ]
@@ -754,8 +888,8 @@ def _normalize_claim_review_decision_quality(
 
     normalized["confidence"] = confidence
     normalized["reasons"] = reasons
-    normalized["covered_slot_ids"] = covered_slot_ids
     normalized["quality_flags"] = quality_flags
+    normalized["blocking_quality_flags"] = blocking_quality_flags
     return normalized
 
 
@@ -835,30 +969,36 @@ def _normalize_source_type(value: str | None) -> str:
 
 
 def _normalize_claim_decision(value: str | None) -> str:
-    normalized = (value or "downrank").strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = (value or "keep_supporting").strip().lower().replace(" ", "_")
     aliases = {
-        "keep": "accept",
-        "approve": "accept",
-        "approved": "accept",
-        "accepted": "accept",
-        "good": "accept",
-        "valid": "accept",
-        "lower_priority": "downrank",
-        "needs_evidence": "downrank",
+        "keep": "keep_main",
+        "approve": "keep_main",
+        "approved": "keep_main",
+        "accepted": "keep_main",
+        "accept": "keep_main",
+        "good": "keep_main",
+        "valid": "keep_main",
+        "main": "keep_main",
+        "core": "keep_main",
+        "supporting": "keep_supporting",
+        "downrank": "keep_supporting",
+        "lower_priority": "keep_supporting",
+        "needs_evidence": "keep_supporting",
+        "example": "keep_example",
+        "context": "keep_context",
         "unsupported": "reject",
         "off_topic": "reject",
         "off_slot": "reject",
         "remove": "reject",
-        "duplicative": "duplicate",
-        "too_vague": "vague",
-        "needs_split": "split_needed",
-        "split": "split_needed",
-        "rewrite": "split_needed",
-        "revise": "split_needed",
+        "duplicative": "reject",
+        "duplicate": "reject",
+        "too_vague": "reject",
+        "vague": "reject",
+        "split_needed": "reject",
     }
     normalized = aliases.get(normalized, normalized)
-    allowed = {"accept", "downrank", "reject", "duplicate", "vague", "split_needed"}
-    return normalized if normalized in allowed else "downrank"
+    allowed = {"keep_main", "keep_supporting", "keep_example", "keep_context", "reject"}
+    return normalized if normalized in allowed else "keep_supporting"
 
 
 def _bounded_json(payload: dict[str, Any], max_chars: int) -> str:
@@ -923,6 +1063,17 @@ def _decision_counts(decisions: list[dict[str, Any]]) -> dict[str, int]:
         label = str(decision.get("decision") or "unknown")
         counts[label] = counts.get(label, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _reviewer_decision_count_fields(decisions: list[dict[str, Any]]) -> dict[str, int]:
+    counts = _decision_counts(decisions)
+    return {
+        "reviewer_keep_main": counts.get("keep_main", 0),
+        "reviewer_keep_supporting": counts.get("keep_supporting", 0),
+        "reviewer_keep_example": counts.get("keep_example", 0),
+        "reviewer_keep_context": counts.get("keep_context", 0),
+        "reviewer_rejected": counts.get("reject", 0),
+    }
 
 
 def _sha256(text: str) -> str:

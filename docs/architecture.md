@@ -16,15 +16,35 @@ through the existing OpenAI-compatible provider path; it is not a search provide
 `candidate_url`, `fetch_attempt`, `content_snapshot`, `source_document`, `source_chunk`,
 `citation_span`, `claim`, `claim_evidence`, or `report_artifact`. Optional LLM stages now cover
 query rewriting, source judging, evidence reranking, claim review, and grounded report writing.
-Each stage has an independent disabled-by-default flag, bounded input/output size, structured JSON
+Each stage has an independent enablement flag, bounded input/output size, structured JSON
 validation, diagnostics, and deterministic fallback. The query rewriter, evidence reranker, and
 claim reviewer normalize common provider JSON aliases before strict validation, but failed
-normalization remains visible in task diagnostics. Source judging may actively rerank only behind
+normalization remains visible in task diagnostics. Claim-candidate scoring treats low
+quality/answer/relevance scores as ranking and LLM-review inputs rather than fatal filters; only
+clear non-evidence, unsafe/ineligible chunks, and non-claimable text are hard rejected before
+selection. Source judging may actively rerank only behind
 `LLM_SOURCE_JUDGE_ACTIVE_RERANK=true`, and even then deterministic ownership, low-value source
 filters, blocklists, SSRF/acquisition policy, and official-source priority remain final; active
 participation counts and guardrail reasons are exposed in observability. Evidence reranking can rank
 only existing chunk ids, claim review can review only existing draft claim ids, and report writing
-can render only validated claim/evidence/citation ids.
+can render only validated claim/evidence/citation ids. Task-detail observability keeps pipeline
+evidence/source-yield summaries stable after report generation instead of replacing them with the
+smaller report-manifest subset.
+
+The iterative research-loop optimization adds an optional `LLMResearchStrategist` in
+`services/orchestrator/app/research_quality/llm_research_strategist.py` plus a deterministic
+coverage evaluator. The strategist receives only a compact task-state summary after verification:
+question, prior queries, remaining budgets, candidate summaries, verified claim summaries, and
+slot coverage. It returns structured stop/continue decisions and next search queries. By default
+this is shadow diagnostics only. When `RESEARCH_LOOP_ENABLED=true`,
+`RESEARCH_LOOP_STRATEGIST_ENABLED=true`, and `RESEARCH_LOOP_STRATEGIST_SHADOW_MODE=false`, valid
+`continue_search` strategist queries can replace deterministic gap-analyzer supplemental queries;
+invalid output, provider failure, disabled flags, or empty query lists fall back to
+`gap_analyzer.py`. The strategist never creates claims, evidence, sources, or reports directly.
+Structured source judging now also records source triage fields, and active triage can attempt
+`must_fetch` candidates before generic ranked candidates while skipping explicit low-value or
+duplicate LLM-triaged candidates. The existing acquisition policy, canonical URL ledger, fetch
+attempt recording, MIME policy, and deterministic fallback remain the authority of record.
 
 ### Deployment report quality increment
 

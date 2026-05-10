@@ -5,6 +5,7 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 APP_MODULE="services.orchestrator.app.main:app"
+FULL_DEEPSEARCH_SCRIPT="$PROJECT_ROOT/scripts/run_full_deepsearch.sh"
 LOG_DIR="${DEV_LOG_DIR:-$PROJECT_ROOT/.logs}"
 RUN_DIR="${DEV_RUN_DIR:-$PROJECT_ROOT/.run}"
 ENV_FILE="${DEV_ENV_FILE:-$PROJECT_ROOT/.env}"
@@ -535,6 +536,29 @@ start_all() {
     print_status
 }
 
+restart_command() {
+    case "${DEV_RESTART_PROFILE:-full}" in
+        full)
+            if [ ! -f "$FULL_DEEPSEARCH_SCRIPT" ]; then
+                fail "Full DeepSearch helper is missing: $FULL_DEEPSEARCH_SCRIPT"
+            fi
+            log "Delegating restart to the full DeepSearch profile."
+            log "Set DEV_RESTART_PROFILE=local to use the lightweight local restart path."
+            if [ -n "${DEV_ENV_FILE+x}" ] && [ -z "${FULL_DEEPSEARCH_ENV_FILE+x}" ]; then
+                FULL_DEEPSEARCH_ENV_FILE="$ENV_FILE" bash "$FULL_DEEPSEARCH_SCRIPT" restart
+            else
+                bash "$FULL_DEEPSEARCH_SCRIPT" restart
+            fi
+            ;;
+        local)
+            start_all
+            ;;
+        *)
+            fail "Unsupported DEV_RESTART_PROFILE=${DEV_RESTART_PROFILE:-}; use full or local."
+            ;;
+    esac
+}
+
 print_process_status() {
     local name="$1"
     local pid_file="$2"
@@ -719,8 +743,8 @@ show_help() {
 Usage: ./dev.sh [COMMAND] [ARGS]
 
 Commands:
-  start       Start or converge local services. This stops only processes from this script first.
-  restart     Same as start; provided for operator clarity.
+  start       Start or converge local app processes only: backend, worker, frontend, and optional mock search.
+  restart     Start the full DeepSearch profile by default: dependencies, backend, worker, and frontend.
   stop        Stop backend, worker, frontend, and optional mock search processes started by this script.
   status      Show process, URL, log, and port diagnostics.
   doctor      Check dependencies, config, and common service reachability.
@@ -742,9 +766,15 @@ Useful environment controls:
   DEV_SKIP_FRONTEND=true              Start backend and worker only.
   DEV_SKIP_WORKER=true                Start backend and frontend without the worker.
   DEV_BACKEND_RELOAD=false            Start uvicorn without --reload.
+  DEV_RESTART_PROFILE=local           Make restart use the same lightweight path as start.
   DEV_START_MOCK_SEARXNG=true         Start scripts/mock_searxng.py and point SEARXNG_BASE_URL at it.
   SEARCH_PROVIDER=smoke INDEX_BACKEND=local
                                       Run deterministic dev mode without real search/OpenSearch.
+
+Full restart controls are handled by scripts/run_full_deepsearch.sh, including:
+  FULL_DEEPSEARCH_ENV_FILE=/path/.env.deepseek.local
+  FULL_DEEPSEARCH_DEPS_MODE=auto|host|docker|none
+  FULL_DEEPSEARCH_SKIP_DEPS=true
 EOF
 }
 
@@ -753,8 +783,11 @@ main() {
     shift || true
 
     case "$command" in
-        start|restart)
+        start)
             start_all
+            ;;
+        restart)
+            restart_command
             ;;
         stop)
             setup_dirs

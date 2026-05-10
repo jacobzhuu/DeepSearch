@@ -111,6 +111,18 @@ _SOCIAL_VIDEO_FORUM_DOMAINS = (
     "stackexchange.com",
     "quora.com",
 )
+_OFFICIAL_VENDOR_DOMAINS = (
+    "anthropic.com",
+    "openai.com",
+    "googleblog.com",
+    "blog.google",
+    "deepmind.google",
+    "nvidia.com",
+    "blogs.nvidia.com",
+    "microsoft.com",
+    "amazon.com",
+    "meta.com",
+)
 
 
 @dataclass(frozen=True)
@@ -235,10 +247,14 @@ def _authority_score(
     if source_category == "low_quality_or_blocked":
         return 0.1, "low_quality_or_blocked"
 
-    if normalized_domain.startswith(("docs.", "reference.", "documentation.")) or _is_docs_path(
-        path
-    ):
+    if normalized_domain.startswith(
+        ("docs.", "reference.", "documentation.", "blog.", "news.")
+    ) or _is_docs_path(path):
         return 0.95, "official_docs"
+    if _is_official_vendor_domain(normalized_domain):
+        if _is_blog_path(path) or _is_news_path(path):
+            return 0.92, "official_docs"
+        return 0.75, "official_vendor_domain"
     if normalized_domain.endswith("wikipedia.org"):
         return 0.78, "wikipedia_article"
     if _is_project_homepage(normalized_domain, path):
@@ -642,6 +658,18 @@ def _is_docs_path(path: str) -> bool:
             "/reference",
         )
     )
+
+
+def _is_blog_path(path: str) -> bool:
+    return any(marker in path for marker in ("/blog", "/blogs", "/newsroom", "/news-room"))
+
+
+def _is_news_path(path: str) -> bool:
+    return any(marker in path for marker in ("/news", "/press", "/announcements"))
+
+
+def _is_official_vendor_domain(domain: str) -> bool:
+    return any(domain == item or domain.endswith(f".{item}") for item in _OFFICIAL_VENDOR_DOMAINS)
 
 
 def _is_project_homepage(domain: str, path: str) -> bool:

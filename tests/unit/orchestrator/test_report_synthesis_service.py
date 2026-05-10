@@ -1045,9 +1045,157 @@ def test_adjacent_entity_claims_are_excluded_unless_explicitly_requested(
     assert adapter_claim.statement in overview_result.markdown
     assert adjacent_claim.statement not in overview_result.markdown
     assert adjacent_claim.notes_json["report_eligible"] is False
-    assert "claim_review_downrank" in adjacent_claim.notes_json["report_eligibility"]["reasons"]
+    assert (
+        adjacent_claim.notes_json["report_eligibility"]["review_decision"]["decision"]
+        == "keep_supporting"
+    )
+    assert "query_focus_mismatch" in adjacent_claim.notes_json["report_eligibility"]["reasons"]
     assert explicit_claim.statement in explicit_result.markdown
     assert explicit_claim.notes_json["report_eligible"] is True
+
+
+def test_report_safety_excludes_example_context_and_weak_support_from_core_answer(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is ExampleFlow?",
+        constraints={},
+    )
+    core_statement = "ExampleFlow is a workflow engine for auditable research tasks."
+    example_statement = "ExampleFlow can be used in a demo chatbot integration."
+    context_statement = "ExampleFlow provides background glossary material for related workflows."
+    weak_statement = "ExampleFlow may coordinate research tasks in some deployments."
+    core_claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=core_statement,
+        canonical_url="https://example.org/exampleflow-core",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found strong support."},
+            "claim_category": "definition",
+            "answer_role": "definition",
+            "answer_relevant": True,
+            "claim_quality_score": 0.95,
+            "query_answer_score": 0.95,
+            "slot_ids": ["definition"],
+            "llm_claim_review": {
+                "decision": "keep_main",
+                "relevance": "direct",
+                "source_role": "primary_reference",
+                "claim_role": "definition",
+                "centrality": "core",
+                "confidence": 0.92,
+                "reasons": ["Direct definition evidence."],
+                "related_answer_slot": "definition",
+            },
+        },
+    )
+    example_claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=example_statement,
+        canonical_url="https://example.org/exampleflow-example",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found support."},
+            "claim_category": "feature",
+            "answer_role": "feature",
+            "answer_relevant": True,
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.8,
+            "slot_ids": ["feature"],
+            "llm_claim_review": {
+                "decision": "keep_example",
+                "relevance": "partial",
+                "source_role": "example_only",
+                "claim_role": "example",
+                "centrality": "example",
+                "confidence": 0.82,
+                "reasons": ["Application example only."],
+                "related_answer_slot": "feature",
+            },
+        },
+    )
+    context_claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=context_statement,
+        canonical_url="https://example.org/exampleflow-context",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found support."},
+            "claim_category": "feature",
+            "answer_role": "feature",
+            "answer_relevant": True,
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.78,
+            "slot_ids": ["feature"],
+            "llm_claim_review": {
+                "decision": "keep_context",
+                "relevance": "background",
+                "source_role": "supporting_reference",
+                "claim_role": "limitation",
+                "centrality": "peripheral",
+                "confidence": 0.77,
+                "reasons": ["Context only."],
+                "related_answer_slot": "feature",
+            },
+        },
+    )
+    weak_claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=weak_statement,
+        canonical_url="https://example.org/exampleflow-weak",
+        domain="example.org",
+        notes={
+            "verification": {
+                "rationale": "Only weak lexical support was found.",
+                "strong_support_evidence_count": 0,
+                "weak_support_evidence_count": 1,
+            },
+            "claim_category": "mechanism",
+            "answer_role": "mechanism",
+            "answer_relevant": True,
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.88,
+            "slot_ids": ["mechanism"],
+        },
+    )
+    db_session.commit()
+    service = _report_service(db_session, tmp_path)
+
+    result = service.generate_markdown_report(task.id)
+    db_session.refresh(core_claim)
+    db_session.refresh(example_claim)
+    db_session.refresh(context_claim)
+    db_session.refresh(weak_claim)
+    answer_section = result.markdown.split("## Answer", 1)[1].split(
+        "## Answer Slot Coverage",
+        1,
+    )[0]
+    manifest = _manifest(result.artifact)
+
+    assert core_statement in answer_section
+    assert example_statement not in result.markdown
+    assert context_statement not in result.markdown
+    assert weak_statement not in answer_section
+    assert core_claim.notes_json["report_eligible"] is True
+    assert example_claim.notes_json["report_eligible"] is False
+    assert context_claim.notes_json["report_eligible"] is False
+    assert "claim_review_keep_example" in example_claim.notes_json["report_eligibility"]["reasons"]
+    assert "claim_review_keep_context" in context_claim.notes_json["report_eligibility"]["reasons"]
+    assert (
+        manifest["report_writer"]["report_filter_summary"][
+            "excluded_from_report_example_misaligned"
+        ]
+        == 1
+    )
+    assert (
+        manifest["report_writer"]["report_filter_summary"]["excluded_from_report_weak_support"] == 1
+    )
 
 
 def test_claim_drafting_chunk_selection_preserves_source_diversity_for_mechanism_questions(

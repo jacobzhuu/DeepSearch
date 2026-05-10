@@ -265,6 +265,12 @@ When a task has generated a pre-run plan, has been queued, or has run through th
   Claim-review diagnostics may report `low_quality_review`; those decisions remain visible in
   observability but are not persisted as claim-note exclusions unless they pass structured quality
   validation.
+- `research_strategy`, when the optional LLM research strategist is enabled, including shadow/active
+  mode, decision, generated follow-up queries, targeted answer slots, source-selection guidance,
+  remaining budgets, coverage evaluation, and fallback diagnostics. Active strategist follow-up
+  query execution requires both `RESEARCH_LOOP_ENABLED=true` and
+  `RESEARCH_LOOP_STRATEGIST_SHADOW_MODE=false`; otherwise the old deterministic gap analyzer remains
+  the execution path.
 - `known_path_fallback`, summarizing whether deterministic known-path candidates were injected, how many were added, duplicates/filtered counts, and the provider error classification that triggered the fallback
 - `selected_sources`, including `source_category`, `source_selection_reason`, `selected_by`, `downrank_reason`, and `known_path_candidate` metadata when applicable; deployment queries may include `official_repository` for verified upstream Docker repositories such as `github.com/searxng/searxng-docker`
 - `fetch_succeeded`
@@ -282,7 +288,7 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 - `slot_coverage_summary`, with per-slot evidence candidate, accepted evidence, strong support, weak support, unsupported, source-count, and `covered|weak|missing` status fields
 - `source_yield_summary`, with per-source attempted/fetched/parsed/indexed flags, candidate/accepted/claim/rejected counts, contribution level, and dropped-source reasons
 - `dropped_sources`, using the stable reason taxonomy `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`
-- `evidence_yield_summary`, with total/accepted/rejected candidate counts plus by-slot, by-source, and top rejection-reason summaries
+- `evidence_yield_summary`, with total, accepted, hard-rejected, and unselected candidate counts plus by-slot, by-source, and top rejection-reason summaries. Score-only filters such as low claim quality, low answer score, or weak answer relevance are treated as unselected/ranking signals instead of hard rejections.
 - `verification_summary`, including deterministic verifier method names, strong support counts, weak support counts, contradiction counts, and explicit limitations
 - `gap_analysis` and `gap_rounds`, when required answer slots were missing or weak after verification and the runner generated supplemental search queries before reporting
 - `supplemental_acquisition` with trigger status, reason, attempted sources, and skipped sources
@@ -295,6 +301,7 @@ Compatibility contract:
 - legacy tasks that predate source-yield, evidence-yield, slot-coverage, or verification summaries still return stable empty values when another observability field is present
 - list fields default to `[]`: `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, and `slot_coverage_summary`
 - object fields default to `{}`: `evidence_yield_summary` and `verification_summary`
+- `REPORTING` stage report-manifest summaries do not replace the full pipeline `source_yield_summary` or `evidence_yield_summary`; task detail keeps the drafting/verification observability stable after the report artifact is generated
 - clients must continue to tolerate `progress.observability = null` for tasks with no pipeline/search/report events
 
 ### `GET /api/v1/research/tasks/{task_id}/events`
@@ -1556,6 +1563,9 @@ Execution contract:
   - parse decisions with snapshot id, canonical URL, MIME type, storage location, body length, decision, and parser error when present
   - per-source answer-yield metrics, source-yield summaries, dropped-source reasons, answer coverage by definition/mechanism/privacy/feature, accepted claims by category, rejected claims by rule, near-duplicate claim removals, and category coverage gaps
   - evidence-yield summaries and slot-coverage summaries that link answer slots to candidate evidence, accepted evidence, strong/weak support, unsupported claims, and contributing source counts
+  - optional LLM research-strategist diagnostics after verification, including coverage-based
+    stop/continue decisions, generated query rationales, target slots, budget remaining, and whether
+    strategist queries replaced deterministic gap queries or stayed in shadow mode
   - verification summaries that identify the deterministic lexical verifier method and distinguish strong support from weak lexical support
   - supplemental acquisition trigger reason, attempted sources, skipped sources, and bounded retry status
   - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, LangGraph owned-source fallback queries for LangChain docs/reference/GitHub when relevant, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates or low-value results, non-fatal `gap_search_unavailable` / `supplemental_search_failed` warnings when supplemental search fails after usable evidence exists, max-round terminal reasons, and per-round `RESEARCHING_MORE` results
@@ -1703,9 +1713,9 @@ External dependencies:
 - `INDEX_BACKEND=opensearch`
 - `OPENSEARCH_BASE_URL`
 - `OPENSEARCH_INDEX_NAME`
-- optional planner-only OpenAI-compatible provider through `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`
+- optional OpenAI-compatible provider through `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` for planner/source-judge/claim-review/report-writer assistance
 
-No LLM API is used by claim drafting or verification. Report writing remains deterministic unless `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`; in that mode the grounded report writer receives only verified claims and their evidence/citation-span excerpts, and invalid LLM output falls back to deterministic Markdown. Planner output is stored only in task-event payload JSON and task-detail observability summaries; there is no research-plan schema migration. Optional source judging is controlled by `LLM_SOURCE_JUDGE_ENABLED=false` by default, `LLM_SOURCE_JUDGE_MAX_CANDIDATES=5`, and reserved `LLM_SOURCE_JUDGE_ACTIVE_RERANK=false`; the MVP records shadow diagnostics only and sets `used_in_final_ranking=false`.
+Claim drafting and verification remain ledger-bound: deterministic drafting creates persisted draft claims/evidence candidates, optional LLM claim review can only review those persisted draft claims, and verification still attaches only selected deterministic evidence relations. Report writing remains deterministic unless `LLM_ENABLED=true`, `LLM_REPORT_WRITER_ENABLED=true`, and the configured provider is not `noop`; in that mode the grounded report writer receives only verified claims and their evidence/citation-span excerpts, and invalid LLM output falls back to deterministic Markdown. Planner output is stored only in task-event payload JSON and task-detail observability summaries; there is no research-plan schema migration. Optional source judging is controlled by `LLM_SOURCE_JUDGE_ENABLED`, `LLM_SOURCE_JUDGE_MAX_CANDIDATES`, and `LLM_SOURCE_JUDGE_ACTIVE_RERANK`; active changes remain bounded by deterministic ownership, low-value-source, SSRF/acquisition, and official-source guardrails.
 
 ## Phase 10 infrastructure-hardening rules
 

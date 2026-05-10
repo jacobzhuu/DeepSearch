@@ -480,6 +480,43 @@ def test_claim_verification_service_rejects_paused_tasks(db_session: Session) ->
         service.verify_claims(seeded.task_id, claim_ids=None, limit=1)
 
 
+def test_claim_verification_promotes_exact_candidate_support_without_retrieval_hit(
+    db_session: Session,
+) -> None:
+    seeded = _seed_support_and_contradict_chunks(db_session)
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+        verification_max_claims_per_request=5,
+        retrieval_max_results_per_request=5,
+    )
+
+    draft_result = service.draft_claims(
+        seeded.task_id,
+        query=None,
+        source_chunk_ids=[seeded.support_chunk_id],
+        limit=1,
+    )
+    verify_result = service.verify_claims(seeded.task_id, claim_ids=None, limit=1)
+
+    claim = ClaimRepository(db_session).get(draft_result.entries[0].claim.id)
+    assert claim is not None
+    evidence = ClaimEvidenceRepository(db_session).list_for_claim(claim.id)
+
+    assert verify_result.verified_claims == 1
+    assert verify_result.entries[0].support_evidence_count == 1
+    assert claim.verification_status == CLAIM_VERIFICATION_STATUS_SUPPORTED
+    assert {item.relation_type for item in evidence} == {
+        CLAIM_EVIDENCE_RELATION_CANDIDATE_SUPPORT,
+        CLAIM_EVIDENCE_RELATION_SUPPORT,
+    }
+    assert claim.notes_json["verification"]["strong_support_evidence_count"] == 1
+    assert claim.notes_json["verification"]["evidence_relations"][0]["relation_detail"] == (
+        "strong_support"
+    )
+
+
 def _seed_support_and_contradict_chunks(db_session: Session) -> SeededChunks:
     task = create_research_task_service(db_session).create_task(
         query="illustrative examples",
@@ -561,7 +598,7 @@ SUPPORT_TEXT = (
 )
 
 CONTRADICT_TEXT = (
-    "Counterpoint.\n\n" "This domain is not for use in illustrative examples in documents."
+    "Counterpoint.\n\nThis domain is not for use in illustrative examples in documents."
 )
 
 DIVERSITY_TEXT = (

@@ -11,12 +11,38 @@ export const ErrorState: React.FC<ErrorStateProps> = ({ error, onRetry }) => {
   const errorMessage = error instanceof Error ? error.message : error;
 
   return (
-    <div style={{ padding: '2rem', border: '1px solid red', borderRadius: '4px', color: 'red', margin: '1rem 0' }}>
-      <h3>出错了</h3>
-      <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>{errorMessage}</pre>
+    <div 
+      className="card-solid" 
+      style={{ 
+        padding: '2rem', 
+        border: '1px solid #fce8e6', 
+        backgroundColor: '#fffbfa',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: '1rem',
+        textAlign: 'center'
+      }}
+    >
+      <div style={{ color: '#d93025', fontSize: '2rem' }}>⚠️</div>
+      <h3 style={{ color: '#d93025', margin: 0 }}>研究过程中出现错误</h3>
+      <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', maxWidth: '500px' }}>
+        {errorMessage}
+      </div>
       {onRetry && (
-        <button onClick={onRetry} style={{ marginTop: '1rem' }}>
-          重试
+        <button 
+          onClick={onRetry} 
+          style={{ 
+            marginTop: '0.5rem',
+            padding: '0.5rem 1.5rem',
+            backgroundColor: 'var(--primary-color)',
+            color: 'white',
+            border: 'none',
+            borderRadius: 'var(--radius-sm)',
+            fontWeight: 600,
+          }}
+        >
+          重新尝试
         </button>
       )}
     </div>

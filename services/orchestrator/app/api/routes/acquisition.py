@@ -42,6 +42,7 @@ def get_http_acquisition_client() -> HttpAcquisitionClient:
         max_redirects=settings.acquisition_max_redirects,
         max_response_bytes=settings.acquisition_max_response_bytes,
         user_agent=settings.acquisition_user_agent,
+        trust_env_proxy=settings.acquisition_trust_env_proxy,
     )
 
 

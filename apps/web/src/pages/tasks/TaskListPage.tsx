@@ -4,8 +4,11 @@ import { EmptyState } from '../../components/common/EmptyState';
 import { ErrorState } from '../../components/common/ErrorState';
 import { LoadingState } from '../../components/common/LoadingState';
 import { PageLayout } from '../../components/layout/PageLayout';
+import { StatusBadge } from '../../components/common/StatusBadge';
+import { Button } from '../../components/common/Button';
 import { ResearchTaskListItem } from '../../features/tasks/types';
 import { useTasks } from '../../features/tasks/hooks';
+import { formatChinaDateTime } from '../../lib/datetime';
 
 export const TaskListPage: React.FC = () => {
   const { tasksData, isLoading, error, refetch } = useTasks();
@@ -17,9 +20,9 @@ export const TaskListPage: React.FC = () => {
     return () => window.clearInterval(timer);
   }, [refetch]);
 
-  if (isLoading) {
+  if (isLoading && !tasksData) {
     return (
-      <PageLayout title="任务列表">
+      <PageLayout title="研究任务">
         <LoadingState />
       </PageLayout>
     );
@@ -29,14 +32,35 @@ export const TaskListPage: React.FC = () => {
 
   return (
     <PageLayout
-      title="任务列表"
-      actions={<Link to="/tasks/new" style={buttonStyle}>新建任务</Link>}
+      title="研究任务"
+      actions={
+        <Link to="/tasks/new">
+          <Button size="sm">新建研究</Button>
+        </Link>
+      }
     >
       <ErrorState error={error} onRetry={() => void refetch()} />
+
       {tasks.length === 0 ? (
-        <EmptyState message="还没有 research_task。" />
+        <EmptyState message="目前没有任何研究任务。点击上方按钮开始您的第一次深度研究。" />
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100%, 1fr))', gap: '1rem' }}>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 120px 180px 100px',
+            padding: '0 1.5rem 0.75rem 1.5rem',
+            color: 'var(--text-secondary)',
+            fontSize: '0.75rem',
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: '0.05em'
+          }}>
+            <div>研究问题</div>
+            <div style={{ textAlign: 'center' }}>状态</div>
+            <div style={{ textAlign: 'right' }}>更新时间</div>
+            <div></div>
+          </div>
+
           {tasks.map((task) => (
             <TaskListRow key={task.task_id} task={task} />
           ))}
@@ -48,58 +72,57 @@ export const TaskListPage: React.FC = () => {
 
 const TaskListRow: React.FC<{ task: ResearchTaskListItem }> = ({ task }) => {
   return (
-    <section style={{ border: '1px solid #e5e5e5', borderRadius: '8px', padding: '1rem', backgroundColor: '#fff' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'flex-start' }}>
-        <div style={{ minWidth: 0 }}>
-          <Link
-            to={`/tasks/${task.task_id}`}
-            style={{
-              fontWeight: 700,
-              color: '#111',
-              textDecoration: 'none',
-              overflowWrap: 'anywhere',
-            }}
-          >
-            {task.query}
-          </Link>
-          <div style={{ marginTop: '0.5rem', color: '#666', fontSize: '0.875rem' }}>
-            更新 {new Date(task.updated_at).toLocaleString()} · 事件 {task.events_total}
-          </div>
-          <div style={{ marginTop: '0.25rem', color: '#888', fontFamily: 'monospace', fontSize: '0.8rem' }}>
-            {task.task_id}
-          </div>
+    <div
+      className="card-solid"
+      style={{
+        padding: '1.25rem 1.5rem',
+        display: 'grid',
+        gridTemplateColumns: '1fr 120px 180px 100px',
+        alignItems: 'center',
+        gap: '1rem',
+        transition: 'transform 0.2s, box-shadow 0.2s',
+        cursor: 'pointer'
+      }}
+      onClick={() => window.location.href = `/tasks/${task.task_id}`}
+    >
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            fontWeight: 600,
+            color: 'var(--text-primary)',
+            fontSize: '1rem',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis'
+          }}
+        >
+          {task.query}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.5rem', flexShrink: 0 }}>
-          <span style={statusStyle}>{task.status}</span>
-          <Link to={`/tasks/${task.task_id}`} style={smallButtonStyle}>打开</Link>
+        <div style={{ marginTop: '0.25rem', color: 'var(--text-secondary)', fontSize: '0.75rem', fontFamily: 'monospace' }}>
+          {task.task_id}
         </div>
       </div>
-    </section>
+
+      <div style={{ textAlign: 'center' }}>
+        <StatusBadge status={task.status} />
+      </div>
+
+      <div style={{ textAlign: 'right', color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
+        {formatChinaDateTime(task.updated_at, {
+          year: undefined,
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: undefined,
+        })}
+      </div>
+
+      <div style={{ textAlign: 'right' }}>
+        <Link to={`/tasks/${task.task_id}`} onClick={(e) => e.stopPropagation()}>
+          <Button variant="ghost" size="sm">打开</Button>
+        </Link>
+      </div>
+    </div>
   );
-};
-
-const buttonStyle: React.CSSProperties = {
-  padding: '0.5rem 1rem',
-  backgroundColor: '#111',
-  color: 'white',
-  textDecoration: 'none',
-  borderRadius: '6px',
-  fontWeight: 700,
-};
-
-const smallButtonStyle: React.CSSProperties = {
-  padding: '0.35rem 0.75rem',
-  border: '1px solid #ddd',
-  color: '#111',
-  textDecoration: 'none',
-  borderRadius: '6px',
-  fontSize: '0.875rem',
-};
-
-const statusStyle: React.CSSProperties = {
-  padding: '0.25rem 0.65rem',
-  backgroundColor: '#f1f1f1',
-  borderRadius: '999px',
-  fontSize: '0.75rem',
-  fontWeight: 700,
 };

@@ -217,7 +217,16 @@ class ParsingService:
         limit: int,
     ) -> list[ContentSnapshot]:
         if content_snapshot_ids is None:
-            return self.content_snapshot_repository.list_for_task(task_id, limit=limit)
+            successful_snapshots: list[ContentSnapshot] = []
+            for content_snapshot in self.content_snapshot_repository.list_for_task(task_id):
+                fetch_attempt = content_snapshot.fetch_attempt
+                fetch_job = fetch_attempt.fetch_job
+                if fetch_job.status != FETCH_STATUS_SUCCEEDED or fetch_attempt.error_code:
+                    continue
+                successful_snapshots.append(content_snapshot)
+                if len(successful_snapshots) >= limit:
+                    break
+            return successful_snapshots
 
         selected = self.content_snapshot_repository.list_by_ids_for_task(
             task_id,

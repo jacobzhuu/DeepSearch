@@ -191,6 +191,46 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
   - reran the real `/run` worker smoke successfully as task
     `09b6f2e4-c933-495c-a576-0f5c742ddd64`
   - full requested validation commands passed
+- 2026-05-08 host-local full-mode helper hardening:
+  - updated `scripts/run_full_deepsearch.sh` so dependency mode `auto` prefers host-local
+    SearXNG/OpenSearch before optional Docker/compose
+  - added managed host-local OpenSearch tarball startup under `/share/zhuzy/services`, a
+    non-root runtime user, single-node loopback config, and explicit local-index fallback when
+    OpenSearch cannot remain alive
+  - hardened managed dependency startup with `setsid` and an OpenSearch post-readiness stability
+    probe so a short-lived process is not mistaken for a usable index backend
+  - set HTTP acquisition and OpenAI-compatible LLM calls to ignore process proxy environment
+    variables by default, with explicit `ACQUISITION_TRUST_ENV_PROXY` and `LLM_TRUST_ENV_PROXY`
+    opt-ins, after the current host's SOCKS proxy env caused `httpx` to raise before fetching
+    or planning
+  - updated the runbook to document Docker-less full-mode commands and the explicit
+    `real-search+deterministic-local+planner+report-LLM` fallback mode
+  - host-local full-mode restart and real worker smoke now pass in the current server shell
+- 2026-05-09 full restart entrypoint:
+  - changed root `./dev.sh restart` to delegate to `scripts/run_full_deepsearch.sh restart`
+    by default, making the full local profile the one-command restart path
+  - preserved the previous lightweight app-process restart behavior behind
+    `DEV_RESTART_PROFILE=local ./dev.sh restart` and `./dev.sh start`
+  - changed the full helper's internal app-process startup call from `./dev.sh restart` to
+    `./dev.sh start` so the two scripts do not recurse
+  - updated the runbook to document the new default restart semantics and the local/smoke
+    opt-out path
+- 2026-05-09 startup import repair:
+  - fixed a backend startup failure where `services.orchestrator.app.services.claims`
+    imported `rewrite_claim_self_contained` from the package facade, but
+    `services/orchestrator/app/claims/__init__.py` did not re-export the helper already
+    implemented in `claims/drafting.py`
+  - reran the full restart command successfully; backend, worker, and frontend now start
+    with `real-search+opensearch+planner+report-LLM`
+- 2026-05-09 source-yield metadata repair:
+  - diagnosed task `306b76ed-2ea0-44d4-b642-b3dbf499cb82` failing in
+    `DRAFTING_CLAIMS` with `AttributeError: 'SearchQuery' object has no attribute
+    'metadata_json'`
+  - fixed `debug_pipeline._build_source_yield_summary` to read search-query slot metadata
+    from the actual `SearchQuery.raw_response_json` / `expansion_metadata` JSON seam, while
+    still preferring candidate-level `metadata_json` when present
+  - added regression coverage for strategist/search-query target-slot metadata extraction
+  - restarted the full local profile so backend and worker use the repaired code
 
 ## 8. Validation
 
@@ -236,6 +276,59 @@ Phase 10 proved the individual runtime seams against real PostgreSQL, MinIO, and
   - `cd apps/web && npm run build` — passed
   - `python3 -m mypy packages/db services/orchestrator/app services/orchestrator/tests tests/unit` — passed
   - `git diff --check` — passed
+- 2026-05-08 host-local full-mode helper validation:
+  - `bash -n scripts/run_full_deepsearch.sh` — passed
+  - `./scripts/run_full_deepsearch.sh doctor` — passed; reported host SearXNG/OpenSearch
+    installed and Docker daemon unavailable but optional
+  - `FULL_DEEPSEARCH_DEPS_MODE=host FULL_DEEPSEARCH_ALLOW_LOCAL_INDEX_FALLBACK=false ./scripts/run_full_deepsearch.sh restart` — passed; started/reused host-local SearXNG and OpenSearch, initialized `source-chunks-v1`, and started backend, worker, and frontend with `real-search+opensearch+planner+report-LLM`
+  - `curl -fsS http://127.0.0.1:9200/` — passed against OpenSearch 2.19.0 after the helper exited
+  - `curl -fsS http://127.0.0.1:8000/readyz` — passed
+  - `curl -fsS http://127.0.0.1:8888/search?q=deepsearch\&format=json` — passed with JSON results
+  - `python3 -m pytest tests/unit/orchestrator/test_acquisition_http_client.py tests/unit/orchestrator/test_llm_settings_and_providers.py -q` — passed, 24 tests
+  - `python3 -m ruff check ...` for touched Python files and tests — passed
+  - `python3 -m black --check ...` for touched Python files and tests — passed
+  - `git diff --check -- ...` for touched files — passed
+  - `python3 scripts/smoke_planner_pipeline.py --query "What is SearXNG and how does it work?" --base-url http://127.0.0.1:8000 --wait-seconds 420` — passed with task `2de5137f-6672-4c5d-897d-db4628c42513`, `running_mode=real-search+opensearch+planner+report-LLM`, `planner_status=success`, 6 source documents, 30 chunks, 6 claims, and report artifact `ce0f4e87-55aa-4937-90aa-6e4dc0b9a409`
+  - `python3 -m mypy services/orchestrator/app/acquisition/http_client.py services/orchestrator/app/llm/providers.py services/orchestrator/app/llm/client.py services/orchestrator/app/settings.py services/orchestrator/app/services/pipeline_runtime.py services/orchestrator/app/api/routes/acquisition.py` — did not pass because mypy followed imports into existing unrelated errors in `research_quality/llm_assistance.py`, `reporting/markdown.py`, and `services/reporting.py`
+- 2026-05-09 full restart entrypoint validation:
+  - `bash -n dev.sh` — passed
+  - `bash -n scripts/run_full_deepsearch.sh` — passed
+  - `./dev.sh help` — passed and documents full restart plus `DEV_RESTART_PROFILE=local`
+  - `./scripts/run_full_deepsearch.sh help` — passed
+  - `DEV_RESTART_PROFILE=local DEV_RUN_DIR=/tmp/deepsearch-devsh-restart-run DEV_LOG_DIR=/tmp/deepsearch-devsh-restart-logs DEV_ENV_FILE=/tmp/deepsearch-devsh-restart-noenv DEV_RUN_INIT=false DEV_SKIP_BACKEND=true DEV_SKIP_WORKER=true DEV_SKIP_FRONTEND=true ./dev.sh restart` — passed without touching current managed services
+  - `FULL_DEEPSEARCH_ENV_FILE=/tmp/deepsearch-full-restart-test.env FULL_DEEPSEARCH_DEPS_MODE=none LLM_API_KEY=dev-test-key DEV_RUN_DIR=/tmp/deepsearch-full-restart-run DEV_LOG_DIR=/tmp/deepsearch-full-restart-logs DEV_RUN_INIT=false DEV_SKIP_BACKEND=true DEV_SKIP_WORKER=true DEV_SKIP_FRONTEND=true ./dev.sh restart` — passed and proved `dev.sh restart` delegates to the full helper, which returns to `dev.sh start`; the temporary env file was removed afterward
+  - `git diff --check -- dev.sh scripts/run_full_deepsearch.sh docs/runbook.md plans/phase-11-deployment-packaging.md` — passed
+- 2026-05-09 startup import repair validation:
+  - `python - <<'PY' ... from services.orchestrator.app.main import app ... PY` — passed and
+    proved the backend import path no longer raises the missing `rewrite_claim_self_contained`
+    import
+  - `python -m pytest tests/unit/orchestrator/test_robustness_improvements.py -q` — passed,
+    5 tests
+  - `python -m pytest tests/unit/orchestrator/test_claim_drafting_helpers.py tests/unit/orchestrator/test_claim_drafting_service.py -q` — failed, 5 assertions; failures are existing claim-quality behavior expectations unrelated to the package export repair, while the import path itself is fixed
+  - `bash -n dev.sh scripts/run_full_deepsearch.sh` — passed
+  - `git diff --check -- services/orchestrator/app/claims/__init__.py dev.sh scripts/run_full_deepsearch.sh docs/runbook.md plans/phase-11-deployment-packaging.md` — passed
+  - `./dev.sh restart` — passed; started backend pid `111343`, worker pid `111353`, and
+    frontend pid `111358`
+  - `curl -fsS http://127.0.0.1:8000/healthz` — passed
+  - `curl -fsS http://127.0.0.1:8000/readyz` — passed
+  - `curl -fsS http://127.0.0.1:5173` — passed
+  - `./dev.sh status` — passed and showed backend/frontend listeners on `127.0.0.1:8000`
+    and `127.0.0.1:5173`
+- 2026-05-09 source-yield metadata repair validation:
+  - `python -m pytest tests/unit/orchestrator/test_task_observability.py -q` — passed, 4
+    tests
+  - `python -m pytest tests/unit/orchestrator/test_pipeline_worker.py -q` — passed, 3
+    tests
+  - `python -m py_compile services/orchestrator/app/services/debug_pipeline.py tests/unit/orchestrator/test_task_observability.py` — passed
+  - `git diff --check -- services/orchestrator/app/services/debug_pipeline.py tests/unit/orchestrator/test_task_observability.py` — passed
+  - `./dev.sh restart` — passed; restarted backend pid `113096`, worker pid `113106`,
+    and frontend pid `113111`
+  - direct `_build_source_yield_summary` call against failed task
+    `306b76ed-2ea0-44d4-b642-b3dbf499cb82` — passed and returned 42 source-yield rows
+    without the previous `SearchQuery.metadata_json` exception
+  - `curl -fsS http://127.0.0.1:8000/healthz` — passed
+  - `curl -fsS http://127.0.0.1:8000/readyz` — passed
+  - `./dev.sh status` — passed
 - known host limitation:
   - the Docker CLI is installed, but the daemon was unavailable at the start of this live-smoke
     turn; compose runtime remains unvalidated here

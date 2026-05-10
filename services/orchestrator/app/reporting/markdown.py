@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from uuid import UUID
 
@@ -166,10 +167,14 @@ def render_markdown_report(
         supported_by_category,
     )
     source_domains = _format_domains(sources)
+    beijing_tz = timezone(timedelta(hours=8))
+    generation_time = datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         f"# {title}",
         "",
-        labels["generated"].format(task_id=task_id, revision_no=revision_no),
+        labels["generated"].format(
+            task_id=task_id, revision_no=revision_no, generation_time=generation_time
+        ),
         "",
         f"## {labels['research_question']}",
         "",
@@ -721,7 +726,10 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "excluded_claims": "已排除低质量或偏离问题的 claim：{count}。",
             "excerpt": "摘录",
             "executive_summary": "执行摘要",
-            "generated": "_由已持久化证据在 revision `{revision_no}` 生成。_",
+            "generated": (
+                "_由已持久化证据在 revision `{revision_no}` 生成。"
+                "生成时间：{generation_time} (北京时间)_"
+            ),
             "missing_answer_coverage": "缺失答案覆盖：{categories}。",
             "missing_required_slots": "缺失必需答案槽位：{slots}。",
             "no_citation_spans": "未记录 citation span。",
@@ -783,7 +791,10 @@ def _report_labels(report_language: str) -> dict[str, str]:
         "excluded_claims": "Excluded low-quality or off-query claims: {count}.",
         "excerpt": "excerpt",
         "executive_summary": "Executive Summary",
-        "generated": "_Generated from persisted evidence at revision `{revision_no}`._",
+        "generated": (
+            "_Generated from persisted evidence at revision `{revision_no}`. "
+            "Generated at: {generation_time} (Beijing Time)_"
+        ),
         "missing_answer_coverage": "Missing answer coverage: {categories}.",
         "missing_required_slots": "Missing required answer slots: {slots}.",
         "no_citation_spans": "No citation spans recorded.",

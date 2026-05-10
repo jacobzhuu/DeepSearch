@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from services.orchestrator.app.acquisition import HttpAcquisitionClient
+from services.orchestrator.app.acquisition import http_client as http_client_module
 
 
 class StaticResolver:
@@ -67,6 +68,7 @@ def test_http_acquisition_client_records_proxy_env_detection(
         user_agent="deepresearch-tests/1.0",
         resolver=StaticResolver("93.184.216.34"),
         client=client,
+        trust_env_proxy=True,
     )
 
     result = fetch_client.fetch("https://example.com/report")
@@ -76,7 +78,62 @@ def test_http_acquisition_client_records_proxy_env_detection(
     assert result.trace["proxy_source"] == "env"
     assert result.trace["proxy_env_var"] == "HTTPS_PROXY"
     assert result.trace["proxy_url_masked"] == "http://***:***@127.0.0.1:7890"
+    assert result.trace["proxy_env_detected"] is True
+    assert result.trace["proxy_env_trusted"] is True
     assert result.trace["resolved_ips"] == ["93.184.216.34"]
+
+
+def test_http_acquisition_client_disables_environment_proxy_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:7890")
+    captured: dict[str, object] = {}
+
+    class FakeStream:
+        headers = {"content-type": "text/plain"}
+        status_code = 200
+        url = httpx.URL("https://example.com/report")
+
+        def __enter__(self) -> FakeStream:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def iter_bytes(self) -> list[bytes]:
+            return [b"ok"]
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured["trust_env"] = kwargs.get("trust_env")
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def stream(self, *args: object, **kwargs: object) -> FakeStream:
+            del args, kwargs
+            return FakeStream()
+
+    monkeypatch.setattr(http_client_module.httpx, "Client", FakeClient)
+    fetch_client = HttpAcquisitionClient(
+        timeout_seconds=5.0,
+        max_redirects=3,
+        max_response_bytes=1024,
+        user_agent="deepresearch-tests/1.0",
+        resolver=StaticResolver("93.184.216.34"),
+    )
+
+    result = fetch_client.fetch("https://example.com/report")
+
+    assert result.error_code is None
+    assert captured["trust_env"] is False
+    assert result.trace["proxy_enabled"] is False
+    assert result.trace["proxy_source"] == "none"
+    assert result.trace["proxy_env_detected"] is True
+    assert result.trace["proxy_env_trusted"] is False
 
 
 def test_http_acquisition_client_blocks_non_global_targets_before_request() -> None:

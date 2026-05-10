@@ -92,6 +92,56 @@ _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
         "github_repos": (("modelcontextprotocol", "servers"),),
         "secondary_domains": (),
     },
+    "claude": {
+        "owned_domains": ("anthropic.com",),
+        "github_repos": (("anthropics", "claude-sdk"),),
+        "secondary_domains": (),
+    },
+    "anthropic": {
+        "owned_domains": ("anthropic.com",),
+        "github_repos": (("anthropics", "claude-sdk"),),
+        "secondary_domains": (),
+    },
+    "openai": {
+        "owned_domains": ("openai.com",),
+        "github_repos": (("openai", "openai-python"), ("openai", "openai-node")),
+        "secondary_domains": (),
+    },
+    "gpt": {
+        "owned_domains": ("openai.com",),
+        "github_repos": (("openai", "openai-python"), ("openai", "openai-node")),
+        "secondary_domains": (),
+    },
+    "google": {
+        "owned_domains": ("googleblog.com", "deepmind.google", "blog.google"),
+        "github_repos": (("google", "generative-ai-python"),),
+        "secondary_domains": (),
+    },
+    "deepmind": {
+        "owned_domains": ("deepmind.google",),
+        "github_repos": (),
+        "secondary_domains": (),
+    },
+    "microsoft": {
+        "owned_domains": ("microsoft.com", "azure.microsoft.com"),
+        "github_repos": (("microsoft", "autogen"),),
+        "secondary_domains": (),
+    },
+    "aws": {
+        "owned_domains": ("aws.amazon.com", "amazon.com"),
+        "github_repos": (),
+        "secondary_domains": (),
+    },
+    "nvidia": {
+        "owned_domains": ("nvidia.com", "blogs.nvidia.com"),
+        "github_repos": (),
+        "secondary_domains": (),
+    },
+    "meta": {
+        "owned_domains": ("meta.com", "ai.meta.com"),
+        "github_repos": (("facebook", "llama"),),
+        "secondary_domains": (),
+    },
 }
 
 

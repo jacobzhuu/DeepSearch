@@ -105,7 +105,7 @@ export function useRunTask() {
       setResult(data);
       return data;
     } catch (err) {
-      setError(err instanceof Error ? err : new Error('Failed to run DeepSearch'));
+      setError(err instanceof Error ? err : new Error('Failed to run 开源情报收集与溯源系统'));
       return null;
     } finally {
       setIsRunning(false);

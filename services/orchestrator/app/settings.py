@@ -52,15 +52,15 @@ class Settings(BaseSettings):
         validation_alias="ACQUISITION_MAX_RESPONSE_BYTES",
     )
     acquisition_max_candidates_per_request: int = Field(
-        default=5,
+        default=15,
         validation_alias="ACQUISITION_MAX_CANDIDATES_PER_REQUEST",
     )
     acquisition_target_successful_snapshots: int = Field(
-        default=2,
+        default=10,
         validation_alias="ACQUISITION_TARGET_SUCCESSFUL_SNAPSHOTS",
     )
     acquisition_min_answer_sources: int = Field(
-        default=3,
+        default=5,
         validation_alias="ACQUISITION_MIN_ANSWER_SOURCES",
     )
     acquisition_max_supplemental_sources: int = Field(
@@ -75,6 +75,62 @@ class Settings(BaseSettings):
         default=4,
         validation_alias="RESEARCH_GAP_MAX_QUERIES_PER_ROUND",
     )
+    research_loop_enabled: bool = Field(
+        default=False,
+        validation_alias="RESEARCH_LOOP_ENABLED",
+    )
+    research_loop_strategist_enabled: bool = Field(
+        default=False,
+        validation_alias="RESEARCH_LOOP_STRATEGIST_ENABLED",
+    )
+    research_loop_strategist_shadow_mode: bool = Field(
+        default=True,
+        validation_alias="RESEARCH_LOOP_STRATEGIST_SHADOW_MODE",
+    )
+    research_loop_max_rounds: int = Field(
+        default=3,
+        validation_alias="RESEARCH_LOOP_MAX_ROUNDS",
+    )
+    research_loop_max_total_queries: int = Field(
+        default=16,
+        validation_alias="RESEARCH_LOOP_MAX_TOTAL_QUERIES",
+    )
+    research_loop_max_queries_per_round: int = Field(
+        default=5,
+        validation_alias="RESEARCH_LOOP_MAX_QUERIES_PER_ROUND",
+    )
+    research_loop_max_total_fetch_attempts: int = Field(
+        default=20,
+        validation_alias="RESEARCH_LOOP_MAX_TOTAL_FETCH_ATTEMPTS",
+    )
+    research_loop_max_strategy_calls: int = Field(
+        default=4,
+        validation_alias="RESEARCH_LOOP_MAX_STRATEGY_CALLS",
+    )
+    research_loop_fetch_more_candidates_per_round: int = Field(
+        default=3,
+        validation_alias="RESEARCH_LOOP_FETCH_MORE_CANDIDATES_PER_ROUND",
+    )
+    research_loop_min_distinct_domains: int = Field(
+        default=3,
+        validation_alias="RESEARCH_LOOP_MIN_DISTINCT_DOMAINS",
+    )
+    research_loop_min_authoritative_sources: int = Field(
+        default=1,
+        validation_alias="RESEARCH_LOOP_MIN_AUTHORITATIVE_SOURCES",
+    )
+    research_loop_required_slot_min_status: str = Field(
+        default="moderate",
+        validation_alias="RESEARCH_LOOP_REQUIRED_SLOT_MIN_STATUS",
+    )
+    research_loop_allow_low_coverage_report: bool = Field(
+        default=True,
+        validation_alias="RESEARCH_LOOP_ALLOW_LOW_COVERAGE_REPORT",
+    )
+    research_acquisition_max_must_fetch_per_round: int = Field(
+        default=3,
+        validation_alias="RESEARCH_ACQUISITION_MAX_MUST_FETCH_PER_ROUND",
+    )
     research_worker_poll_interval_seconds: float = Field(
         default=2.0,
         validation_alias="RESEARCH_WORKER_POLL_INTERVAL_SECONDS",
@@ -84,8 +140,24 @@ class Settings(BaseSettings):
         validation_alias="RESEARCH_WORKER_BATCH_SIZE",
     )
     acquisition_user_agent: str = Field(
-        default="deepresearch-orchestrator/0.1",
+        default="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         validation_alias="ACQUISITION_USER_AGENT",
+    )
+    acquisition_accept_language: str = Field(
+        default="en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        validation_alias="ACQUISITION_ACCEPT_LANGUAGE",
+    )
+    research_parse_limit: int = Field(
+        default=8,
+        validation_alias="RESEARCH_PARSE_LIMIT",
+    )
+    research_claim_limit: int = Field(
+        default=20,
+        validation_alias="RESEARCH_CLAIM_LIMIT",
+    )
+    acquisition_trust_env_proxy: bool = Field(
+        default=False,
+        validation_alias="ACQUISITION_TRUST_ENV_PROXY",
     )
     snapshot_storage_backend: str = Field(
         default="filesystem",
@@ -151,28 +223,33 @@ class Settings(BaseSettings):
         default=5,
         validation_alias="CLAIM_VERIFICATION_MAX_CLAIMS_PER_REQUEST",
     )
-    llm_enabled: bool = Field(default=False, validation_alias="LLM_ENABLED")
+    llm_enabled: bool = Field(default=True, validation_alias="LLM_ENABLED")
     llm_provider: str = Field(default="noop", validation_alias="LLM_PROVIDER")
     llm_model: str = Field(default="", validation_alias="LLM_MODEL")
     llm_api_key: str = Field(default="", validation_alias="LLM_API_KEY", repr=False)
     llm_base_url: str = Field(default="", validation_alias="LLM_BASE_URL")
-    llm_timeout_seconds: float = Field(default=30.0, validation_alias="LLM_TIMEOUT_SECONDS")
-    llm_max_retries: int = Field(default=1, validation_alias="LLM_MAX_RETRIES")
+    llm_timeout_seconds: float = Field(default=60.0, validation_alias="LLM_TIMEOUT_SECONDS")
+    llm_max_retries: int = Field(default=3, validation_alias="LLM_MAX_RETRIES")
+    llm_trust_env_proxy: bool = Field(default=False, validation_alias="LLM_TRUST_ENV_PROXY")
     llm_max_output_tokens: int = Field(
         default=1200,
         validation_alias="LLM_MAX_OUTPUT_TOKENS",
     )
     llm_report_writer_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias="LLM_REPORT_WRITER_ENABLED",
     )
     llm_source_judge_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias="LLM_SOURCE_JUDGE_ENABLED",
     )
     llm_source_judge_active_rerank: bool = Field(
-        default=False,
+        default=True,
         validation_alias="LLM_SOURCE_JUDGE_ACTIVE_RERANK",
+    )
+    llm_source_triage_active: bool = Field(
+        default=True,
+        validation_alias="LLM_SOURCE_TRIAGE_ACTIVE",
     )
     llm_source_judge_max_candidates: int = Field(
         default=5,
@@ -195,7 +272,7 @@ class Settings(BaseSettings):
         validation_alias="LLM_EVIDENCE_RERANKER_MAX_CHUNKS",
     )
     llm_claim_reviewer_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias="LLM_CLAIM_REVIEWER_ENABLED",
     )
     llm_claim_reviewer_max_claims: int = Field(
@@ -215,7 +292,7 @@ class Settings(BaseSettings):
         validation_alias="REPORT_INCLUDE_LEDGER_DEBUG_APPENDIX",
     )
     research_planner_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias="RESEARCH_PLANNER_ENABLED",
     )
     research_planner_max_subquestions: int = Field(
@@ -239,6 +316,7 @@ class Settings(BaseSettings):
             "llm_api_key_present": bool(self.llm_api_key.strip()),
             "llm_timeout_seconds": self.llm_timeout_seconds,
             "llm_max_retries": self.llm_max_retries,
+            "llm_trust_env_proxy": self.llm_trust_env_proxy,
             "llm_max_output_tokens": self.llm_max_output_tokens,
             "llm_report_writer_enabled": self.llm_report_writer_enabled,
             "llm_report_max_output_tokens": self.llm_report_max_output_tokens,
@@ -258,6 +336,29 @@ class Settings(BaseSettings):
             "report_include_ledger_debug_appendix": self.report_include_ledger_debug_appendix,
             "research_gap_max_rounds": self.research_gap_max_rounds,
             "research_gap_max_queries_per_round": self.research_gap_max_queries_per_round,
+            "research_loop_enabled": self.research_loop_enabled,
+            "research_loop_strategist_enabled": self.research_loop_strategist_enabled,
+            "research_loop_strategist_shadow_mode": self.research_loop_strategist_shadow_mode,
+            "research_loop_max_rounds": self.research_loop_max_rounds,
+            "research_loop_max_total_queries": self.research_loop_max_total_queries,
+            "research_loop_max_queries_per_round": self.research_loop_max_queries_per_round,
+            "research_loop_max_total_fetch_attempts": (self.research_loop_max_total_fetch_attempts),
+            "research_loop_max_strategy_calls": self.research_loop_max_strategy_calls,
+            "research_loop_fetch_more_candidates_per_round": (
+                self.research_loop_fetch_more_candidates_per_round
+            ),
+            "research_loop_min_distinct_domains": self.research_loop_min_distinct_domains,
+            "research_loop_min_authoritative_sources": (
+                self.research_loop_min_authoritative_sources
+            ),
+            "research_loop_required_slot_min_status": (self.research_loop_required_slot_min_status),
+            "research_loop_allow_low_coverage_report": (
+                self.research_loop_allow_low_coverage_report
+            ),
+            "research_acquisition_max_must_fetch_per_round": (
+                self.research_acquisition_max_must_fetch_per_round
+            ),
+            "llm_source_triage_active": self.llm_source_triage_active,
             "acquisition_min_answer_sources": self.acquisition_min_answer_sources,
             "acquisition_max_supplemental_sources": self.acquisition_max_supplemental_sources,
         }

@@ -23,7 +23,6 @@ from services.orchestrator.app.claims import (
     CLAIM_EVIDENCE_RELATION_WEAK_SUPPORT,
     CLAIM_TYPE_FACT,
     CLAIM_VERIFICATION_STATUS_DRAFT,
-    MIN_DRAFT_CLAIM_QUALITY_SCORE,
     MIN_DRAFT_QUERY_ANSWER_SCORE,
     VERIFIER_METHOD_LEXICAL_HEURISTIC_V2,
     ClaimCandidateScore,
@@ -45,6 +44,7 @@ from services.orchestrator.app.claims import (
     normalize_claim_identity,
     normalized_excerpt_hash,
     resolve_verification_status,
+    rewrite_claim_self_contained,
     score_claim_statement,
     select_verification_span,
     validate_citation_span,
@@ -497,7 +497,7 @@ class ClaimDraftingService:
                         )
                     )
             verification_candidates.extend(
-                self._deployment_candidate_support_verification_candidates(
+                self._candidate_support_verification_candidates(
                     task=task,
                     claim=claim,
                     seen_spans=seen_verification_spans,
@@ -742,16 +742,26 @@ class ClaimDraftingService:
         for source_chunk, retrieval_score in chunks_seen:
             content_quality_score = _chunk_content_quality_score(source_chunk)
             source_quality_score = _source_quality_score(source_chunk)
+            page_title = source_chunk.source_document.title
             for supporting_span in iter_supporting_spans(source_chunk.text):
                 try:
                     statement = draft_claim_statement(supporting_span.excerpt)
                 except ValueError:
                     continue
+
+                # Add self-contained rewriting
+                statement = rewrite_claim_self_contained(
+                    statement, page_title=page_title, query=query
+                )
+
                 score = score_claim_statement(
                     statement=statement,
                     query=query,
                     content_quality_score=content_quality_score,
                     source_quality_score=source_quality_score,
+                    domain=source_chunk.source_document.domain,
+                    source_url=source_chunk.source_document.canonical_url,
+                    page_title=page_title,
                 )
                 evidence_slot_ids: tuple[str, ...] = ()
                 if deployment_query:
@@ -785,6 +795,8 @@ class ClaimDraftingService:
                     query=query,
                     content_quality_score=max(content_quality_score or 0.0, 0.58),
                     source_quality_score=source_quality_score,
+                    domain=source_chunk.source_document.domain,
+                    source_url=source_chunk.source_document.canonical_url,
                 )
                 rejected_rules = _strict_rejected_rules(source_chunk, statement, query, score)
                 candidates.append(
@@ -1080,22 +1092,19 @@ class ClaimDraftingService:
             return existing_notes
         return {**existing_notes, **new_notes}
 
-    def _deployment_candidate_support_verification_candidates(
+    def _candidate_support_verification_candidates(
         self,
         *,
         task: ResearchTask,
         claim: Claim,
         seen_spans: set[tuple[UUID, int, int]],
     ) -> list[VerificationEvidenceCandidate]:
-        if classify_query_intent(task.query).intent_name != "deployment":
-            return []
         notes = claim.notes_json or {}
         slot_ids = tuple(item for item in notes.get("slot_ids", []) if isinstance(item, str))
-        deployment_claim = notes.get("evidence_kind") == "deployment_code_or_config" or any(
-            slot_id.startswith("deployment_") for slot_id in slot_ids
-        )
-        if not deployment_claim:
-            return []
+        deployment_claim = (
+            classify_query_intent(task.query).intent_name == "deployment"
+            and notes.get("evidence_kind") == "deployment_code_or_config"
+        ) or any(slot_id.startswith("deployment_") for slot_id in slot_ids)
 
         candidates: list[VerificationEvidenceCandidate] = []
         for evidence in self.claim_evidence_repository.list_for_claim(claim.id):
@@ -1109,6 +1118,11 @@ class ClaimDraftingService:
                 continue
             matched_span = select_verification_span(source_chunk.text, claim.statement)
             if matched_span is None:
+                continue
+            if (
+                not deployment_claim
+                and matched_span.relation_type != CLAIM_EVIDENCE_RELATION_SUPPORT
+            ):
                 continue
             span_key = (
                 source_chunk.id,
@@ -1649,29 +1663,29 @@ def _strict_rejected_rules(
     query: str,
     score: ClaimCandidateScore,
 ) -> list[str]:
+    from services.orchestrator.app.claims.drafting import CandidateTriageStatus
     rejected_rules: list[str] = []
     deployment_evidence_statement = is_deployment_evidence_statement(statement)
     if not _source_chunk_eligible_for_claims(source_chunk) and not deployment_evidence_statement:
         rejected_rules.append("chunk_ineligible")
-    if score.rejected_reason is not None:
-        rejected_rules.append(score.rejected_reason)
-    if score.claim_quality_score < MIN_DRAFT_CLAIM_QUALITY_SCORE:
-        rejected_rules.append("insufficient_claim_quality")
-    if score.query_answer_score < MIN_DRAFT_QUERY_ANSWER_SCORE:
-        rejected_rules.append("insufficient_answer_score")
-    if not is_answer_relevant_score(score, query=query):
-        rejected_rules.append("not_answer_relevant")
-    if not is_claimable_statement(statement, query=query) and score.rejected_reason is None:
+    if score.triage_status == CandidateTriageStatus.REJECT_FATAL:
+        if score.rejected_reason is not None:
+            rejected_rules.append(score.rejected_reason)
+        else:
+            rejected_rules.append("reject_fatal")
+    if not is_claimable_statement(statement, query=query) and score.triage_status != CandidateTriageStatus.REJECT_FATAL:
         rejected_rules.append("not_claimable_statement")
     return list(dict.fromkeys(rejected_rules))
 
 
 def _candidate_selection_sort_key(
     candidate: DraftClaimCandidate,
-) -> tuple[int, int, float, float, float, float, str, int, int]:
+) -> tuple[int, int, int, float, float, float, float, float, str, int, int]:
     return (
         candidate_category_sort_key(candidate.score.answer_role),
         candidate_category_sort_key(candidate.score.claim_category),
+        _candidate_tier_sort_priority(candidate.score.candidate_tier),
+        -candidate.score.source_suitability_score,
         -candidate.score.source_quality_score,
         -candidate.score.query_answer_score,
         -candidate.score.claim_quality_score,
@@ -1680,6 +1694,15 @@ def _candidate_selection_sort_key(
         candidate.source_chunk.chunk_no,
         candidate.supporting_span.start_offset,
     )
+
+
+def _candidate_tier_sort_priority(tier: str) -> int:
+    return {
+        "main_candidate": 0,
+        "supporting_candidate": 1,
+        "recall_candidate": 2,
+        "rejected": 3,
+    }.get(tier, 4)
 
 
 def _deployment_slot_order_for_query(query: str) -> dict[str, int]:
@@ -1715,7 +1738,7 @@ def _llm_claim_review_rejected(claim: Claim) -> bool:
     decision = review.get("decision")
     confidence = review.get("confidence")
     confidence_value = float(confidence) if isinstance(confidence, int | float) else 0.0
-    return decision in {"reject", "duplicate", "vague"} and confidence_value >= 0.65
+    return decision in {"reject", "duplicate", "vague", "split_needed"} and confidence_value >= 0.65
 
 
 def _deployment_required_marker_groups_for_query(query: str) -> tuple[tuple[str, ...], ...]:
@@ -1788,12 +1811,16 @@ def _fallback_candidate_allowed(
     *,
     query: str | None = None,
 ) -> bool:
+    from services.orchestrator.app.claims.drafting import CandidateTriageStatus
     statement = " ".join(candidate.statement.split())
-    if len(statement) < 40 or len(statement) > 300:
+    has_cjk = any('\u4e00' <= char <= '\u9fff' for char in statement)
+    if not has_cjk and len(statement) < 40:
+        return False
+    if len(statement) > 300:
         return False
     if _source_chunk_hard_excluded_for_claims(candidate.source_chunk):
         return False
-    if candidate.score.rejected_reason is not None:
+    if candidate.score.triage_status == CandidateTriageStatus.REJECT_FATAL:
         return False
     if candidate.score.claim_category in {
         "navigation",
@@ -1861,7 +1888,8 @@ def _first_rejection_reason(
     rejected_rules: list[str],
     score: ClaimCandidateScore,
 ) -> str | None:
-    if score.rejected_reason is not None:
+    from services.orchestrator.app.claims.drafting import CandidateTriageStatus
+    if score.triage_status == CandidateTriageStatus.REJECT_FATAL:
         return score.rejected_reason
     return rejected_rules[0] if rejected_rules else None
 
@@ -1877,6 +1905,40 @@ def _build_claim_drafting_diagnostics(
     for candidate in rejected_candidates:
         for rule in candidate.rejected_rules:
             distribution[rule] = distribution.get(rule, 0) + 1
+    tier_counts: dict[str, int] = {
+        "main_candidate": 0,
+        "supporting_candidate": 0,
+        "recall_candidate": 0,
+        "rejected": 0,
+    }
+    soft_flag_counts: dict[str, int] = {}
+    candidate_tiers_by_slot: dict[str, dict[str, int]] = {}
+    reviewed_candidates_by_slot: dict[str, int] = {}
+    for candidate in candidates:
+        tier = candidate.score.candidate_tier
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        for flag in candidate.score.analysis_flags:
+            soft_flag_counts[flag] = soft_flag_counts.get(flag, 0) + 1
+        slot_ids = (
+            candidate.evidence_slot_ids
+            or slot_ids_for_candidate_category(candidate.score.claim_category, query=query)
+            or ("unmapped",)
+        )
+        for slot_id in slot_ids:
+            slot_counts = candidate_tiers_by_slot.setdefault(
+                slot_id,
+                {
+                    "main_candidate": 0,
+                    "supporting_candidate": 0,
+                    "recall_candidate": 0,
+                    "rejected": 0,
+                },
+            )
+            slot_counts[tier] = slot_counts.get(tier, 0) + 1
+            if not candidate.rejected_rules:
+                reviewed_candidates_by_slot[slot_id] = (
+                    reviewed_candidates_by_slot.get(slot_id, 0) + 1
+                )
     answer_relevant_candidates = [
         candidate
         for candidate in candidates
@@ -1890,6 +1952,19 @@ def _build_claim_drafting_diagnostics(
         ),
         "candidate_sentences_count": len(candidates),
         "answer_relevant_candidate_count": len(answer_relevant_candidates),
+        "hard_rejected_garbage": sum(
+            1 for candidate in candidates if candidate.score.triage_status.value == "reject_fatal"
+        ),
+        "soft_flag_short_text": soft_flag_counts.get("short_text", 0)
+        + soft_flag_counts.get("very_short", 0),
+        "soft_flag_missing_punctuation": soft_flag_counts.get("missing_punctuation", 0),
+        "soft_flag_heading_like": soft_flag_counts.get("heading_like", 0),
+        "main_candidate_count": tier_counts.get("main_candidate", 0),
+        "supporting_candidate_count": tier_counts.get("supporting_candidate", 0),
+        "recall_candidate_count": tier_counts.get("recall_candidate", 0),
+        "score_rejected_count": tier_counts.get("rejected", 0),
+        "candidate_tiers_by_slot": candidate_tiers_by_slot,
+        "llm_reviewed_candidates_by_slot": reviewed_candidates_by_slot,
         "answer_candidate_count_by_category": _accepted_candidates_by_category(
             answer_relevant_candidates
         ),
@@ -1927,7 +2002,10 @@ def _candidate_diagnostic(
         "claim_quality_score": candidate.score.claim_quality_score,
         "query_answer_score": candidate.score.query_answer_score,
         "query_relevance_score": candidate.score.query_relevance_score,
+        "source_suitability_score": candidate.score.source_suitability_score,
         "claim_selection_score": candidate.score.final_score,
+        "candidate_tier": candidate.score.candidate_tier,
+        "analysis_flags": list(candidate.score.analysis_flags),
         "rejected_reason": rejected_reason,
         "rejected_rules": list(candidate.rejected_rules),
     }
@@ -1961,15 +2039,15 @@ def _evidence_candidate_payload(
         title=source_document.title,
         query=query,
     ).source_intent
+    slot_ids = candidate.evidence_slot_ids
+    if not slot_ids and classify_query_intent(query).intent_name != "deployment":
+        slot_ids = slot_ids_for_candidate_category(candidate.score.claim_category, query=query)
     payload = EvidenceCandidate(
         evidence_candidate_id=_candidate_evidence_id(candidate),
         source_document_id=str(source_document.id),
         source_chunk_id=str(source_chunk.id),
         citation_span_id=None,
-        slot_ids=(
-            candidate.evidence_slot_ids
-            or slot_ids_for_candidate_category(candidate.score.claim_category, query=query)
-        ),
+        slot_ids=slot_ids,
         source_intent=source_intent,
         excerpt=candidate.supporting_span.excerpt,
         start_offset=candidate.supporting_span.start_offset,
@@ -1988,7 +2066,10 @@ def _evidence_candidate_payload(
             "query_relevance_score": candidate.score.query_relevance_score,
             "query_answer_score": candidate.score.query_answer_score,
             "source_quality_score": candidate.score.source_quality_score,
+            "source_suitability_score": candidate.score.source_suitability_score,
             "claim_selection_score": candidate.score.final_score,
+            "candidate_tier": candidate.score.candidate_tier,
+            "analysis_flags": list(candidate.score.analysis_flags),
             "retrieval_score": candidate.retrieval_score,
             "draft_mode": candidate.draft_mode,
             "evidence_kind": candidate.evidence_kind,

@@ -181,8 +181,7 @@ def test_source_intent_identifies_searxng_docker_repo_as_official_repository() -
     )
     current_compose = classify_source_intent(
         canonical_url=(
-            "https://raw.githubusercontent.com/searxng/searxng/master/"
-            "container/docker-compose.yml"
+            "https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml"
         ),
         domain="raw.githubusercontent.com",
         title="SearXNG container docker-compose.yml",

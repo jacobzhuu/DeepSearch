@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from json import JSONDecodeError
 from typing import Any
 from uuid import UUID
@@ -60,6 +61,8 @@ def render_grounded_llm_report(
     llm_model: str,
     max_output_tokens: int,
     include_ledger_debug_appendix: bool = False,
+    original_user_question: str | None = None,
+    research_plan: dict[str, Any] | None = None,
 ) -> GroundedLLMReport:
     normalized_language = normalize_report_language(report_language)
     grounded_claims = _grounded_claims(claims)
@@ -75,6 +78,8 @@ def render_grounded_llm_report(
         claims=grounded_claims,
         sources=sources,
         report_language=normalized_language,
+        original_user_question=original_user_question,
+        research_plan=research_plan,
     )
     response = llm_provider.generate(
         LLMRequest(
@@ -124,21 +129,83 @@ def render_grounded_llm_report(
 
 
 def _system_prompt(report_language: str) -> str:
-    language_name = (
-        "Simplified Chinese" if is_chinese_report_language(report_language) else "English"
-    )
+    if is_chinese_report_language(report_language):
+        return (
+            "你是一个基于 OSINT 研究账本的资深调查报告撰写专家。\n"
+            "Use Simplified Chinese for all user-visible report prose.\n"
+            "你的任务是生成一份高质量、详尽的研究报告，字数要求在 3000 到 5000 字之间。\n"
+            "你必须先回答原始用户问题 (original_user_question)。\n"
+            "章节顺序应尽可能参考 planner_research_plan.answer_outline 或 subquestions，并做必要的展开和深入分析。\n"
+            "【严禁幻觉】verified_claims 和引用摘录是唯一的可靠事实来源。\n"
+            "planner_research_plan 仅用于构建结构和预期，不能作为事实依据。\n"
+            "如果某个规划的子问题缺乏已验证的 claim，请将其列为“覆盖缺口”或“未解决项”。\n"
+            "不要机械地列出 claim。将相关的 claim 组合成连贯、逻辑严密、细节丰富的长段落和深度分析。\n"
+            "每个章节应以简明扼要的结论或范围说明开始，随后进行详细的论述。\n"
+            "每个事实段落必须携带有效的 claim_ids 和 claim_evidence_ids。\n"
+            "弱支持/混合/不支持/反驳的 claim 不能作为既定事实，仅能用于讨论不确定性。\n"
+            "返回有效的 JSON 对象，不要使用 Markdown Fences 或任何解释性文字。\n"
+            "JSON 结构要求：\n"
+            "{\n"
+            '  "title": string,\n'
+            '  "question_alignment": {\n'
+            '    "original_user_question": string,\n'
+            '    "planner_intent": string,\n'
+            '    "answered_parts": [string],\n'
+            '    "partially_answered_parts": [string],\n'
+            '    "unanswered_parts": [string]\n'
+            "  },\n"
+            '  "executive_summary": [item],\n'
+            '  "sections": [{\n'
+            '    "heading": string,\n'
+            '    "related_planner_subquestions": [string],\n'
+            '    "related_answer_slots": [string],\n'
+            '    "items": [item]\n'
+            "  }],\n"
+            '  "uncertainties": [item],\n'
+            '  "unresolved": [string]\n'
+            "}\n"
+            '其中 item 是 {"text": string, "claim_ids": [string], '
+            '"claim_evidence_ids": [string], "citation_span_ids": [string]}。'
+        )
+
     return (
-        "You are a grounded research report writer for an OSINT research ledger.\n"
-        f"Write all report prose and section headings in {language_name}.\n"
-        "You may only use facts explicitly present in the provided verified claims "
-        "and citation excerpts.\n"
-        "Do not introduce new facts, dates, numbers, names, comparisons, causes, or conclusions.\n"
-        "Every factual item must cite existing claim_ids and claim_evidence_ids from the input.\n"
-        "Mixed or unsupported claims may only be discussed as uncertainty, not as settled facts.\n"
-        "Return valid JSON only. Do not return Markdown and do not wrap JSON in prose.\n"
-        'Required JSON shape: {"title": string, "executive_summary": [item], '
-        '"sections": [{"heading": string, "items": [item]}], "uncertainties": [item], '
-        '"unresolved": [string]}. Each item is {"text": string, "claim_ids": [string], '
+        "You are an expert grounded research report writer for an OSINT research ledger.\n"
+        "Your task is to generate a high-quality, comprehensive research report between 3000 and 5000 words in length.\n"
+        "You must answer the original_user_question first.\n"
+        "Section order should follow planner_research_plan.answer_outline or subquestions "
+        "where possible, expanding and providing deep analysis for each point.\n"
+        "verified_claims and evidence excerpts are the ONLY factual sources. DO NOT introduce "
+        "external facts.\n"
+        "planner_research_plan provides structure and coverage expectations, but cannot justify "
+        "factual claims.\n"
+        "If a planner subquestion lacks verified claims, write it as a coverage gap or "
+        "unresolved item.\n"
+        "Do not mechanically list claims. Group related claims into readable paragraphs.\n"
+        "Each section starts with a concise takeaway or scope sentence.\n"
+        "Every factual block must carry valid claim_ids and claim_evidence_ids.\n"
+        "Weak/mixed/unsupported/contradicted claims cannot become established findings.\n"
+        "Return valid JSON only. Do not return Markdown or wrap JSON in prose.\n"
+        "Required JSON shape:\n"
+        "{\n"
+        '  "title": string,\n'
+        '  "question_alignment": {\n'
+        '    "original_user_question": string,\n'
+        '    "planner_intent": string,\n'
+        '    "answered_parts": [string],\n'
+        '    "partially_answered_parts": [string],\n'
+        '    "unanswered_parts": [string]\n'
+        "  },\n"
+        '  "executive_summary": [item],\n'
+        '  "sections": [{\n'
+        '    "heading": string,\n'
+        '    "related_planner_subquestions": [string],\n'
+        '    "related_answer_slots": [string],\n'
+        '    "items": [item]\n'
+        "  }],\n"
+        '  "uncertainties": [item],\n'
+        '  "unresolved": [string]\n'
+        "}\n"
+        'Item is {"text": string, "claim_ids": [string], '
         '"claim_evidence_ids": [string], "citation_span_ids": [string]}.'
     )
 
@@ -151,22 +218,23 @@ def _build_grounding_bundle(
     claims: list[ReportClaimItem],
     sources: list[ReportSourceItem],
     report_language: str,
+    original_user_question: str | None = None,
+    research_plan: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     return {
         "task_id": str(task_id),
         "revision_no": revision_no,
         "research_question": research_question,
+        "original_user_question": original_user_question or research_question,
+        "planner_research_plan": research_plan or {},
         "report_language": report_language,
         "rules": [
-            "Use only verified_claims and their evidence excerpts.",
+            "Use only verified_claims and their evidence excerpts for factual content.",
             "Use supported claims as settled findings only when support_level is not weak.",
             "Use mixed or unsupported claims only in uncertainty sections.",
             "Every item must include claim_ids and claim_evidence_ids from this bundle.",
-            "For deployment questions, organize evidence by prerequisites, Docker run or "
-            "Compose, volumes, ports, configuration, security, troubleshooting, and update "
-            "or maintenance when verified claims for those slots exist.",
-            "If a deployment section lacks verified command or configuration evidence, list "
-            "that as a coverage gap instead of inventing commands.",
+            "planner_research_plan provides structure and goals, but is NOT a factual source.",
+            "If a planner goal lacks verified claims, report it as a coverage gap.",
         ],
         "answer_slots": [
             {
@@ -277,18 +345,50 @@ def _render_validated_llm_payload(
         research_question,
         report_language=report_language,
     )
+    beijing_tz = timezone(timedelta(hours=8))
+    generation_time = datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         f"# {title}",
         "",
-        labels["generated"].format(task_id=task_id, revision_no=revision_no),
+        labels["generated"].format(
+            task_id=task_id, revision_no=revision_no, generation_time=generation_time
+        ),
         "",
         f"## {labels['research_question']}",
         "",
         research_question,
         "",
-        f"## {labels['executive_summary']}",
-        "",
     ]
+
+    alignment = payload.get("question_alignment")
+    if isinstance(alignment, dict):
+        lines.extend([f"## {labels['question_alignment']}", ""])
+        orig_q = _string_or_none(alignment.get("original_user_question"))
+        if orig_q:
+            lines.append(f"- **{labels['original_question_label']}**: {orig_q}")
+
+        intent = _string_or_none(alignment.get("planner_intent"))
+        if intent:
+            lines.append(f"- **{labels['planner_intent_label']}**: {intent}")
+
+        for key, label in [
+            ("answered_parts", labels["answered_label"]),
+            ("partially_answered_parts", labels["partially_answered_label"]),
+            ("unanswered_parts", labels["unanswered_label"]),
+        ]:
+            parts = _string_list(alignment.get(key))
+            if parts:
+                lines.append(f"- **{label}**:")
+                for part in parts:
+                    lines.append(f"  - {part}")
+        lines.append("")
+
+    lines.extend(
+        [
+            f"## {labels['executive_summary']}",
+            "",
+        ]
+    )
     if executive_items:
         lines.extend(_render_grounded_items(executive_items, labels=labels))
     else:
@@ -296,8 +396,32 @@ def _render_validated_llm_payload(
 
     lines.extend(["", f"## {labels['key_findings']}", ""])
     if sections:
-        for heading, items in sections:
+        for section in payload.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            heading = _string_or_none(section.get("heading"))
+            if not heading:
+                continue
+
+            items = _validated_items(
+                section.get("items"),
+                claim_by_id=claim_by_id,
+                evidence_by_id=evidence_by_id,
+                citation_by_evidence_id=citation_by_evidence_id,
+                evidence_claim_id=evidence_claim_id,
+                allowed_statuses={"supported"},
+                allow_weak_support=False,
+            )
+            if not items:
+                continue
+
             lines.extend([f"### {heading}", ""])
+
+            planner_subs = _string_list(section.get("related_planner_subquestions"))
+            if planner_subs:
+                lines.append(f"_{labels['related_subs']}: {', '.join(planner_subs)}_")
+                lines.append("")
+
             lines.extend(_render_grounded_items(items, labels=labels))
             lines.append("")
     else:
@@ -766,6 +890,7 @@ def _string_or_none(value: object) -> str | None:
 def _labels(report_language: str) -> dict[str, Any]:
     if is_chinese_report_language(report_language):
         return {
+            "answered_label": "已回答部分",
             "answer_relevant": "已纳入与问题相关的 claim：{count}。",
             "chunk": "chunk",
             "citation": "citation",
@@ -788,7 +913,8 @@ def _labels(report_language: str) -> dict[str, Any]:
             "excerpt": "摘录",
             "executive_summary": "执行摘要",
             "generated": (
-                "_由 grounded LLM report writer 基于已持久化证据在 revision `{revision_no}` 生成。_"
+                "_由 grounded LLM report writer 基于已持久化证据在 revision `{revision_no}` 生成。"
+                "生成时间：{generation_time} (北京时间)_"
             ),
             "key_findings": "关键结论",
             "llm_generation": (
@@ -803,6 +929,11 @@ def _labels(report_language: str) -> dict[str, Any]:
             "no_unresolved": "未从已验证 claim 集中推断额外未解决问题。",
             "none": "无",
             "offsets": "offsets",
+            "original_question_label": "原始问题",
+            "partially_answered_label": "部分回答部分",
+            "planner_intent_label": "规划意图",
+            "question_alignment": "问题对齐与覆盖",
+            "related_subs": "关联子问题",
             "research_question": "研究问题",
             "source": "source",
             "source_scope": "来源范围与限制",
@@ -819,10 +950,12 @@ def _labels(report_language: str) -> dict[str, Any]:
                 "Troubleshooting": "故障排查",
                 "Update / maintenance": "更新 / 维护",
             },
+            "unanswered_label": "未回答部分",
             "uncertainty": "冲突 / 不确定性",
             "unresolved": "未解决问题",
         }
     return {
+        "answered_label": "Answered parts",
         "answer_relevant": "Answer-relevant claims included: {count}.",
         "chunk": "chunk",
         "citation": "citation",
@@ -849,7 +982,7 @@ def _labels(report_language: str) -> dict[str, Any]:
         "executive_summary": "Executive Summary",
         "generated": (
             "_Generated by grounded LLM report writer from persisted evidence at revision "
-            "`{revision_no}`._"
+            "`{revision_no}`. Generated at: {generation_time} (Beijing Time)_"
         ),
         "key_findings": "Key Findings",
         "llm_generation": (
@@ -866,6 +999,11 @@ def _labels(report_language: str) -> dict[str, Any]:
         ),
         "none": "none",
         "offsets": "offsets",
+        "original_question_label": "Original user question",
+        "partially_answered_label": "Partially answered parts",
+        "planner_intent_label": "Planner intent",
+        "question_alignment": "Question Alignment and Coverage",
+        "related_subs": "Related subquestions",
         "research_question": "Research Question",
         "source": "source",
         "source_scope": "Source Scope and Limitations",
@@ -873,6 +1011,7 @@ def _labels(report_language: str) -> dict[str, Any]:
             "This report is synthesized strictly from persisted claims, evidence, and "
             "citation spans, with no external facts."
         ),
+        "unanswered_label": "Unanswered parts",
         "uncertainty": "Conflicts / Uncertainty",
         "unresolved": "Unresolved Questions",
     }

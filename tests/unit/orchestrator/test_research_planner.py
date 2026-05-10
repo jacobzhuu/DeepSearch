@@ -6,10 +6,14 @@ from uuid import uuid4
 
 import pytest
 
+from services.orchestrator.app.api.routes.research_tasks import (
+    _constraints_with_report_language,
+)
 from services.orchestrator.app.llm import LLMError, LLMRequest, LLMResponse, NoopLLMProvider
 from services.orchestrator.app.planning import (
     ResearchPlannerError,
     ResearchPlannerService,
+    build_default_research_plan,
     build_optional_research_plan,
 )
 
@@ -132,6 +136,43 @@ def test_planner_json_parsing_and_validation() -> None:
     }
 
 
+def test_recent_nvidia_open_model_plan_uses_current_official_guardrails() -> None:
+    plan = build_default_research_plan(
+        query="近30天NVIDIA在开源模型生态上的关键发布与影响",
+        max_subquestions=5,
+        max_search_queries=8,
+    )
+
+    query_texts = [item.query_text for item in plan.search_queries]
+    combined = "\n".join(query_texts).lower()
+
+    assert query_texts[0] == "近30天NVIDIA在开源模型生态上的关键发布与影响"
+    assert "site:nvidia.com" in combined
+    assert "site:blogs.nvidia.com" in combined
+    assert "site:developer.nvidia.com" in combined
+    assert "site:nvidianews.nvidia.com" in combined
+    assert "site:huggingface.co/nvidia" in combined
+    assert "site:github.com/nvidia" in combined
+    assert "2025" not in combined
+    assert plan.source_preferences["preferred_domains"][:4] == [
+        "nvidia.com",
+        "blogs.nvidia.com",
+        "developer.nvidia.com",
+        "nvidianews.nvidia.com",
+    ]
+    assert "planner_queries_supplemented_for_recent_nvidia_official_sources" in plan.warnings
+
+
+def test_report_language_does_not_default_search_language_constraint() -> None:
+    constraints = _constraints_with_report_language(
+        {},
+        report_language="zh-CN",
+        include_language_default=False,
+    )
+
+    assert constraints == {"report_language": "zh-CN"}
+
+
 def test_planner_accepts_fenced_json_after_extraction() -> None:
     plan = _planner(
         StaticLLMProvider(
@@ -157,11 +198,13 @@ def test_planner_rejects_prose_wrapped_unfenced_json() -> None:
             StaticLLMProvider(
                 f"""
                 Here is the plan:
-                {_planner_json(
-                    intent="definition",
-                    normalized_question="What is SearXNG?",
-                    subquestions=["What is SearXNG?"],
-                )}
+                {
+                    _planner_json(
+                        intent="definition",
+                        normalized_question="What is SearXNG?",
+                        subquestions=["What is SearXNG?"],
+                    )
+                }
                 Done.
                 """
             )

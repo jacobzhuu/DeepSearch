@@ -128,9 +128,9 @@ def test_claim_drafting_service_creates_claim_citation_and_evidence(db_session: 
     )
     assert (
         source_chunk.text[
-            first_result.entries[0]
-            .citation_span.start_offset : first_result.entries[0]
-            .citation_span.end_offset
+            first_result.entries[0].citation_span.start_offset : first_result.entries[
+                0
+            ].citation_span.end_offset
         ]
         == first_result.entries[0].citation_span.excerpt
     )

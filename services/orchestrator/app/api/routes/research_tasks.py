@@ -33,6 +33,7 @@ from services.orchestrator.app.planning import (
     create_research_planner_service,
 )
 from services.orchestrator.app.reporting import normalize_report_language
+from services.orchestrator.app.research_quality import summarize_evidence_yield
 from services.orchestrator.app.services.research_tasks import (
     ResearchTaskService,
     TaskNotFoundError,
@@ -44,6 +45,12 @@ from services.orchestrator.app.settings import get_settings
 
 router = APIRouter(prefix="/api/v1/research/tasks", tags=["research-tasks"])
 SessionDep = Annotated[Session, Depends(get_db_session)]
+
+NON_FATAL_DETERMINISTIC_REJECTION_REASONS = {
+    "insufficient_claim_quality",
+    "insufficient_answer_score",
+    "not_answer_relevant",
+}
 
 
 def get_research_task_service(session: SessionDep) -> ResearchTaskService:
@@ -70,7 +77,7 @@ def create_research_task(
         constraints=_constraints_with_report_language(
             request.constraints,
             report_language=request.report_language,
-            include_language_default=True,
+            include_language_default=False,
         )
         or {},
     )
@@ -578,6 +585,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     evidence_yield_summary: dict[str, Any] | None = None
     verification_summary: dict[str, Any] | None = None
     supplemental_acquisition: dict[str, Any] | None = None
+    research_strategy: dict[str, Any] | None = None
     gap_analysis: dict[str, Any] | None = None
     gap_rounds: list[dict[str, Any]] = []
     failure_diagnostics: dict[str, Any] | None = None
@@ -761,7 +769,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 _object_list(result.get("source_yield_summary")) or source_yield_summary
             )
             dropped_sources = _object_list(result.get("dropped_sources")) or dropped_sources
-            evidence_summary = result.get("evidence_yield_summary")
+            evidence_summary = _evidence_yield_summary_from_diagnostics(result) or result.get(
+                "evidence_yield_summary"
+            )
             if isinstance(evidence_summary, dict):
                 evidence_yield_summary = evidence_summary
             coverage = result.get("answer_coverage")
@@ -836,7 +846,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 source_yield_summary = (
                     _object_list(drafting.get("source_yield_summary")) or source_yield_summary
                 )
-                evidence_summary = drafting.get("evidence_yield_summary")
+                evidence_summary = _evidence_yield_summary_from_diagnostics(
+                    drafting
+                ) or drafting.get("evidence_yield_summary")
                 if isinstance(evidence_summary, dict):
                     evidence_yield_summary = evidence_summary
             verification = result.get("verification")
@@ -854,16 +866,6 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             quality_summary = result.get("source_quality_summary")
             if isinstance(quality_summary, dict):
                 source_quality_summary = quality_summary
-            source_yield_summary = (
-                _object_list(result.get("source_yield_summary")) or source_yield_summary
-            )
-            dropped_sources = _object_list(result.get("dropped_sources")) or dropped_sources
-            slot_coverage_summary = (
-                _object_list(result.get("slot_coverage_summary")) or slot_coverage_summary
-            )
-            evidence_summary = result.get("evidence_yield_summary")
-            if isinstance(evidence_summary, dict):
-                evidence_yield_summary = evidence_summary
             verification = result.get("verification_summary")
             if isinstance(verification, dict):
                 verification_summary = verification
@@ -885,7 +887,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             slot_coverage_summary = (
                 _object_list(details.get("slot_coverage_summary")) or slot_coverage_summary
             )
-            evidence_summary = details.get("evidence_yield_summary")
+            evidence_summary = _evidence_yield_summary_from_diagnostics(details) or details.get(
+                "evidence_yield_summary"
+            )
             if isinstance(evidence_summary, dict):
                 evidence_yield_summary = evidence_summary
             verification = details.get("verification_summary")
@@ -903,6 +907,8 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         warnings.extend(_string_list(result.get("warnings")))
         if event.event_type.endswith(".gap_analysis") and isinstance(result, dict):
             gap_analysis = result
+        if event.event_type.endswith(".research_strategy") and isinstance(result, dict):
+            research_strategy = result
 
     if research_plan is not None:
         diagnostics = research_plan.get("planner_diagnostics")
@@ -968,6 +974,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and evidence_yield_summary is None
         and verification_summary is None
         and supplemental_acquisition is None
+        and research_strategy is None
         and failure_diagnostics is None
         and not pipeline_counts
         and not deduped_warnings
@@ -1017,6 +1024,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         evidence_yield_summary=evidence_yield_summary or {},
         verification_summary=verification_summary or {},
         supplemental_acquisition=supplemental_acquisition,
+        research_strategy=research_strategy,
         gap_analysis=gap_analysis,
         gap_rounds=gap_rounds,
         failure_diagnostics=failure_diagnostics,
@@ -1029,6 +1037,31 @@ def _object_list(value: object) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _evidence_yield_summary_from_diagnostics(payload: dict[str, Any]) -> dict[str, Any] | None:
+    diagnostics_value = payload.get("diagnostics")
+    diagnostics = diagnostics_value if isinstance(diagnostics_value, dict) else payload
+    evidence_candidates = _object_list(diagnostics.get("evidence_candidates"))
+    if not evidence_candidates:
+        return None
+    normalized_candidates: list[dict[str, Any]] = []
+    for candidate in evidence_candidates:
+        rejection_reasons = [
+            reason
+            for reason in _string_list(candidate.get("rejection_reasons"))
+            if reason not in NON_FATAL_DETERMINISTIC_REJECTION_REASONS
+        ]
+        normalized_candidates.append({**candidate, "rejection_reasons": rejection_reasons})
+    accepted_candidate_ids = {
+        item for item in _string_list(diagnostics.get("accepted_evidence_candidate_ids")) if item
+    }
+    query = _string_or_none(diagnostics.get("query") or payload.get("query"))
+    return summarize_evidence_yield(
+        normalized_candidates,
+        accepted_candidate_ids=accepted_candidate_ids,
+        query=query,
+    )
 
 
 def _string_list(value: object) -> list[str]:

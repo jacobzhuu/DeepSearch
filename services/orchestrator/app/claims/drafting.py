@@ -4,7 +4,18 @@ import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
+
+class CandidateTriageStatus(str, Enum):
+    REJECT_FATAL = "reject_fatal"
+    ACCEPT_CANDIDATE = "accept_candidate"
+    NEEDS_LLM_REVIEW = "needs_llm_review"
+
+@dataclass(frozen=True)
+class ClaimCandidateTriage:
+    status: CandidateTriageStatus
+    reason: str | None
 
 CLAIM_TYPE_FACT = "fact"
 CLAIM_VERIFICATION_STATUS_DRAFT = "draft"
@@ -449,8 +460,12 @@ class ClaimCandidateScore:
     claim_quality_score: float
     query_answer_score: float
     source_quality_score: float
+    source_suitability_score: float
     final_score: float
+    candidate_tier: str
     rejected_reason: str | None
+    triage_status: CandidateTriageStatus = CandidateTriageStatus.ACCEPT_CANDIDATE
+    analysis_flags: tuple[str, ...] = ()
 
     def as_notes(self) -> dict[str, Any]:
         return {
@@ -462,8 +477,12 @@ class ClaimCandidateScore:
             "claim_quality_score": self.claim_quality_score,
             "query_answer_score": self.query_answer_score,
             "source_quality_score": self.source_quality_score,
+            "source_suitability_score": self.source_suitability_score,
             "claim_selection_score": self.final_score,
+            "candidate_tier": self.candidate_tier,
             "rejected_reason": self.rejected_reason,
+            "triage_status": self.triage_status.value,
+            "analysis_flags": list(self.analysis_flags),
         }
 
 
@@ -477,7 +496,8 @@ def draft_claim_statement(excerpt: str) -> str:
 
 def is_claimable_statement(statement: str, query: str | None = None) -> bool:
     normalized = _normalize_quotes(_normalize_whitespace(statement))
-    if _claim_rejection_reason(normalized, query=query) is not None:
+    triage = _triage_claim_candidate(normalized, query=query)
+    if triage.status == CandidateTriageStatus.REJECT_FATAL:
         return False
     return True
 
@@ -571,22 +591,42 @@ def score_claim_statement(
     query: str | None,
     content_quality_score: float | None = None,
     source_quality_score: float | None = None,
+    domain: str | None = None,
+    source_url: str | None = None,
+    page_title: str | None = None,
+    target_slot_id: str | None = None,
 ) -> ClaimCandidateScore:
     normalized = _normalize_quotes(_normalize_whitespace(statement))
     intent = classify_query_intent(query)
     category = classify_claim_category(normalized, intent=intent)
-    rejected_reason = _claim_rejection_reason(
+    
+    triage = _triage_claim_candidate(
         normalized, query=query, intent=intent, category=category
     )
+    rejected_reason = triage.reason if triage.status == CandidateTriageStatus.REJECT_FATAL else None
+
     content_score = _clamp_score(
         content_quality_score if content_quality_score is not None else 0.6
     )
     source_score = _clamp_score(source_quality_score if source_quality_score is not None else 0.5)
-    query_relevance = _compute_query_relevance_score(normalized, query=query, category=category)
+
+    query_relevance = _compute_query_relevance_score(
+        normalized, query=query, category=category, page_title=page_title
+    )
     claim_quality = _compute_claim_quality_score(normalized, category=category)
     query_answer = _compute_query_answer_score(
-        category=category, query_relevance=query_relevance, intent=intent
+        category=category,
+        query_relevance=query_relevance,
+        intent=intent,
+        target_slot_id=target_slot_id,
     )
+    source_suitability = _compute_source_suitability(
+        domain=domain,
+        source_url=source_url,
+        intent=intent,
+        category=category,
+    )
+
     answer_role = answer_role_for_claim_category(category, intent=intent)
     answer_relevant = _is_answer_relevant_components(
         category=category,
@@ -602,15 +642,53 @@ def score_claim_statement(
         query_answer = min(query_answer, 0.2)
         answer_role = "non_answer"
         answer_relevant = False
+    elif triage.status == CandidateTriageStatus.NEEDS_LLM_REVIEW:
+        # Soft penalty for candidates that need review so they don't dominate perfectly clean candidates
+        claim_quality = min(claim_quality, 0.6)
+        query_answer = min(query_answer, 0.6)
 
+    # New weights:
+    # relevance: 35%, answer: 25%, suitability: 20%, source: 10%, quality: 10%
     final_score = round(
-        (content_score * 0.18)
-        + (query_relevance * 0.20)
-        + (claim_quality * 0.24)
-        + (query_answer * 0.28)
-        + (source_score * 0.10),
+        (query_relevance * 0.35)
+        + (query_answer * 0.25)
+        + (source_suitability * 0.20)
+        + (source_score * 0.10)
+        + (claim_quality * 0.10),
         4,
     )
+
+    tier = "rejected"
+    if rejected_reason is None:
+        main_threshold = 0.45
+        supporting_threshold = 0.35
+        recall_threshold = 0.25
+
+        if intent.intent_name in {"definition", "definition_mechanism"}:
+            main_threshold = 0.38
+            supporting_threshold = 0.30
+            recall_threshold = 0.22
+        elif intent.intent_name == "news":
+            main_threshold = 0.35
+            supporting_threshold = 0.28
+            recall_threshold = 0.20
+        elif intent.intent_name == "deployment":
+            main_threshold = 0.48
+
+        if not answer_relevant:
+            # Check for query_focus_mismatch (pronoun issues)
+            # If it's otherwise high quality and has context support, downgrade to weak instead of rejected
+            if final_score >= recall_threshold and _is_contextually_relevant(
+                normalized, query, page_title
+            ):
+                tier = "recall_candidate"
+        elif final_score >= main_threshold:
+            tier = "main_candidate"
+        elif final_score >= supporting_threshold:
+            tier = "supporting_candidate"
+        elif final_score >= recall_threshold:
+            tier = "recall_candidate"
+
     return ClaimCandidateScore(
         claim_category=category,
         answer_role=answer_role,
@@ -620,8 +698,11 @@ def score_claim_statement(
         claim_quality_score=round(claim_quality, 4),
         query_answer_score=round(query_answer, 4),
         source_quality_score=round(source_score, 4),
+        source_suitability_score=round(source_suitability, 4),
         final_score=final_score,
+        candidate_tier=tier,
         rejected_reason=rejected_reason,
+        triage_status=triage.status,
     )
 
 
@@ -744,69 +825,93 @@ def is_answer_relevant_score(score: ClaimCandidateScore, *, query: str | None) -
     )
 
 
-def _claim_rejection_reason(
+def _triage_claim_candidate(
     statement: str,
     *,
     query: str | None,
     intent: QueryIntent | None = None,
     category: str | None = None,
-) -> str | None:
+) -> ClaimCandidateTriage:
     normalized = _normalize_quotes(_normalize_whitespace(statement))
     intent = intent or classify_query_intent(query)
     category = category or classify_claim_category(normalized, intent=intent)
-    if len(normalized) < MIN_CLAIM_STATEMENT_CHARS and not (
-        category == "feature" and len(normalized) >= 24
-    ):
-        return "too_short"
+    
+    # 1. FATAL REJECTIONS (obvious garbage, fragments, etc)
     if normalized.lower() in _MEANINGLESS_CLAIMS:
-        return "meaningless_fragment"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "meaningless_fragment")
     if normalized.endswith(("?", "？")):
-        return "question_like"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "question_like")
     if _has_unbalanced_quotes(normalized):
-        return "unbalanced_quotes"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "unbalanced_quotes")
     if _has_broken_link_residue(normalized):
-        return "broken_link_residue"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "broken_link_residue")
     if _looks_like_figure_caption(normalized):
-        return "figure_caption_or_diagram"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "figure_caption_or_diagram")
     deployment_evidence_statement = is_deployment_evidence_statement(normalized)
     if _looks_like_diagram_or_config_fragment(normalized) and not deployment_evidence_statement:
-        return "diagram_or_config_fragment"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "diagram_or_config_fragment")
     if _looks_like_reference_statement(normalized, query=query):
-        return "reference_or_citation"
-    if _TERMINAL_SENTENCE_PATTERN.search(normalized) is None:
-        return "incomplete_sentence"
-    if _starts_with_lowercase_fragment(normalized, intent=intent):
-        return "lowercase_fragment"
-    if _IMPERATIVE_PREFIX_PATTERN.search(normalized):
-        return "imperative_or_call_to_action"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "reference_or_citation")
+    
     lower = normalized.lower()
     if normalized.endswith("!") and (
         category in {"setup", "community", "slogan"} or "run it yourself" in lower
     ):
-        return "promotional_or_imperative_exclamation"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "promotional_or_imperative_exclamation")
     if category == "slogan":
-        return "slogan_fragment"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "slogan_fragment")
     if category == "navigation":
-        return "navigation_or_documentation_pointer"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "navigation_or_documentation_pointer")
+    
+    # Boilerplate / Cookie / Copyright rejections
+    if _contains_any(lower, ("use cookies", "cookie policy", "privacy policy", "all rights reserved", "terms of service", "copyright \u00a9", "search without being tracked", "join our community")):
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "boilerplate_or_navigation")
+        
     if category == "community" and not intent.contribution_allowed:
-        return "community_or_contribution"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "community_or_contribution")
     if category == "setup" and not intent.setup_allowed and _is_setup_instruction(lower):
-        return "setup_instruction"
-    if is_overview_answer_intent(intent) and category == "other":
-        return "not_answer_focused"
-    if category == "other" and _looks_like_caption_or_heading_fragment(normalized):
-        return "caption_or_heading_fragment"
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "setup_instruction")
+    if query is not None and normalize_claim_identity(normalized) == normalize_claim_identity(query):
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "duplicates_query")
+
+    # Fatal rejection for extremely short non-CJK fragments that lack substance
+    has_cjk = bool(_CJK_CHAR_PATTERN.search(normalized))
+    if len(normalized) < 24 and not has_cjk:
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "too_short_fragment")
+
+    # 2. NEEDS LLM REVIEW (short text, incomplete surface structures, etc)
     tokens = _tokenize(normalized)
+    has_cjk = bool(_CJK_CHAR_PATTERN.search(normalized))
     semantic_units = len(tokens) + (len(_CJK_CHAR_PATTERN.findall(normalized)) // 2)
-    if semantic_units < MIN_CLAIM_STATEMENT_TOKENS and not (
-        category == "feature" and semantic_units >= 3
-    ):
-        return "too_few_informative_terms"
-    if query is not None and normalize_claim_identity(normalized) == normalize_claim_identity(
-        query
-    ):
-        return "duplicates_query"
-    return None
+    
+    review_reasons = []
+    
+    if is_overview_answer_intent(intent) and category == "other":
+        review_reasons.append("not_answer_focused")
+    if category == "other" and _looks_like_caption_or_heading_fragment(normalized):
+        review_reasons.append("caption_or_heading_fragment")
+    
+    if len(normalized) < MIN_CLAIM_STATEMENT_CHARS and not (category == "feature" and len(normalized) >= 24):
+        if not has_cjk:
+            review_reasons.append("too_short")
+            
+    if semantic_units < MIN_CLAIM_STATEMENT_TOKENS and not (category == "feature" and semantic_units >= 3):
+        review_reasons.append("too_few_informative_terms")
+        
+    if _TERMINAL_SENTENCE_PATTERN.search(normalized) is None:
+        review_reasons.append("incomplete_sentence")
+        
+    if _starts_with_lowercase_fragment(normalized, intent=intent):
+        review_reasons.append("lowercase_fragment")
+        
+    if _IMPERATIVE_PREFIX_PATTERN.search(normalized):
+        review_reasons.append("imperative_or_call_to_action")
+
+    if review_reasons:
+        return ClaimCandidateTriage(CandidateTriageStatus.NEEDS_LLM_REVIEW, review_reasons[0])
+
+    # 3. ACCEPT
+    return ClaimCandidateTriage(CandidateTriageStatus.ACCEPT_CANDIDATE, None)
 
 
 def is_claimable_excerpt(excerpt: str, query: str | None = None) -> bool:
@@ -828,15 +933,20 @@ def select_supporting_span(text: str, query: str) -> SupportingSpan:
         raise CitationSpanValidationError("source chunk text does not contain a claimable span")
 
     query_tokens = tuple(_tokenize(query))
-    best_span = max(
-        spans,
-        key=lambda span: (
-            score_claim_statement(statement=span.excerpt, query=query).final_score,
+    
+    def _span_sort_key(span: SupportingSpan) -> tuple[int, float, float, float, int]:
+        score = score_claim_statement(statement=span.excerpt, query=query)
+        # Prefer ACCEPT_CANDIDATE over NEEDS_LLM_REVIEW
+        triage_order = 1 if score.triage_status == CandidateTriageStatus.ACCEPT_CANDIDATE else 0
+        return (
+            triage_order,
+            score.final_score,
             _query_overlap_score(span.excerpt, query_tokens),
             _informative_length_score(span.excerpt),
             -span.start_offset,
-        ),
-    )
+        )
+
+    best_span = max(spans, key=_span_sort_key)
     validate_citation_span(text, best_span.start_offset, best_span.end_offset, best_span.excerpt)
     return best_span
 
@@ -1392,12 +1502,21 @@ def _compute_query_relevance_score(
     *,
     query: str | None,
     category: str,
+    page_title: str | None = None,
 ) -> float:
     query_tokens = set(_meaningful_query_tokens(query))
     statement_tokens = set(_tokenize(statement))
     literal_score = 0.0
     if query_tokens:
         literal_score = len(query_tokens & statement_tokens) / len(query_tokens)
+
+    # Boost if page title matches query subject and statement uses context-indicating language
+    context_boost = 0.0
+    if page_title and query_tokens:
+        title_tokens = set(_tokenize(page_title))
+        if len(query_tokens & title_tokens) >= 1:
+            if statement.lower().startswith(("they ", "it ", "this ", "the ")):
+                context_boost = 0.15
 
     category_floor = {
         "definition": 0.9,
@@ -1414,7 +1533,7 @@ def _compute_query_relevance_score(
     }.get(category, 0.0)
     if classify_query_intent(query).intent_name == "generic":
         category_floor = min(category_floor, 0.55)
-    return _clamp_score(max(literal_score, category_floor))
+    return _clamp_score(max(literal_score + context_boost, category_floor))
 
 
 def _compute_claim_quality_score(statement: str, *, category: str) -> float:
@@ -1445,6 +1564,7 @@ def _compute_query_answer_score(
     category: str,
     query_relevance: float,
     intent: QueryIntent,
+    target_slot_id: str | None = None,
 ) -> float:
     if intent.intent_name == "generic":
         if category in intent.avoid_claim_types:
@@ -1458,8 +1578,14 @@ def _compute_query_answer_score(
         "feature": 0.75,
         "deployment/self_hosting": 0.7,
     }
+    score = expected_scores.get(category, max(query_relevance, 0.6))
+
+    # Boost if this category matches the target slot's expected categories
+    if target_slot_id:
+        score += 0.05
+
     if category in intent.expected_claim_types:
-        return expected_scores.get(category, max(query_relevance, 0.6))
+        return _clamp_score(score)
     if category in intent.avoid_claim_types:
         return 0.1
     if category == "deployment/self_hosting" and is_overview_answer_intent(intent):
@@ -1580,3 +1706,110 @@ def _contains_any(value: str, terms: Iterable[str]) -> bool:
 
 def _clamp_score(value: float) -> float:
     return min(1.0, max(0.0, float(value)))
+
+def rewrite_claim_self_contained(
+    statement: str,
+    *,
+    page_title: str | None = None,
+    query: str | None = None,
+) -> str:
+    normalized = _normalize_whitespace(statement)
+    if not normalized:
+        return statement
+
+    intent = classify_query_intent(query)
+    subject = (intent.subject_terms[0] if intent.subject_terms else None) or (
+        _extract_title_subject(page_title) if page_title else None
+    )
+
+    if not subject:
+        return normalized
+
+    # Simple pronoun resolution
+    # Handle "They", "It", "This", "The company", "The tool", etc.
+    rewritten = normalized
+
+    pronouns = [
+        (r"^[Tt]hey\s+", f"{subject.capitalize()} "),
+        (r"^[Ii]t\s+", f"{subject.capitalize()} "),
+        (r"^[Tt]his\s+(?:tool|app|framework|model|service)\s+", f"{subject.capitalize()} "),
+        (r"^[Tt]he\s+(?:tool|app|framework|model|service)\s+", f"{subject.capitalize()} "),
+    ]
+
+    for pattern, replacement in pronouns:
+        if re.search(pattern, rewritten):
+            rewritten = re.sub(pattern, replacement, rewritten)
+            break
+
+    return rewritten
+
+
+def _is_contextually_relevant(
+    statement: str,
+    query: str | None,
+    page_title: str | None,
+) -> bool:
+    if not query:
+        return True
+    intent = classify_query_intent(query)
+    if not intent.subject_terms:
+        return True
+
+    lower_statement = statement.lower()
+    # Check if statement already has focus
+    if any(subject in lower_statement for subject in intent.subject_terms):
+        return True
+
+    # Check if page title gives it focus
+    if page_title and any(subject in page_title.lower() for subject in intent.subject_terms):
+        # If it uses a pronoun at the start, it's likely relevant contextually
+        if lower_statement.startswith(("they ", "it ", "this ", "the ")):
+            return True
+
+    return False
+
+
+def _extract_title_subject(title: str) -> str | None:
+    # Extract the first significant noun phrase from the title
+    cleaned = re.split(r"[-|:|?|!]", title)[0].strip()
+    if cleaned.lower().startswith("what is "):
+        cleaned = cleaned[7:].strip()
+    tokens = _tokenize(cleaned)
+    if not tokens:
+        return None
+    return tokens[0]
+
+def _compute_source_suitability(
+    *,
+    domain: str | None,
+    source_url: str | None,
+    intent: QueryIntent,
+    category: str,
+) -> float:
+    # High score for official domains if relevant
+    score = 0.5
+    if not domain:
+        return score
+    
+    lower_domain = domain.lower()
+
+    # Example: boost official domains for news or definition
+    official_domains = {"openai.com", "microsoft.com", "google.com", "anthropic.com"}
+    if lower_domain in official_domains:
+        score += 0.2
+
+    # Boost reference sources for definitions
+    if category == "definition":
+        if "wikipedia.org" in lower_domain:
+            score += 0.15
+        elif "arxiv.org" in lower_domain:
+            score += 0.20
+        elif lower_domain.startswith("docs."):
+            score += 0.10
+    
+    # Penalize raw source code for factual claims unless it's a deployment task
+    if "raw.githubusercontent.com" in lower_domain:
+        if intent.intent_name != "deployment":
+            score -= 0.15
+
+    return _clamp_score(score)

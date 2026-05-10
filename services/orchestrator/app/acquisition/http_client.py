@@ -93,15 +93,19 @@ class HttpAcquisitionClient:
         max_redirects: int,
         max_response_bytes: int,
         user_agent: str,
+        accept_language: str = "en-US,en;q=0.9",
         resolver: HostResolver | None = None,
         client: httpx.Client | None = None,
+        trust_env_proxy: bool = False,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_redirects = max_redirects
         self.max_response_bytes = max_response_bytes
         self.user_agent = user_agent
+        self.accept_language = accept_language
         self.resolver = resolver or SocketHostResolver()
         self.client = client
+        self.trust_env_proxy = trust_env_proxy
 
     def fetch(self, url: str) -> HttpFetchResult:
         try:
@@ -115,7 +119,7 @@ class HttpAcquisitionClient:
                 mime_type=None,
                 content=None,
                 content_hash=None,
-                trace=_merge_trace(_proxy_trace_for_url(url), error.trace),
+                trace=_merge_trace(_proxy_trace_for_url(url, self.trust_env_proxy), error.trace),
             )
         except httpx.RequestError as error:
             return HttpFetchResult(
@@ -126,7 +130,11 @@ class HttpAcquisitionClient:
                 mime_type=None,
                 content=None,
                 content_hash=None,
-                trace=_request_error_trace(url=url, error=error),
+                trace=_request_error_trace(
+                    url=url,
+                    error=error,
+                    trust_env_proxy=self.trust_env_proxy,
+                ),
             )
 
     def _fetch_with_redirects(self, url: str) -> HttpFetchResult:
@@ -145,7 +153,7 @@ class HttpAcquisitionClient:
                         {
                             "requested_url": url,
                             "final_url": current_url,
-                            **_proxy_trace_for_url(current_url),
+                            **_proxy_trace_for_url(current_url, self.trust_env_proxy),
                             **target_validation.to_trace(),
                         },
                         error.trace,
@@ -158,10 +166,14 @@ class HttpAcquisitionClient:
                         {
                             "requested_url": url,
                             "final_url": current_url,
-                            **_proxy_trace_for_url(current_url),
+                            **_proxy_trace_for_url(current_url, self.trust_env_proxy),
                             **target_validation.to_trace(),
                         },
-                        _request_error_trace(url=current_url, error=error),
+                        _request_error_trace(
+                            url=current_url,
+                            error=error,
+                            trust_env_proxy=self.trust_env_proxy,
+                        ),
                     ),
                 ) from error
             location = response_data.headers.get("location")
@@ -174,7 +186,7 @@ class HttpAcquisitionClient:
                             "requested_url": url,
                             "final_url": response_data.final_url,
                             "redirect_chain": redirect_chain,
-                            **_proxy_trace_for_url(current_url),
+                            **_proxy_trace_for_url(current_url, self.trust_env_proxy),
                             **target_validation.to_trace(),
                         },
                     )
@@ -200,7 +212,7 @@ class HttpAcquisitionClient:
                             "final_url": response_data.final_url,
                             "redirect_chain": redirect_chain,
                             "redirect_stub_target": stub_redirect_target,
-                            **_proxy_trace_for_url(current_url),
+                            **_proxy_trace_for_url(current_url, self.trust_env_proxy),
                             **target_validation.to_trace(),
                         },
                     )
@@ -230,7 +242,7 @@ class HttpAcquisitionClient:
                     "requested_url": url,
                     "final_url": response_data.final_url,
                     "redirect_chain": redirect_chain,
-                    **_proxy_trace_for_url(current_url),
+                    **_proxy_trace_for_url(current_url, self.trust_env_proxy),
                     **target_validation.to_trace(),
                     "response_bytes": len(response_data.content),
                 },
@@ -243,7 +255,18 @@ class HttpAcquisitionClient:
 
     def _perform_request(self, url: str) -> _HttpResponseData:
         headers = {
-            "Accept": "*/*",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": self.accept_language,
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
             "User-Agent": self.user_agent,
         }
         if self.client is not None:
@@ -252,7 +275,7 @@ class HttpAcquisitionClient:
         with httpx.Client(
             follow_redirects=False,
             timeout=self.timeout_seconds,
-            trust_env=True,
+            trust_env=self.trust_env_proxy,
         ) as client:
             return self._perform_request_with_client(client, url, headers)
 
@@ -440,7 +463,12 @@ def _extract_html_redirect_stub_target(response_data: _HttpResponseData) -> str 
     return None
 
 
-def _request_error_trace(*, url: str, error: httpx.RequestError) -> dict[str, Any]:
+def _request_error_trace(
+    *,
+    url: str,
+    error: httpx.RequestError,
+    trust_env_proxy: bool = False,
+) -> dict[str, Any]:
     request = _request_from_error(error)
     request_url = str(request.url) if request is not None else url
     return {
@@ -448,17 +476,20 @@ def _request_error_trace(*, url: str, error: httpx.RequestError) -> dict[str, An
         "message": str(error),
         "requested_url": url,
         "final_url": request_url,
-        **_proxy_trace_for_url(url),
+        **_proxy_trace_for_url(url, trust_env_proxy),
     }
 
 
-def _proxy_trace_for_url(url: str) -> dict[str, Any]:
+def _proxy_trace_for_url(url: str, trust_env_proxy: bool = False) -> dict[str, Any]:
     proxy_url, env_var, no_proxy_matched = _proxy_env_for_url(url)
+    proxy_enabled = trust_env_proxy and proxy_url is not None
     return {
-        "proxy_enabled": proxy_url is not None,
-        "proxy_source": "env" if proxy_url is not None else "none",
+        "proxy_enabled": proxy_enabled,
+        "proxy_source": "env" if proxy_enabled else "none",
         "proxy_env_var": env_var,
         "proxy_url_masked": _mask_proxy_url(proxy_url) if proxy_url is not None else None,
+        "proxy_env_detected": proxy_url is not None,
+        "proxy_env_trusted": trust_env_proxy,
         "no_proxy_matched": no_proxy_matched,
     }
 

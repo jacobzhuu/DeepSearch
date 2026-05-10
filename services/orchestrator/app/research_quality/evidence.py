@@ -114,6 +114,7 @@ class EvidenceYieldSummary:
     total_candidates: int
     accepted_candidates: int
     rejected_candidates: int
+    unselected_candidates: int
     by_slot: dict[str, dict[str, int]]
     by_source: dict[str, dict[str, int]]
     by_query: dict[str, Any]
@@ -124,6 +125,7 @@ class EvidenceYieldSummary:
             "total_candidates": self.total_candidates,
             "accepted_candidates": self.accepted_candidates,
             "rejected_candidates": self.rejected_candidates,
+            "unselected_candidates": self.unselected_candidates,
             "by_slot": self.by_slot,
             "by_source": self.by_source,
             "by_query": self.by_query,
@@ -221,6 +223,7 @@ def summarize_evidence_yield(
 
     accepted_count = 0
     rejected_count = 0
+    unselected_count = 0
     for item in candidates:
         candidate_id = item.get("evidence_candidate_id")
         is_accepted = isinstance(candidate_id, str) and candidate_id in accepted_ids
@@ -229,9 +232,14 @@ def summarize_evidence_yield(
             accepted_count += 1
         elif rejection_reasons:
             rejected_count += 1
+        else:
+            unselected_count += 1
         for reason in rejection_reasons:
             rejection_counter[reason] += 1
 
+        candidate_state = (
+            "accepted" if is_accepted else "rejected" if rejection_reasons else "unselected"
+        )
         slot_ids = _string_list(item.get("slot_ids"))
         if not slot_ids:
             slot_ids = ["unassigned"]
@@ -239,15 +247,16 @@ def summarize_evidence_yield(
         for slot_id in slot_ids:
             slot_counts = by_slot.setdefault(slot_id, Counter())
             slot_counts["total"] += 1
-            slot_counts["accepted" if is_accepted else "rejected"] += 1
+            slot_counts[candidate_state] += 1
         source_counts = by_source.setdefault(source_id, Counter())
         source_counts["total"] += 1
-        source_counts["accepted" if is_accepted else "rejected"] += 1
+        source_counts[candidate_state] += 1
 
     summary = EvidenceYieldSummary(
         total_candidates=len(candidates),
         accepted_candidates=accepted_count,
         rejected_candidates=rejected_count,
+        unselected_candidates=unselected_count,
         by_slot={key: dict(value) for key, value in sorted(by_slot.items())},
         by_source={key: dict(value) for key, value in sorted(by_source.items())},
         by_query={"query": query} if query else {},

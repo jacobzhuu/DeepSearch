@@ -3,13 +3,17 @@ import { useNavigate } from 'react-router-dom';
 import { PageLayout } from '../../components/layout/PageLayout';
 import { ErrorState } from '../../components/common/ErrorState';
 import { RuntimeModeBanner } from '../../components/common/RuntimeModeBanner';
+import { SectionCard } from '../../components/common/SectionCard';
+import { Button } from '../../components/common/Button';
+import { Badge } from '../../components/common/Badge';
+import { LoadingState } from '../../components/common/LoadingState';
 import { PipelineRunResponse, ResearchPlanResponse } from '../../features/tasks/types';
 import { useCreateTask, usePlanTask, useRunTask } from '../../features/tasks/hooks';
 
 export const NewTaskPage: React.FC = () => {
   const navigate = useNavigate();
   const { createTask, isCreating, error } = useCreateTask();
-  const { planTask, isPlanning, result: planResult, error: planError } = usePlanTask();
+  const { planTask, isPlanning, error: planError } = usePlanTask();
   const { runTask, isRunning, result: runResult, error: runError } = useRunTask();
 
   const [query, setQuery] = useState('');
@@ -26,10 +30,6 @@ export const NewTaskPage: React.FC = () => {
     const result = await createTask({
       query,
       report_language: reportLanguage,
-      constraints: {
-        language: reportLanguage,
-        report_language: reportLanguage,
-      },
     });
     if (result) {
       setTaskId(result.task_id);
@@ -85,116 +85,179 @@ export const NewTaskPage: React.FC = () => {
   };
 
   const busy = isCreating || isPlanning || isRunning;
-  const displayedPlan = activePlan || planResult;
+  const displayedPlan = taskId ? activePlan : null;
+  const isAwaitingInitialPlan = Boolean(taskId && isPlanning && !displayedPlan);
+  const didPlanGenerationFail = Boolean(taskId && !isPlanning && !displayedPlan);
 
   return (
-    <PageLayout title="创建新任务">
-      <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem', maxWidth: '760px' }}>
-        <ErrorState error={error} />
-        <ErrorState error={planError} />
-        <ErrorState error={runError} />
-        <PipelineRunSummary result={runResult} />
+    <PageLayout maxWidth="800px">
+      <div style={{ textAlign: 'center', marginBottom: '3rem', marginTop: '2rem' }}>
+        <h1 style={{ fontSize: '2.5rem', marginBottom: '1rem', background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+          开启深度研究
+        </h1>
+        <p style={{ fontSize: '1.125rem', color: 'var(--text-secondary)', maxWidth: '600px', margin: '0 auto' }}>
+          开源情报收集与溯源系统将根据您的问题自主规划研究路径，搜集真实网页证据并生成专业报告。
+        </p>
+      </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <label htmlFor="query" style={{ fontWeight: 'bold' }}>研究问题</label>
-          <textarea
-            id="query"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="例如：近30天 NVIDIA 在开源模型生态上的关键发布与影响"
-            rows={4}
-            style={{ padding: '0.5rem', fontFamily: 'inherit' }}
-            required
-            disabled={busy || Boolean(taskId)}
-          />
-        </div>
+      <SectionCard>
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          <ErrorState error={error} />
+          <ErrorState error={planError} />
+          <ErrorState error={runError} />
+          <PipelineRunSummary result={runResult} />
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <label htmlFor="report-language" style={{ fontWeight: 'bold' }}>报告语言</label>
-          <select
-            id="report-language"
-            value={reportLanguage}
-            onChange={(e) => setReportLanguage(e.target.value)}
-            disabled={busy || Boolean(taskId)}
-            style={{ padding: '0.5rem', fontFamily: 'inherit', maxWidth: '220px' }}
-          >
-            <option value="zh-CN">中文（简体）</option>
-            <option value="en-US">English</option>
-          </select>
-        </div>
-
-        {!taskId && (
-          <button
-            type="submit"
-            disabled={busy || !query.trim()}
-            style={{ padding: '0.75rem', cursor: busy ? 'not-allowed' : 'pointer', fontWeight: 'bold' }}
-          >
-            {isCreating ? '创建中...' : isPlanning ? '生成研究计划中...' : '创建任务并生成研究计划'}
-          </button>
-        )}
-      </form>
-
-      {taskId && !displayedPlan && (
-        <section style={{ marginTop: '1.5rem', maxWidth: '760px', border: '1px solid #f3c27a', borderRadius: '8px', padding: '1rem', backgroundColor: '#fff8ed' }}>
-          <strong>任务已创建，研究计划尚未生成。</strong>
-          <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1rem', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              onClick={handleRegeneratePlan}
-              disabled={busy}
-              style={{ padding: '0.75rem 1rem', cursor: busy ? 'not-allowed' : 'pointer', fontWeight: 'bold' }}
-            >
-              {isPlanning ? '生成研究计划中...' : '重新生成研究计划'}
-            </button>
-            <button type="button" onClick={resetTask} disabled={busy} style={{ padding: '0.75rem 1rem' }}>
-              创建另一个任务
-            </button>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+            <label htmlFor="query" style={{ fontWeight: 600, fontSize: '1rem' }}>您想研究什么？</label>
+            <textarea
+              id="query"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="例如：近30天 NVIDIA 在开源模型生态上的关键发布与影响"
+              rows={4}
+              style={{ 
+                padding: '1rem', 
+                fontFamily: 'inherit', 
+                borderRadius: 'var(--radius-md)', 
+                border: '1px solid var(--border-color)',
+                fontSize: '1rem',
+                resize: 'vertical',
+                outline: 'none',
+                transition: 'border-color 0.2s',
+              }}
+              onFocus={(e) => e.target.style.borderColor = 'var(--primary-color)'}
+              onBlur={(e) => e.target.style.borderColor = 'var(--border-color)'}
+              required
+              disabled={busy || Boolean(taskId)}
+            />
           </div>
-        </section>
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              <label htmlFor="report-language" style={{ fontWeight: 600, fontSize: '0.875rem' }}>报告语言</label>
+              <select
+                id="report-language"
+                value={reportLanguage}
+                onChange={(e) => setReportLanguage(e.target.value)}
+                disabled={busy || Boolean(taskId)}
+                style={{ 
+                  padding: '0.5rem 2rem 0.5rem 0.75rem', 
+                  fontFamily: 'inherit', 
+                  borderRadius: 'var(--radius-sm)', 
+                  border: '1px solid var(--border-color)',
+                  backgroundColor: 'white',
+                }}
+              >
+                <option value="zh-CN">中文 (简体)</option>
+                <option value="en-US">English</option>
+              </select>
+            </div>
+
+            {!taskId && (
+              <Button
+                type="submit"
+                isLoading={isCreating || isPlanning}
+                disabled={busy || !query.trim()}
+                size="lg"
+              >
+                开始规划研究
+              </Button>
+            )}
+          </div>
+        </form>
+      </SectionCard>
+
+      {isAwaitingInitialPlan && (
+        <SectionCard>
+          <LoadingState message="正在生成研究计划..." />
+        </SectionCard>
+      )}
+
+      {didPlanGenerationFail && (
+        <SectionCard style={{ border: '1px solid #fce8e6', backgroundColor: '#fffbfa' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem' }}>
+            <strong>任务已创建，但研究计划生成失败。</strong>
+            <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', textAlign: 'center' }}>
+              可以重试计划生成，或放弃当前空任务后重新创建。
+            </div>
+            <div style={{ display: 'flex', gap: '0.75rem' }}>
+              <Button onClick={handleRegeneratePlan} isLoading={isPlanning}>
+                重新生成计划
+              </Button>
+              <Button variant="outline" onClick={resetTask}>
+                放弃并重来
+              </Button>
+            </div>
+          </div>
+        </SectionCard>
       )}
 
       {displayedPlan && (
-        <section style={{ marginTop: '1.5rem', display: 'grid', gap: '1rem', maxWidth: '920px' }}>
+        <div style={{ marginTop: '2rem', animation: 'fadeIn 0.5s ease-out' }}>
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(10px); }
+              to { opacity: 1; transform: translateY(0); }
+            }
+          `}</style>
+          
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <h2 style={{ fontSize: '1.5rem', margin: 0 }}>研究计划</h2>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <Badge variant="info">{displayedPlan.planner_mode}</Badge>
+              <Badge variant="info">{displayedPlan.plan_source}</Badge>
+            </div>
+          </div>
+
           <RuntimeModeBanner
             runningMode={displayedPlan.running_mode}
             dependencies={displayedPlan.dependencies}
             warnings={displayedPlan.warnings}
           />
-          <section style={{ border: '1px solid #e2e8f0', borderRadius: '8px', padding: '1rem', backgroundColor: '#fff' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
-              <strong>研究计划</strong>
-              <span style={{ color: '#64748b' }}>
-                {displayedPlan.planner_mode} / {displayedPlan.plan_source}
-              </span>
-            </div>
+
+          <SectionCard>
             <PlanPreview plan={displayedPlan.research_plan || {}} />
-            <label htmlFor="plan-json" style={{ display: 'block', marginTop: '1rem', fontWeight: 'bold' }}>
-              可编辑计划 JSON
-            </label>
-            <textarea
-              id="plan-json"
-              value={planDraft}
-              onChange={(event) => setPlanDraft(event.target.value)}
-              rows={16}
-              disabled={busy}
-              style={{ width: '100%', marginTop: '0.5rem', padding: '0.75rem', fontFamily: 'monospace', fontSize: '0.9rem' }}
-            />
-            {planParseError && <div style={{ marginTop: '0.5rem', color: '#b91c1c' }}>{planParseError}</div>}
-            <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1rem', flexWrap: 'wrap' }}>
-              <button
-                type="button"
+            
+            <details style={{ marginTop: '1.5rem' }}>
+              <summary style={{ cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '0.875rem', fontWeight: 600 }}>
+                查看/编辑 计划 JSON
+              </summary>
+              <textarea
+                id="plan-json"
+                value={planDraft}
+                onChange={(event) => setPlanDraft(event.target.value)}
+                rows={12}
+                disabled={busy}
+                style={{ 
+                  width: '100%', 
+                  marginTop: '0.75rem', 
+                  padding: '1rem', 
+                  fontFamily: 'monospace', 
+                  fontSize: '0.875rem',
+                  borderRadius: 'var(--radius-sm)',
+                  border: '1px solid var(--border-color)',
+                  backgroundColor: '#f8f9fa'
+                }}
+              />
+              {planParseError && <div style={{ marginTop: '0.5rem', color: '#d93025', fontSize: '0.875rem' }}>{planParseError}</div>}
+            </details>
+
+            <div style={{ display: 'flex', gap: '1rem', marginTop: '2rem' }}>
+              <Button
                 onClick={handleRunConfirmedPlan}
+                isLoading={isRunning}
                 disabled={busy || !planDraft.trim()}
-                style={{ padding: '0.75rem 1rem', cursor: busy ? 'not-allowed' : 'pointer', fontWeight: 'bold' }}
+                size="lg"
+                style={{ flex: 1 }}
               >
-                {isPlanning ? '保存计划中...' : isRunning ? '运行 DeepSearch 中...' : '确认计划并开始研究'}
-              </button>
-              <button type="button" onClick={resetTask} disabled={busy} style={{ padding: '0.75rem 1rem' }}>
-                创建另一个任务
-              </button>
+                确认计划并开始研究
+              </Button>
+              <Button variant="outline" onClick={resetTask} size="lg">
+                重新创建
+              </Button>
             </div>
-          </section>
-        </section>
+          </SectionCard>
+        </div>
       )}
     </PageLayout>
   );
@@ -205,27 +268,42 @@ const PlanPreview: React.FC<{ plan: Record<string, any> }> = ({ plan }) => {
   const searchQueries = Array.isArray(plan.search_queries) ? plan.search_queries : [];
 
   return (
-    <div style={{ marginTop: '0.75rem', display: 'grid', gap: '0.75rem' }}>
-      <div><strong>意图:</strong> {plan.intent || '未记录'}</div>
+    <div style={{ display: 'grid', gap: '1.5rem' }}>
+      <div>
+        <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.5rem' }}>
+          研究意图
+        </div>
+        <div style={{ fontSize: '1.125rem', fontWeight: 500 }}>{plan.intent || '未记录'}</div>
+      </div>
+      
       {subquestions.length > 0 && (
         <div>
-          <div style={{ color: '#475569' }}>子问题</div>
-          <ul style={{ marginTop: '0.35rem', paddingLeft: '1.25rem' }}>
-            {subquestions.map((item: string) => <li key={item}>{item}</li>)}
-          </ul>
+          <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.5rem' }}>
+            分解子问题 ({subquestions.length})
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            {subquestions.map((item: string, i: number) => (
+              <div key={i} style={{ display: 'flex', gap: '0.75rem', alignItems: 'flex-start' }}>
+                <div style={{ color: 'var(--primary-color)', fontWeight: 700 }}>{i + 1}.</div>
+                <div style={{ color: 'var(--text-primary)' }}>{item}</div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
+
       {searchQueries.length > 0 && (
         <div>
-          <div style={{ color: '#475569' }}>计划搜索查询</div>
-          <ol style={{ marginTop: '0.35rem', paddingLeft: '1.25rem' }}>
+          <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.5rem' }}>
+            计划搜索查询 ({searchQueries.length})
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
             {searchQueries.map((item: any, index: number) => (
-              <li key={`${index}-${item.query_text || item}`}>
+              <Badge key={index} variant="secondary" style={{ padding: '0.5rem 0.85rem', fontSize: '0.875rem' }}>
                 {item.query_text || String(item)}
-                {item.expected_source_type ? <span style={{ color: '#64748b' }}> ({item.expected_source_type})</span> : null}
-              </li>
+              </Badge>
             ))}
-          </ol>
+          </div>
         </div>
       )}
     </div>
@@ -236,17 +314,28 @@ const PipelineRunSummary: React.FC<{ result: PipelineRunResponse | null }> = ({ 
   if (!result) return null;
 
   return (
-    <section style={{ border: '1px solid #ddd', borderRadius: '4px', padding: '1rem', backgroundColor: '#fafafa' }}>
-      <strong>流程模式:</strong> {result.running_mode} <br />
-      <strong>状态:</strong> {result.status} <br />
-      <strong>已完成阶段:</strong> {result.stages_completed.join(' -> ') || '无'} <br />
+    <div 
+      className="card-solid" 
+      style={{ 
+        border: '1px solid var(--border-color)', 
+        backgroundColor: '#f8f9fa', 
+        marginBottom: '1rem',
+        padding: '1rem'
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+        <strong>运行状态: {result.status}</strong>
+        <Badge variant="info">{result.running_mode}</Badge>
+      </div>
+      <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
+        已完成: {result.stages_completed.join(' → ') || '开始中'}
+      </div>
       {result.failure && (
-        <>
-          <strong>失败阶段:</strong> {result.failure.failed_stage} <br />
-          <strong>原因:</strong> {result.failure.reason} <br />
-          <strong>下一步建议:</strong> {result.failure.next_action}
-        </>
+        <div style={{ marginTop: '0.75rem', color: '#d93025', fontSize: '0.875rem' }}>
+          <strong>失败:</strong> {result.failure.reason} <br />
+          <strong>建议:</strong> {result.failure.next_action}
+        </div>
       )}
-    </section>
+    </div>
   );
 };

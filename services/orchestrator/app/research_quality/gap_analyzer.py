@@ -231,7 +231,19 @@ def _targeted_project_queries(
             ("LangGraph site:reference.langchain.com", "official_docs"),
             ("LangGraph github langchain-ai langgraph", "official_repository"),
             ("LangGraph docs langchain", "official_docs"),
-        )
+        ),
+        "claude": (
+            ("Claude site:anthropic.com", "official_docs"),
+            ("Claude site:docs.anthropic.com", "official_docs"),
+            ("Claude site:blog.anthropic.com", "official_docs"),
+            ("Claude API release notes", "official_docs"),
+            ("Claude model versions performance", "official_or_reference"),
+        ),
+        "anthropic": (
+            ("Anthropic site:anthropic.com", "official_docs"),
+            ("Anthropic news announcements", "official_docs"),
+            ("Anthropic Claude updates", "official_docs"),
+        ),
     }.get(project, ())
     supplemental: list[SupplementalSearchQuery] = []
     seen = set(existing_query_texts)
@@ -261,6 +273,10 @@ def _targeted_project_for_query(query: str) -> str | None:
     normalized = query.lower()
     if "langgraph" in normalized:
         return "langgraph"
+    if "claude" in normalized:
+        return "claude"
+    if "anthropic" in normalized:
+        return "anthropic"
     return None
 
 

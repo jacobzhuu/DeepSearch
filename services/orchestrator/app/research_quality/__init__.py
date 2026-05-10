@@ -22,6 +22,10 @@ from services.orchestrator.app.research_quality.evidence import (
     slot_ids_for_candidate_category,
     summarize_evidence_yield,
 )
+from services.orchestrator.app.research_quality.coverage_evaluator import (
+    CoverageEvaluation,
+    evaluate_research_coverage,
+)
 from services.orchestrator.app.research_quality.gap_analyzer import (
     GapAnalysisResult,
     SupplementalSearchQuery,
@@ -34,6 +38,10 @@ from services.orchestrator.app.research_quality.llm_assistance import (
     LLMEvidenceRerankerService,
     LLMQueryRewriterService,
     QueryRewriteResult,
+)
+from services.orchestrator.app.research_quality.llm_research_strategist import (
+    LLMResearchStrategistService,
+    ResearchStrategyResult,
 )
 from services.orchestrator.app.research_quality.source_intent import (
     SourceIntentClassification,
@@ -52,6 +60,7 @@ __all__ = [
     "CONTRIBUTION_LEVELS",
     "DROPPED_SOURCE_REASONS",
     "EVIDENCE_LINEAGE_FIELDS",
+    "CoverageEvaluation",
     "EvidenceCandidate",
     "EvidenceYieldSummary",
     "GapAnalysisResult",
@@ -60,6 +69,7 @@ __all__ = [
     "LLMClaimReviewService",
     "LLMEvidenceRerankerService",
     "LLMQueryRewriterService",
+    "LLMResearchStrategistService",
     "QUALITY_DIAGNOSTIC_FIELDS",
     "SlotCoverageSummary",
     "SourceIntentClassification",
@@ -69,6 +79,7 @@ __all__ = [
     "SourceYieldSummary",
     "SupplementalSearchQuery",
     "QueryRewriteResult",
+    "ResearchStrategyResult",
     "analyze_required_slot_gaps",
     "answer_slot_coverage",
     "answer_slots_for_query",
@@ -77,6 +88,7 @@ __all__ = [
     "classify_source_intent",
     "contribution_level_for_counts",
     "evidence_candidate_id",
+    "evaluate_research_coverage",
     "missing_answer_slots",
     "normalize_dropped_reasons",
     "slot_ids_for_candidate_category",

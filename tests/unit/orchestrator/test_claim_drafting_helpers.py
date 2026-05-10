@@ -49,7 +49,16 @@ def test_select_supporting_span_rejects_short_title_and_fragment_spans() -> None
 def test_claim_quality_rules_require_complete_non_duplicate_statement() -> None:
     assert not is_claimable_statement("Data")
     assert not is_claimable_statement("What Is OpenAI?", query="What is OpenAI?")
-    assert not is_claimable_statement("OpenAI artificial intelligence research organization")
+    fragment_score = score_claim_statement(
+        statement="OpenAI artificial intelligence research organization",
+        query="What is OpenAI?",
+    )
+    assert is_claimable_statement(
+        "OpenAI artificial intelligence research organization",
+        query="What is OpenAI?",
+    )
+    assert fragment_score.answer_relevant is False
+    assert fragment_score.candidate_tier == "recall_candidate"
     assert is_claimable_statement(
         "OpenAI is an artificial intelligence research and deployment company.",
         query="What is OpenAI?",
@@ -119,6 +128,82 @@ def test_query_intent_classifier_identifies_definition_mechanism_query() -> None
     assert intent.subject_terms == ("searxng",)
     assert intent.expected_claim_types == ("definition", "mechanism", "privacy", "feature")
     assert "community" in intent.avoid_claim_types
+
+
+def test_chinese_transformer_definition_claims_survive_hard_filter() -> None:
+    query = "什么是 transformer 架构？"
+    accepted_sentences = [
+        "Transformer 是一种基于注意力机制的神经网络架构",
+        "编码器由多头注意力和前馈网络组成",
+        "自注意力用于建模序列中不同位置之间的关系",
+        "Transformer architecture relies on self-attention",
+    ]
+
+    intent = classify_query_intent(query)
+
+    assert intent.intent_name == "generic"
+    assert intent.subject_terms == ()
+    for sentence in accepted_sentences:
+        score = score_claim_statement(statement=sentence, query=query, domain="arxiv.org")
+        assert is_claimable_statement(sentence, query=query)
+        assert score.rejected_reason is None
+        assert score.candidate_tier in {
+            "main_candidate",
+            "supporting_candidate",
+            "recall_candidate",
+        }
+        assert score.answer_role in {"definition", "mechanism", "other"}
+
+
+def test_claim_hard_filter_still_rejects_garbage() -> None:
+    query = "什么是 transformer 架构？"
+    rejected = [
+        "We use cookies to improve your experience.",
+        "Privacy Policy",
+        "Home",
+        "-",
+        '{"key": "value"}',
+        "Join our community on GitHub",
+        "Search without being tracked.",
+    ]
+
+    for statement in rejected:
+        score = score_claim_statement(statement=statement, query=query)
+        assert not is_claimable_statement(statement, query=query)
+        assert score.triage_status.value == "reject_fatal"
+        assert score.candidate_tier == "rejected"
+
+
+def test_chinese_transformer_scoring_uses_source_suitability_without_punctuation_bias() -> None:
+    query = "什么是 transformer 架构？"
+    definition = "Transformer 是一种基于注意力机制的神经网络架构"
+    component = "编码器由多头注意力和前馈网络组成"
+    mechanism = "自注意力用于建模序列中不同位置之间的关系"
+    arxiv_score = score_claim_statement(statement=definition, query=query, domain="arxiv.org")
+    wiki_score = score_claim_statement(statement=definition, query=query, domain="wikipedia.org")
+    raw_score = score_claim_statement(
+        statement=definition,
+        query=query,
+        domain="raw.githubusercontent.com",
+    )
+    product_docs_score = score_claim_statement(
+        statement="Amazon SageMaker includes a Transformer integration for deployment",
+        query=query,
+        domain="docs.aws.amazon.com",
+    )
+
+    assert arxiv_score.source_suitability_score > raw_score.source_suitability_score
+    assert wiki_score.source_suitability_score > raw_score.source_suitability_score
+    assert product_docs_score.source_suitability_score < arxiv_score.source_suitability_score
+    for statement in (definition, component, mechanism):
+        score = score_claim_statement(statement=statement, query=query, domain="arxiv.org")
+        assert score.candidate_tier in {
+            "main_candidate",
+            "supporting_candidate",
+            "recall_candidate",
+        }
+        assert score.rejected_reason is None
+        assert score.claim_quality_score >= 0.45
 
 
 def test_query_aware_claim_filters_accept_answer_sentences() -> None:

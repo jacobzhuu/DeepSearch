@@ -270,9 +270,32 @@ def _generate_deterministic_fallback_queries(
     coverage = research_state.get("coverage_evaluation") or {}
     missing_slots = coverage.get("required_slots_missing", [])
     weak_slots = coverage.get("required_slots_weak", [])
-    query = research_state.get("query", "unknown research topic")
+    if not missing_slots and not weak_slots:
+        answer_slots = research_state.get("answer_slots")
+        if isinstance(answer_slots, list):
+            missing_slots = [
+                item.get("slot_id")
+                for item in answer_slots
+                if isinstance(item, dict)
+                and item.get("required") is True
+                and item.get("status") == "missing"
+            ]
+            weak_slots = [
+                item.get("slot_id")
+                for item in answer_slots
+                if isinstance(item, dict)
+                and item.get("required") is True
+                and item.get("status") == "weak"
+            ]
+    query = (
+        research_state.get("query") or research_state.get("question") or "unknown research topic"
+    )
 
-    slots_to_target = list(missing_slots) + list(weak_slots)
+    slots_to_target = [
+        str(slot_id).strip()
+        for slot_id in [*list(missing_slots), *list(weak_slots)]
+        if str(slot_id).strip()
+    ]
     if not slots_to_target:
         return []
 
@@ -402,12 +425,19 @@ _STRATEGIST_SYSTEM_PROMPT = (
     "when required answer slots have sufficient evidence or when budget is exhausted. Return "
     "valid JSON only matching this schema:\n"
     "{\n"
-    '  "decision": "continue_search" | "fetch_more_existing_candidates" | "stop_sufficient" | "stop_budget_exhausted" | "stop_unanswerable",\n'
+    '  "decision": "continue_search" | "fetch_more_existing_candidates" | '
+    '"stop_sufficient" | "stop_budget_exhausted" | "stop_unanswerable",\n'
     '  "decision_confidence": 0.0 to 1.0,\n'
     '  "stop_reason": "string or null",\n'
-    '  "coverage_assessment": {"overall_status": "string", "required_slots_missing": ["list"], "main_problem": "string"},\n'
-    '  "next_queries": [{"query_text": "string", "language": "string or null", "target_slots": ["list"], "expected_source_types": ["list"], "rationale": "string", "priority": 1}],\n'
-    '  "source_selection_guidance": {"must_fetch_source_types": ["list"], "prefer_new_domains": true, "avoid_domains": ["list"], "avoid_reason": "string"},\n'
-    '  "minimum_evidence_to_stop": {"required_slots_must_be_at_least": "moderate", "min_distinct_domains": 3, "min_primary_or_reference_sources": 1, "allow_report_with_warning": true}\n'
+    '  "coverage_assessment": {"overall_status": "string", '
+    '"required_slots_missing": ["list"], "main_problem": "string"},\n'
+    '  "next_queries": [{"query_text": "string", "language": "string or null", '
+    '"target_slots": ["list"], "expected_source_types": ["list"], '
+    '"rationale": "string", "priority": 1}],\n'
+    '  "source_selection_guidance": {"must_fetch_source_types": ["list"], '
+    '"prefer_new_domains": true, "avoid_domains": ["list"], "avoid_reason": "string"},\n'
+    '  "minimum_evidence_to_stop": {"required_slots_must_be_at_least": "moderate", '
+    '"min_distinct_domains": 3, "min_primary_or_reference_sources": 1, '
+    '"allow_report_with_warning": true}\n'
     "}"
 )

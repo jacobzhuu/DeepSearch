@@ -127,6 +127,9 @@ VERIFY_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_VERIFYING, STAGE_RESE
 MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD = 2
 GAP_SEARCH_UNAVAILABLE_WARNING = "gap_search_unavailable"
 SUPPLEMENTAL_SEARCH_FAILED_WARNING = "supplemental_search_failed"
+MIN_REPORT_MAIN_CLAIMS = 12
+MIN_REPORT_SUPPORT_EVIDENCE = 12
+MIN_REPORT_SOURCE_DOCUMENTS = 4
 
 
 @dataclass(frozen=True)
@@ -445,18 +448,10 @@ class DebugRealPipelineRunner:
                     and strategy_payload.get("status") == "used"
                 ):
                     decision = strategy_payload.get("decision")
-                    if decision in {
-                        "stop_sufficient",
-                        "stop_budget_exhausted",
-                        "stop_unanswerable",
-                    }:
+                    if decision in {"stop_budget_exhausted", "stop_unanswerable"} and not (
+                        self._has_followup_budget(task_id, round_no=round_no, max_rounds=max_rounds)
+                    ):
                         break
-
-                if coverage_evaluation.get("can_stop") is True and (
-                    strategy_payload is None
-                    or strategy_payload.get("decision") in {None, "stop_sufficient"}
-                ):
-                    break
 
             analysis = analyze_required_slot_gaps(
                 task.query,
@@ -476,6 +471,26 @@ class DebugRealPipelineRunner:
                     round_no=round_no,
                     max_rounds=max_rounds,
                 )
+            if not analysis_payload.get("triggered"):
+                quality_gate = self._current_report_quality_gate(
+                    task_id,
+                    slot_coverage_summary=slot_coverage_summary,
+                    coverage_evaluation=coverage_evaluation,
+                    round_no=round_no,
+                    max_rounds=max_rounds,
+                )
+                if quality_gate.get("triggered"):
+                    analysis_payload = _gap_analysis_payload_from_quality_gate(
+                        analysis_payload,
+                        quality_gate,
+                        query=task.query,
+                        round_no=round_no,
+                        max_rounds=max_rounds,
+                        max_queries=self.gap_max_queries_per_round,
+                        existing_query_texts=self._existing_search_query_texts(task_id),
+                    )
+                else:
+                    analysis_payload["report_quality_gate"] = quality_gate
             self._record_gap_analysis(task_id, analysis_payload)
             if not analysis_payload.get("triggered"):
                 break
@@ -1850,6 +1865,41 @@ class DebugRealPipelineRunner:
             budget_exhausted=budget_exhausted,
         ).to_payload() | {"source_yield_summary": source_yield_summary}
 
+    def _current_report_quality_gate(
+        self,
+        task_id: UUID,
+        *,
+        slot_coverage_summary: list[dict[str, Any]],
+        coverage_evaluation: dict[str, Any],
+        round_no: int,
+        max_rounds: int,
+    ) -> dict[str, Any]:
+        task = self._get_task(task_id)
+        counts = self._safe_counts(task_id)
+        return _evaluate_report_quality_gate(
+            self.session,
+            task_id,
+            query=task.query,
+            counts=counts,
+            slot_coverage_summary=slot_coverage_summary,
+            coverage_evaluation=coverage_evaluation,
+            min_main_claims=_minimum_report_main_claims(task.query),
+            min_support_evidence=_minimum_report_support_evidence(task.query),
+            min_source_documents=MIN_REPORT_SOURCE_DOCUMENTS,
+            round_no=round_no,
+            max_rounds=max_rounds,
+            max_total_queries=self.research_loop_max_total_queries,
+            max_total_fetch_attempts=self.research_loop_max_total_fetch_attempts,
+        )
+
+    def _has_followup_budget(self, task_id: UUID, *, round_no: int, max_rounds: int) -> bool:
+        counts = self._safe_counts(task_id)
+        return (
+            round_no <= max_rounds
+            and counts.search_queries < self.research_loop_max_total_queries
+            and counts.fetch_attempts < self.research_loop_max_total_fetch_attempts
+        )
+
     def _run_research_strategy_if_configured(
         self,
         task_id: UUID,
@@ -1995,7 +2045,7 @@ class DebugRealPipelineRunner:
             return False
         if not self.research_loop_enabled or self.research_loop_strategist_shadow_mode:
             return False
-        if strategy_payload.get("status") != "used":
+        if strategy_payload.get("status") not in {"used", "fallback"}:
             return False
         decision = strategy_payload.get("decision")
         if decision == "continue_search":
@@ -2189,6 +2239,15 @@ def _supplemental_search_provider_failure(
 
 def _safe_int(value: Any) -> int:
     return value if isinstance(value, int) else 0
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _fetch_entry_summary(entry: Any, *, query: str | None = None) -> dict[str, Any]:
@@ -2463,7 +2522,11 @@ def _planned_queries_from_gap_analysis(gap_analysis: dict[str, Any]) -> list[Pla
                     else "official_or_reference"
                 ),
                 priority=priority if isinstance(priority, int) and priority > 0 else index,
-                query_source="gap_analyzer",
+                query_source=(
+                    item.get("query_source")
+                    if isinstance(item.get("query_source"), str)
+                    else "gap_analyzer"
+                ),
                 metadata={
                     "gap_round_no": item.get("round_no"),
                     "slot_ids": (
@@ -2527,6 +2590,228 @@ def _gap_analysis_payload_from_strategy(
         ],
         "fallback_gap_analysis": fallback_gap_analysis,
     }
+
+
+def _gap_analysis_payload_from_quality_gate(
+    fallback_gap_analysis: dict[str, Any],
+    quality_gate: dict[str, Any],
+    *,
+    query: str,
+    round_no: int,
+    max_rounds: int,
+    max_queries: int,
+    existing_query_texts: set[str],
+) -> dict[str, Any]:
+    queries = _quality_gate_supplemental_queries(
+        query,
+        quality_gate=quality_gate,
+        round_no=round_no,
+        max_queries=max_queries,
+        existing_query_texts=existing_query_texts,
+    )
+    if not queries:
+        return {
+            **fallback_gap_analysis,
+            "report_quality_gate": quality_gate,
+            "warnings": [
+                *list(fallback_gap_analysis.get("warnings", [])),
+                "Report quality gate failed, but no non-duplicate follow-up query was generated.",
+            ],
+        }
+    return {
+        **fallback_gap_analysis,
+        "round_no": round_no,
+        "max_rounds": max_rounds,
+        "triggered": True,
+        "reason": "report_quality_gate_insufficient",
+        "report_quality_gate": quality_gate,
+        "supplemental_queries": queries,
+    }
+
+
+def _quality_gate_supplemental_queries(
+    query: str,
+    *,
+    quality_gate: dict[str, Any],
+    round_no: int,
+    max_queries: int,
+    existing_query_texts: set[str],
+) -> list[dict[str, Any]]:
+    existing = {" ".join(item.lower().split()) for item in existing_query_texts}
+    metrics = quality_gate.get("metrics") if isinstance(quality_gate.get("metrics"), dict) else {}
+    missing_slots = _string_list(metrics.get("missing_required_slots"))
+    weak_slots = _string_list(metrics.get("weak_required_slots"))
+    target_slots = list(dict.fromkeys([*missing_slots, *weak_slots]))
+    query_variants: list[tuple[str, str, list[str]]] = []
+    for slot_id in target_slots:
+        query_variants.extend(
+            [
+                (
+                    f"{query} {slot_id} authoritative evidence",
+                    "official_or_reference",
+                    [slot_id],
+                ),
+                (f"{query} {slot_id} 深度 证据", "official_or_reference", [slot_id]),
+            ]
+        )
+    if not target_slots:
+        query_variants.extend(
+            [
+                (f"{query} official documentation evidence", "official_docs", []),
+                (f"{query} authoritative analysis reference", "official_or_reference", []),
+                (f"{query} 机制 影响 权威资料", "official_or_reference", []),
+                (f"{query} limitations evidence source", "reference", []),
+            ]
+        )
+
+    planned: list[dict[str, Any]] = []
+    for query_text, source_type, slot_ids in query_variants:
+        normalized = " ".join(query_text.lower().split())
+        if not normalized or normalized in existing:
+            continue
+        existing.add(normalized)
+        planned.append(
+            {
+                "query_text": query_text,
+                "rationale": (
+                    "Report quality gate found thin claims, evidence, source diversity, "
+                    "or unresolved coverage; collect additional grounded evidence before "
+                    "final reporting."
+                ),
+                "expected_source_type": source_type,
+                "priority": len(planned) + 1,
+                "slot_ids": slot_ids,
+                "round_no": round_no,
+                "query_source": "report_quality_gate",
+            }
+        )
+        if len(planned) >= max(1, max_queries):
+            break
+    return planned
+
+
+def _evaluate_report_quality_gate(
+    session: Session,
+    task_id: UUID,
+    *,
+    query: str,
+    counts: DebugPipelineCounts,
+    slot_coverage_summary: list[dict[str, Any]],
+    coverage_evaluation: dict[str, Any],
+    min_main_claims: int,
+    min_support_evidence: int,
+    min_source_documents: int,
+    round_no: int,
+    max_rounds: int,
+    max_total_queries: int,
+    max_total_fetch_attempts: int,
+) -> dict[str, Any]:
+    claims = ClaimRepository(session).list_for_task(task_id)
+    evidence_rows = ClaimEvidenceRepository(session).list_for_task(task_id)
+    support_evidence_by_claim_id: dict[UUID, int] = {}
+    support_domains: set[str] = set()
+    for evidence in evidence_rows:
+        if evidence.relation_type != "support":
+            continue
+        support_evidence_by_claim_id[evidence.claim_id] = (
+            support_evidence_by_claim_id.get(evidence.claim_id, 0) + 1
+        )
+        support_domains.add(evidence.citation_span.source_chunk.source_document.domain)
+
+    reportable_supported_claims = [
+        claim
+        for claim in claims
+        if claim.verification_status == "supported"
+        and support_evidence_by_claim_id.get(claim.id, 0) > 0
+        and _claim_counts_toward_gap_slot_coverage(
+            claim,
+            query=query,
+            slot_ids=[
+                item
+                for item in (claim.notes_json or {}).get("slot_ids", [])
+                if isinstance(item, str)
+            ],
+        )
+    ]
+    unsupported_statuses = {"unsupported", "mixed", "contradicted", "draft"}
+    unresolved_claim_count = sum(
+        1 for claim in claims if claim.verification_status in unsupported_statuses
+    )
+    missing_required_slots = [
+        str(slot.get("slot_id") or "unknown")
+        for slot in slot_coverage_summary
+        if slot.get("required") is True and slot.get("status") == "missing"
+    ]
+    weak_required_slots = [
+        str(slot.get("slot_id") or "unknown")
+        for slot in slot_coverage_summary
+        if slot.get("required") is True and slot.get("status") == "weak"
+    ]
+
+    source_documents_min = max(
+        min_source_documents,
+        int(coverage_evaluation.get("min_distinct_domains") or 0),
+    )
+    issues: list[str] = []
+    if len(reportable_supported_claims) < min_main_claims:
+        issues.append("reportable_supported_claims_below_threshold")
+    if sum(support_evidence_by_claim_id.values()) < min_support_evidence:
+        issues.append("support_evidence_below_threshold")
+    if counts.source_documents < source_documents_min:
+        issues.append("source_document_count_below_threshold")
+    if coverage_evaluation.get("can_stop") is not True:
+        issues.append("coverage_evaluation_not_sufficient")
+    if missing_required_slots or weak_required_slots:
+        issues.append("required_slots_unresolved")
+
+    can_continue = (
+        bool(issues)
+        and round_no <= max_rounds
+        and counts.search_queries < max_total_queries
+        and counts.fetch_attempts < max_total_fetch_attempts
+    )
+    return {
+        "status": "sufficient" if not issues else "insufficient",
+        "triggered": can_continue,
+        "can_report": not issues or not can_continue,
+        "can_continue": can_continue,
+        "reason": None if not issues else "report_quality_below_threshold",
+        "issues": issues,
+        "metrics": {
+            "min_main_claims": min_main_claims,
+            "reportable_supported_claims": len(reportable_supported_claims),
+            "min_support_evidence": min_support_evidence,
+            "support_evidence_count": sum(support_evidence_by_claim_id.values()),
+            "min_source_documents": source_documents_min,
+            "source_documents": counts.source_documents,
+            "distinct_support_domains": len(support_domains),
+            "missing_required_slots": missing_required_slots,
+            "weak_required_slots": weak_required_slots,
+            "unresolved_claim_count": unresolved_claim_count,
+            "search_queries": counts.search_queries,
+            "fetch_attempts": counts.fetch_attempts,
+            "max_total_queries": max_total_queries,
+            "max_total_fetch_attempts": max_total_fetch_attempts,
+            "round_no": round_no,
+            "max_rounds": max_rounds,
+        },
+        "coverage_evaluation": coverage_evaluation,
+    }
+
+
+def _minimum_report_main_claims(query: str) -> int:
+    if classify_query_intent(query).intent_name == "deployment":
+        return 8
+    lower = query.lower()
+    if any(term in lower for term in ("compare", "comparison", " versus ", " vs ")):
+        return 16
+    if any(term in lower for term in ("recent", "latest", "近", "最新", "影响", "趋势")):
+        return 14
+    return MIN_REPORT_MAIN_CLAIMS
+
+
+def _minimum_report_support_evidence(query: str) -> int:
+    return max(_minimum_report_main_claims(query), MIN_REPORT_SUPPORT_EVIDENCE)
 
 
 def _claim_support_level_from_notes(notes: dict[str, Any]) -> str:
@@ -3214,8 +3499,7 @@ def _target_slot_ids_from_candidate_or_search_query(
     search_query: Any | None,
 ) -> list[str]:
     candidate_slots = _normalize_slot_id_list(
-        (candidate_metadata or {}).get("target_slots")
-        or (candidate_metadata or {}).get("slot_ids")
+        (candidate_metadata or {}).get("target_slots") or (candidate_metadata or {}).get("slot_ids")
     )
     if candidate_slots:
         return candidate_slots

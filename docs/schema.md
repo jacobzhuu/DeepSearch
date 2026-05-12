@@ -29,14 +29,15 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 - planner guardrail, LLM query-rewrite, source-selection, LLM source-judge, answer-slot coverage,
   LLM research-strategist, coverage-evaluator, LLM evidence-rerank, LLM claim-review, source-yield,
   evidence-yield, dropped-source, verifier-detail, supplemental-acquisition, gap-analysis,
-  deployment-evidence, and
+  report-quality-gate, deployment-evidence, and
   failure-diagnostic fields are stored in existing `task_event.payload_json`,
   `search_query.raw_response_json`, `candidate_url.metadata_json`, `source_chunk.metadata_json`,
   `claim.notes_json`, `research_run.checkpoint_json`, `report_artifact.manifest_json`, and API
   observability payloads; gap supplemental query metadata such as
   `query_source = "gap_analyzer"`, `gap_round_no`, and `slot_ids` stays in existing search
   metadata, while strategist-generated follow-up queries use
-  `query_source = "llm_research_strategist"` in the same existing metadata seam; no new planner,
+  `query_source = "llm_research_strategist"` and report-gate follow-up queries use
+  `query_source = "report_quality_gate"` in the same existing metadata seam; no new planner,
   source-quality, answer-slot, evidence-candidate, deployment-step, gap-analyzer, strategist,
   worker-queue, source-judge, LLM-assistance, or acquisition-retry table exists
 - query-aware claim ranking stores deterministic scoring metadata in the existing `claim.notes_json` field, including `claim_category`, `answer_role`, `answer_relevant`, `content_quality_score`, `query_relevance_score`, `claim_quality_score`, `query_answer_score`, `source_quality_score`, `claim_selection_score`, `rejected_reason`, `draft_mode`, `fallback_reason`, and `original_rejected_reason`

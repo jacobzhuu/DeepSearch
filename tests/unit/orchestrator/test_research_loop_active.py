@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -176,7 +177,7 @@ def test_strategist_fetch_more_existing_candidates_triggers_round(
     assert args[1]["strategy_decision"] == "fetch_more_existing_candidates"
 
 
-def test_strategist_stop_sufficient_breaks_loop(
+def test_strategist_stop_sufficient_does_not_stop_when_coverage_is_weak(
     mock_session: MagicMock, mock_task: MagicMock
 ) -> None:
     mock_task_repo = MagicMock()
@@ -238,5 +239,74 @@ def test_strategist_stop_sufficient_breaks_loop(
 
     runner.run(mock_task.id)
 
-    # _run_research_more_round should NOT be called because strategist said stop
-    assert not runner._run_research_more_round.called
+    assert runner._run_research_more_round.called
+
+
+def test_report_quality_gate_triggers_followup_when_slots_covered_but_claims_thin(
+    mock_session: MagicMock, mock_task: MagicMock
+) -> None:
+    mock_task_repo = MagicMock()
+    mock_task_repo.get.return_value = mock_task
+
+    runner = DebugRealPipelineRunner(
+        mock_session,
+        search_service=MagicMock(),
+        acquisition_service=MagicMock(),
+        parsing_service=MagicMock(),
+        indexing_service=MagicMock(),
+        claims_service=MagicMock(),
+        reporting_service=MagicMock(),
+        dependencies={},
+        research_loop_enabled=True,
+        max_gap_rounds=1,
+    )
+    runner.task_repository = mock_task_repo
+    runner.run_repository = MagicMock()
+    runner.event_repository = MagicMock()
+    runner._run_planner_if_configured = MagicMock()  # type: ignore
+    runner._run_search = MagicMock(return_value={})  # type: ignore
+    runner._run_fetch = MagicMock(return_value={"fetch_succeeded": 1})  # type: ignore
+    runner._run_parse = MagicMock(return_value={})  # type: ignore
+    runner._run_index = MagicMock(return_value={})  # type: ignore
+    runner._run_draft_claims = MagicMock(return_value={})  # type: ignore
+    runner._run_verify_claims = MagicMock(return_value={})  # type: ignore
+    runner._run_report = MagicMock(return_value={})  # type: ignore
+
+    def mock_execute_stage(
+        task_id: UUID,
+        stage: str,
+        action: Callable[[UUID], dict[str, Any]],
+        stages_completed: list[str],
+    ) -> None:
+        action(task_id)
+
+    runner._execute_stage = MagicMock(side_effect=mock_execute_stage)  # type: ignore
+    runner._current_slot_coverage_summary = MagicMock(  # type: ignore
+        return_value=[{"slot_id": "definition", "required": True, "status": "covered"}]
+    )
+    runner._current_coverage_evaluation = MagicMock(return_value={"can_stop": True})  # type: ignore
+    runner._current_report_quality_gate = MagicMock(  # type: ignore
+        side_effect=[
+            {
+                "status": "insufficient",
+                "triggered": True,
+                "reason": "report_quality_below_threshold",
+                "metrics": {"missing_required_slots": [], "weak_required_slots": []},
+            },
+            {
+                "status": "insufficient",
+                "triggered": False,
+                "reason": "report_quality_below_threshold",
+                "metrics": {"missing_required_slots": [], "weak_required_slots": []},
+            },
+        ]
+    )
+    runner._existing_search_query_texts = MagicMock(return_value=set())  # type: ignore
+    runner._run_research_more_round = MagicMock(return_value={"status": "ok"})  # type: ignore
+
+    runner.run(mock_task.id)
+
+    assert runner._run_research_more_round.called
+    args, _ = runner._run_research_more_round.call_args
+    assert args[1]["reason"] == "report_quality_gate_insufficient"
+    assert args[1]["supplemental_queries"]

@@ -118,14 +118,8 @@ def create_pipeline_runner(
         claims_service=create_claim_drafting_service(
             session,
             index_backend=resolved_claim_index_backend,
-            max_candidates_per_request=min(
-                max(settings.claim_drafting_max_candidates_per_request, 8),
-                12,
-            ),
-            verification_max_claims_per_request=min(
-                max(settings.claim_verification_max_claims_per_request, 8),
-                12,
-            ),
+            max_candidates_per_request=_runtime_claim_batch_limit(settings),
+            verification_max_claims_per_request=_runtime_verification_batch_limit(settings),
             retrieval_max_results_per_request=settings.retrieval_max_results_per_request,
             draft_allowed_statuses=DRAFT_ALLOWED_STATUSES,
             verify_allowed_statuses=VERIFY_ALLOWED_STATUSES,
@@ -415,6 +409,28 @@ def llm_evidence_reranker_configured(settings: Settings) -> bool:
 
 def llm_claim_reviewer_configured(settings: Settings) -> bool:
     return bool(settings.llm_enabled and settings.llm_claim_reviewer_enabled)
+
+
+def _runtime_claim_batch_limit(settings: Settings) -> int:
+    return min(
+        max(
+            settings.claim_drafting_max_candidates_per_request,
+            settings.research_claim_limit,
+            24,
+        ),
+        60,
+    )
+
+
+def _runtime_verification_batch_limit(settings: Settings) -> int:
+    return min(
+        max(
+            settings.claim_verification_max_claims_per_request,
+            settings.research_claim_limit,
+            24,
+        ),
+        60,
+    )
 
 
 def create_source_judge_service(settings: Settings, *, provider: Any) -> Any:

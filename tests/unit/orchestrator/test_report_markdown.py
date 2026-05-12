@@ -140,3 +140,70 @@ def test_render_markdown_report_can_include_debug_mapping_when_enabled() -> None
     assert "## Appendix: Claim Evidence Mapping" in report.markdown
     assert str(claim_id) in report.markdown
     assert str(citation_span_id) in report.markdown
+
+
+def test_render_chinese_report_expands_when_evidence_is_sufficient() -> None:
+    source_document_ids = [uuid4(), uuid4(), uuid4(), uuid4()]
+    sources = [
+        ReportSourceItem(
+            source_document_id=source_document_id,
+            canonical_url=f"https://example{i}.org/source",
+            domain=f"example{i}.org",
+            title=f"Example {i}",
+        )
+        for i, source_document_id in enumerate(source_document_ids)
+    ]
+    categories = ["definition", "mechanism", "feature", "privacy"]
+    claims = []
+    for index in range(14):
+        source_document_id = source_document_ids[index % len(source_document_ids)]
+        evidence = ReportEvidenceItem(
+            claim_evidence_id=uuid4(),
+            citation_span_id=uuid4(),
+            source_document_id=source_document_id,
+            source_chunk_id=uuid4(),
+            relation_type="support",
+            score=0.91,
+            canonical_url=f"https://example{index % len(source_document_ids)}.org/source",
+            domain=f"example{index % len(source_document_ids)}.org",
+            chunk_no=index,
+            start_offset=0,
+            end_offset=120,
+            excerpt=(
+                "DeepSearch 的证据账本将搜索、抓取、解析、chunk、claim 和 citation "
+                "span 串联起来，确保结论可以回溯到来源。"
+            ),
+        )
+        category = categories[index % len(categories)]
+        claims.append(
+            ReportClaimItem(
+                claim_id=uuid4(),
+                statement=(f"DeepSearch 结论 {index} 说明研究流程通过可审计证据支持中文长报告。"),
+                claim_type="fact",
+                confidence=0.9,
+                verification_status="supported",
+                rationale="Found support evidence.",
+                support_evidence=[evidence],
+                contradict_evidence=[],
+                claim_category=category,
+                slot_ids=(category,),
+                support_level="strong",
+            )
+        )
+
+    report = render_markdown_report(
+        task_id=uuid4(),
+        research_question="DeepSearch 如何生成高质量中文研究报告？",
+        revision_no=1,
+        claims=claims,
+        sources=sources,
+        report_language="zh-CN",
+    )
+
+    assert "## 背景与问题框架" in report.markdown
+    assert "## 核心发现" in report.markdown
+    assert "## 支撑性发现" in report.markdown
+    assert "## 机制分析" in report.markdown
+    assert "## 证据解释" in report.markdown
+    assert len(report.markdown) >= 3000
+    assert report.supported_count == 14

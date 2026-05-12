@@ -14,6 +14,7 @@ def test_coverage_evaluator_allows_stop_when_slots_and_sources_are_sufficient() 
                 "status": "covered",
                 "supported_claim_count": 1,
                 "source_count": 1,
+                "accepted_evidence_count": 3,
             },
             {
                 "slot_id": "mechanism",
@@ -21,6 +22,7 @@ def test_coverage_evaluator_allows_stop_when_slots_and_sources_are_sufficient() 
                 "status": "covered",
                 "supported_claim_count": 2,
                 "source_count": 2,
+                "accepted_evidence_count": 3,
             },
         ],
         source_yield_summary=[

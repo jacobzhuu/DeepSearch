@@ -211,6 +211,16 @@ def render_markdown_report(
             )
         )
     lines.extend(
+        _render_synthesis_sections(
+            research_question=research_question,
+            claims=strong_supported_claims,
+            sources=sources,
+            slot_coverage_summary=slot_coverage_summary,
+            report_language=normalized_language,
+            labels=labels,
+        )
+    )
+    lines.extend(
         [
             "",
             f"## {labels['answer']}",
@@ -342,8 +352,13 @@ def render_markdown_report(
             )
         )
     if unresolved_claims:
-        for claim in unresolved_claims:
+        lines.append("- " + labels["unresolved_claim_count"].format(count=len(unresolved_claims)))
+        for claim in unresolved_claims[:3]:
             lines.append(f"- {_normalize_inline(claim.statement)}")
+        if len(unresolved_claims) > 3:
+            lines.append(
+                "- " + labels["unresolved_claims_omitted"].format(count=len(unresolved_claims) - 3)
+            )
     elif not ordered_claims:
         lines.append(f"- {labels['no_claims']}")
     elif not missing_core_categories:
@@ -432,6 +447,148 @@ def _evidence_rows(
         for evidence in claim.support_evidence[:2]:
             rows.append((claim, evidence))
     return rows
+
+
+def _render_synthesis_sections(
+    *,
+    research_question: str,
+    claims: list[ReportClaimItem],
+    sources: list[ReportSourceItem],
+    slot_coverage_summary: list[dict[str, object]],
+    report_language: str,
+    labels: dict[str, str],
+) -> list[str]:
+    if not claims:
+        return []
+    main_claims = claims[: min(6, len(claims))]
+    supporting_claims = claims[min(6, len(claims)) : min(14, len(claims))]
+    domains = _format_domains(sources)
+    lines: list[str] = [
+        "",
+        f"## {labels['background_and_scope']}",
+        "",
+        labels["background_paragraph"].format(
+            question=_normalize_inline(research_question),
+            claim_count=len(claims),
+            source_count=len(sources),
+            domains=", ".join(domains) or labels["none"],
+        ),
+        "",
+        f"## {labels['core_findings']}",
+        "",
+    ]
+    for index, claim in enumerate(main_claims, start=1):
+        lines.extend(_render_finding_paragraph(index, claim, labels=labels))
+    if supporting_claims:
+        lines.extend(["", f"## {labels['supporting_findings']}", ""])
+        for index, claim in enumerate(supporting_claims, start=1):
+            lines.extend(_render_supporting_paragraph(index, claim, labels=labels))
+
+    lines.extend(["", f"## {labels['mechanism_analysis']}", ""])
+    grouped = _claims_by_slot(claims, query=research_question)
+    for slot in answer_slots_for_query(research_question):
+        slot_claims = grouped.get(slot.slot_id, [])
+        if not slot_claims:
+            continue
+        slot_label = _slot_label(slot.label, report_language=report_language)
+        lines.append(f"### {slot_label}")
+        lines.append("")
+        for claim in slot_claims[:2]:
+            lines.append(
+                labels["mechanism_paragraph"].format(
+                    claim=_normalize_inline(claim.statement),
+                    evidence=_claim_evidence_summary(claim, labels=labels),
+                )
+            )
+            lines.append("")
+
+    covered_slots = [
+        str(slot.get("label") or slot.get("slot_id"))
+        for slot in slot_coverage_summary
+        if slot.get("required") is True and slot.get("status") not in {"missing", "weak"}
+    ]
+    weak_slots = [
+        str(slot.get("label") or slot.get("slot_id"))
+        for slot in slot_coverage_summary
+        if slot.get("required") is True and slot.get("status") in {"missing", "weak"}
+    ]
+    lines.extend(
+        [
+            f"## {labels['evidence_interpretation']}",
+            "",
+            labels["evidence_interpretation_paragraph"].format(
+                claim_count=len(claims),
+                source_count=len(sources),
+                domains=", ".join(domains) or labels["none"],
+                covered_slots=", ".join(covered_slots) or labels["none"],
+                weak_slots=", ".join(weak_slots) or labels["none"],
+            ),
+        ]
+    )
+    return lines
+
+
+def _render_finding_paragraph(
+    index: int,
+    claim: ReportClaimItem,
+    *,
+    labels: dict[str, str],
+) -> list[str]:
+    return [
+        labels["finding_paragraph"].format(
+            index=index,
+            claim=_normalize_inline(claim.statement),
+            category=_normalize_inline(claim.claim_category or "other"),
+            evidence=_claim_evidence_summary(claim, labels=labels),
+        ),
+        "",
+    ]
+
+
+def _render_supporting_paragraph(
+    index: int,
+    claim: ReportClaimItem,
+    *,
+    labels: dict[str, str],
+) -> list[str]:
+    return [
+        labels["supporting_paragraph"].format(
+            index=index,
+            claim=_normalize_inline(claim.statement),
+            evidence=_claim_evidence_summary(claim, labels=labels),
+        ),
+        "",
+    ]
+
+
+def _claim_evidence_summary(
+    claim: ReportClaimItem,
+    *,
+    labels: dict[str, str],
+) -> str:
+    domains = list(dict.fromkeys(evidence.domain for evidence in claim.support_evidence[:3]))
+    excerpts = [
+        _normalize_inline(evidence.excerpt)
+        for evidence in claim.support_evidence[:2]
+        if evidence.excerpt.strip()
+    ]
+    return labels["evidence_summary"].format(
+        evidence_count=len(claim.support_evidence),
+        domains=", ".join(domains) or labels["none"],
+        excerpts="；".join(excerpts) if excerpts else labels["none"],
+    )
+
+
+def _claims_by_slot(
+    claims: list[ReportClaimItem],
+    *,
+    query: str,
+) -> dict[str, list[ReportClaimItem]]:
+    grouped: dict[str, list[ReportClaimItem]] = {}
+    for claim in claims:
+        for slot_id in _claim_slot_ids(claim, query=query):
+            grouped.setdefault(slot_id, []).append(claim)
+    return grouped
 
 
 def _effective_slot_coverage_rows(
@@ -707,6 +864,13 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "answer_relevant": "已纳入与问题相关的 claim：{count}。",
             "answer_slot_count": "答案槽位覆盖：{covered}/{total}。",
             "answer_slot_coverage": "答案槽位覆盖",
+            "background_and_scope": "背景与问题框架",
+            "background_paragraph": (
+                "本报告围绕“{question}”展开，只综合已经写入研究账本并通过验证的证据。"
+                "当前可用于主体论证的结论共有 {claim_count} 条，来自 {source_count} 个来源，"
+                "覆盖域名包括 {domains}。因此，下面的分析不是开放式猜测，而是把已抓取、"
+                "已解析、已绑定 citation span 的证据组织成可审计的回答。"
+            ),
             "chunk": "chunk",
             "citation": "citation",
             "claim_counts": (
@@ -717,8 +881,19 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "claim_label": "Claim",
             "claim_mapping": "附录：claim/evidence/citation 映射",
             "coverage_limited": "覆盖有限，因为未生成 {categories} 类 claim。",
+            "core_findings": "核心发现",
             "deterministic_generation": (
                 "生成该 artifact 时没有执行新的搜索、抓取、解析、索引、验证器或 LLM 报告写作逻辑。"
+            ),
+            "evidence_interpretation": "证据解释",
+            "evidence_interpretation_paragraph": (
+                "证据层面，主体结论使用 {claim_count} 条已支持 claim 和 {source_count} 个来源。"
+                "来源域名为 {domains}。已形成较明确覆盖的槽位包括 {covered_slots}；"
+                "仍较弱或缺失的槽位包括 {weak_slots}。这些弱项不被提升为事实结论，"
+                "只在最后的限制说明中出现。"
+            ),
+            "evidence_summary": (
+                "证据数 {evidence_count}；来源域名 {domains}；关键摘录：{excerpts}"
             ),
             "evidence_sources": "带证据链接的来源文档：{count} 个；域名：{domains}。",
             "evidence_table": "证据表",
@@ -726,9 +901,18 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "excluded_claims": "已排除低质量或偏离问题的 claim：{count}。",
             "excerpt": "摘录",
             "executive_summary": "执行摘要",
+            "finding_paragraph": (
+                "**发现 {index}（{category}）**：{claim}。这条结论进入主体报告，是因为它"
+                "已经绑定到可追溯证据：{evidence}。报告只围绕这些已验证事实展开。"
+            ),
             "generated": (
                 "_由已持久化证据在 revision `{revision_no}` 生成。"
                 "生成时间：{generation_time} (北京时间)_"
+            ),
+            "mechanism_analysis": "机制分析",
+            "mechanism_paragraph": (
+                "{claim} 该判断对应的证据基础为：{evidence}。从论证角度看，"
+                "它补充了该槽位下的因果链、组成关系或适用边界。"
             ),
             "missing_answer_coverage": "缺失答案覆盖：{categories}。",
             "missing_required_slots": "缺失必需答案槽位：{slots}。",
@@ -752,11 +936,22 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "source_scope_strict": (
                 "本报告严格由已持久化的 task、claim、citation、evidence 和 verification 记录综合。"
             ),
+            "supporting_findings": "支撑性发现",
+            "supporting_paragraph": (
+                "**支撑 {index}**：{claim} 这条材料不单独决定总体结论，"
+                "但它为主体判断提供背景、边界或交叉印证；证据为：{evidence}。"
+            ),
             "uncertainty_counts": (
                 "当前仍有不确定性：{mixed} 条 mixed、{contradicted} 条 contradicted、"
                 "{unsupported} 条 unsupported、{draft} 条 draft。"
             ),
             "unresolved": "未解决问题 / 低覆盖区域",
+            "unresolved_claim_count": (
+                "未进入主体结论的不确定 claim 共 {count} 条；以下仅列少量代表性限制。"
+            ),
+            "unresolved_claims_omitted": (
+                "另有 {count} 条不确定 claim 已从主体报告省略，仅保留在账本中供审计。"
+            ),
             "weak_missing_slots": "缺失或较弱的必需答案槽位：{slots}。",
             "weak_supported_claims": ("{count} 条 claim 只有弱词法支持，已从主要答案章节中排除。"),
         }
@@ -766,6 +961,13 @@ def _report_labels(report_language: str) -> dict[str, str]:
         "answer_relevant": "Answer-relevant claims included: {count}.",
         "answer_slot_count": "Answer slot coverage: {covered}/{total}.",
         "answer_slot_coverage": "Answer Slot Coverage",
+        "background_and_scope": "Background and Scope",
+        "background_paragraph": (
+            "This report addresses “{question}” using only verified ledger evidence. "
+            "The main synthesis has {claim_count} supported claims from {source_count} "
+            "sources across these domains: {domains}. The analysis below organizes fetched, "
+            "parsed, citation-bound evidence rather than adding unsupported outside facts."
+        ),
         "chunk": "chunk",
         "citation": "citation",
         "claim_counts": (
@@ -777,9 +979,20 @@ def _report_labels(report_language: str) -> dict[str, str]:
         "claim_label": "Claim",
         "claim_mapping": "Appendix: Claim Evidence Mapping",
         "coverage_limited": "Coverage is limited because no {categories} claims were generated.",
+        "core_findings": "Core Findings",
         "deterministic_generation": (
             "No new search, fetch, parse, index, verifier, or LLM report-writing logic was "
             "executed while generating this artifact."
+        ),
+        "evidence_interpretation": "Evidence Interpretation",
+        "evidence_interpretation_paragraph": (
+            "The body relies on {claim_count} supported claims and {source_count} sources. "
+            "The source domains are {domains}. Covered required slots include {covered_slots}; "
+            "weak or missing slots include {weak_slots}. Weak areas are not promoted into "
+            "settled findings and are kept in the final limitations section."
+        ),
+        "evidence_summary": (
+            "{evidence_count} evidence item(s); domains: {domains}; key excerpt(s): {excerpts}"
         ),
         "evidence_sources": (
             "Evidence-linked source documents: {count} across domains: {domains}."
@@ -791,9 +1004,18 @@ def _report_labels(report_language: str) -> dict[str, str]:
         "excluded_claims": "Excluded low-quality or off-query claims: {count}.",
         "excerpt": "excerpt",
         "executive_summary": "Executive Summary",
+        "finding_paragraph": (
+            "**Finding {index} ({category})**: {claim} This finding is part of the main "
+            "answer because it is bound to traceable evidence: {evidence}."
+        ),
         "generated": (
             "_Generated from persisted evidence at revision `{revision_no}`. "
             "Generated at: {generation_time} (Beijing Time)_"
+        ),
+        "mechanism_analysis": "Mechanism Analysis",
+        "mechanism_paragraph": (
+            "{claim} The evidence basis is: {evidence}. This adds causal, structural, "
+            "or boundary detail for the answer slot."
         ),
         "missing_answer_coverage": "Missing answer coverage: {categories}.",
         "missing_required_slots": "Missing required answer slots: {slots}.",
@@ -826,11 +1048,24 @@ def _report_labels(report_language: str) -> dict[str, str]:
             "This report is synthesized strictly from persisted task, claim, citation, "
             "evidence, and verification records."
         ),
+        "supporting_findings": "Supporting Findings",
+        "supporting_paragraph": (
+            "**Support {index}**: {claim} This item provides context, boundary detail, or "
+            "cross-checking for the main argument; evidence: {evidence}."
+        ),
         "uncertainty_counts": (
             "Current uncertainty remains: {mixed} mixed, {contradicted} contradicted, "
             "{unsupported} unsupported, {draft} draft."
         ),
         "unresolved": "Unresolved / Low Coverage Areas",
+        "unresolved_claim_count": (
+            "{count} uncertain claim(s) were not promoted into the main answer; only a few "
+            "representative limitations are listed here."
+        ),
+        "unresolved_claims_omitted": (
+            "{count} additional uncertain claim(s) were omitted from the report body and remain "
+            "available in the audit ledger."
+        ),
         "weak_missing_slots": "Missing or weak required answer slots: {slots}.",
         "weak_supported_claims": (
             "{count} claim(s) have weak lexical support only and are kept out of the main "

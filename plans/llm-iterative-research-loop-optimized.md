@@ -741,6 +741,40 @@ Deferred:
   execution still falls back to the deterministic existing-candidate paths unless it produces
   `continue_search` queries.
 
+### 2026-05-10 / report-quality recovery pass
+
+- Audited the thin-report failure mode from run `25ad1c15-e727-4cb9-b21a-0091ec97a177` against the
+  current funnel. The local database did not contain that run id, so the audit used the code path,
+  persisted diagnostic contracts, and unit/regression simulations rather than a direct row replay.
+- Removed the runtime claim/verification bottleneck where `create_pipeline_runner` capped normal
+  claim drafting and verification batches around 12 items even when `RESEARCH_CLAIM_LIMIT` was
+  higher. Runtime batch caps now follow `RESEARCH_CLAIM_LIMIT` with a bounded ceiling.
+- Added a pre-report quality gate in `DebugRealPipelineRunner`. If reportable supported claims,
+  support evidence, source documents, source diversity, or required slot coverage are below
+  thresholds and budgets remain, the gate creates a `report_quality_gate` supplemental search round
+  instead of allowing `REPORTING` to finish with a thin report.
+- Hardened strategist fallback behavior: invalid or malformed strategist JSON now falls back to
+  deterministic missing/weak-slot queries derived from `coverage_evaluation` or `answer_slots`, and
+  active fallback queries can drive follow-up rounds.
+- Expanded deterministic Markdown synthesis so evidence-sufficient Chinese reports include
+  structured sections for background/scope, core findings, supporting findings, mechanism analysis,
+  evidence interpretation, coverage, and final limitations. Unresolved claims are capped in the
+  final limitations section instead of dominating the report body.
+
+Validation performed in this pass:
+
+- `python -m py_compile services/orchestrator/app/services/debug_pipeline.py services/orchestrator/app/services/pipeline_runtime.py services/orchestrator/app/reporting/markdown.py services/orchestrator/app/research_quality/llm_research_strategist.py tests/unit/orchestrator/test_research_loop_active.py tests/unit/orchestrator/test_llm_research_strategist.py tests/unit/orchestrator/test_report_markdown.py` — passed
+- `pytest tests/unit/orchestrator/test_llm_research_strategist.py tests/unit/orchestrator/test_research_loop_active.py tests/unit/orchestrator/test_report_markdown.py -q` — passed
+- `pytest tests/unit/orchestrator/test_llm_research_strategist.py tests/unit/orchestrator/test_research_loop_active.py tests/unit/orchestrator/test_report_markdown.py tests/unit/orchestrator/test_report_synthesis_service.py tests/unit/orchestrator/test_gap_analyzer.py tests/unit/orchestrator/test_coverage_evaluator.py tests/unit/orchestrator/test_robustness_improvements.py -q` — passed
+- `ruff check services/orchestrator/app/services/debug_pipeline.py services/orchestrator/app/services/pipeline_runtime.py services/orchestrator/app/reporting/markdown.py services/orchestrator/app/research_quality/llm_research_strategist.py tests/unit/orchestrator/test_research_loop_active.py tests/unit/orchestrator/test_llm_research_strategist.py tests/unit/orchestrator/test_report_markdown.py tests/unit/orchestrator/test_coverage_evaluator.py` — passed
+
+Deferred:
+
+- A true rerun of `25ad1c15-e727-4cb9-b21a-0091ec97a177` still requires the original live backing
+  services and database rows; the local `data/dev.db` did not contain that run id.
+- Report quality thresholds are deterministic constants in the runner for this pass. They can move
+  to settings after live regression shows the right operating range.
+
 ## 15. Final Target State
 
 After this implementation, DeepSearch should no longer behave like:

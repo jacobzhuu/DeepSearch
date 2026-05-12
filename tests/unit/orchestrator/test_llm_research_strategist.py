@@ -100,8 +100,11 @@ def test_llm_research_strategist_invalid_json_falls_back() -> None:
 
     assert result.status == "fallback"
     assert result.used is False
-    assert result.planned_queries == ()
+    assert [query.query_text for query in result.planned_queries] == [
+        "什么是LLM中的token？ definition"
+    ]
     assert result.fallback_reason == "JSONDecodeError"
+    assert result.decision == "continue_search"
 
 
 def test_llm_research_strategist_stop_decision_does_not_emit_queries() -> None:

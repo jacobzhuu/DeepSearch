@@ -6,7 +6,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from packages.db.repositories import TaskEventRepository
 from services.orchestrator.app.acquisition import HttpAcquisitionClient
+from services.orchestrator.app.acquisition.playwright_backend import (
+    build_playwright_browser_fetch_backend,
+)
 from services.orchestrator.app.api.routes.acquisition import (
     get_http_acquisition_client,
     get_snapshot_object_store,
@@ -99,7 +103,20 @@ def run_debug_real_pipeline(
             snapshot_object_store=snapshot_object_store,
             snapshot_bucket=settings.snapshot_storage_bucket,
             max_candidates_per_request=settings.acquisition_max_candidates_per_request,
+            max_must_fetch_per_round=settings.research_acquisition_max_must_fetch_per_round,
             allowed_statuses=ACQUISITION_ALLOWED_STATUSES,
+            browser_fetch_backend_impl=build_playwright_browser_fetch_backend(
+                settings,
+                http_client,
+            ),
+            browser_fetch_backend_setting=settings.browser_fetch_backend,
+            task_event_repository=TaskEventRepository(session),
+            min_successful_authoritative_snapshots=(
+                settings.acquisition_min_successful_authoritative_snapshots
+            ),
+            defer_success_target_for_high_priority=(
+                settings.acquisition_defer_success_target_for_high_priority
+            ),
         ),
         parsing_service=create_parsing_service(
             session,
@@ -138,6 +155,10 @@ def run_debug_real_pipeline(
         dependencies=dependencies,
         fetch_limit=settings.acquisition_max_candidates_per_request,
         parse_limit=3,
+        parse_drain_enabled=settings.research_parse_drain_enabled,
+        parse_drain_max_batches=settings.research_parse_max_batches,
+        parse_drain_target_documents=settings.research_parse_target_documents,
+        parse_drain_max_seconds=settings.research_parse_drain_max_seconds,
         index_limit=10,
         claim_limit=5,
         event_source=DEBUG_EVENT_SOURCE,

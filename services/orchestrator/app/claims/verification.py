@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from services.orchestrator.app.claims.drafting import (
     CLAIM_EVIDENCE_RELATION_SUPPORT,
@@ -22,6 +23,20 @@ CLAIM_VERIFICATION_STATUS_SUPPORTED = "supported"
 CLAIM_VERIFICATION_STATUS_MIXED = "mixed"
 CLAIM_VERIFICATION_STATUS_UNSUPPORTED = "unsupported"
 VERIFIER_METHOD_LEXICAL_HEURISTIC_V2 = "lexical_overlap_contradiction_scan_v2"
+VERIFIER_METHOD_README_REPOSITORY_NORMALIZED_COMPOSITE = (
+    "readme_repository_normalized_token_support_v1"
+)
+
+_README_COMPOSITE_CAPABILITY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bguarantee[s]?\b", re.IGNORECASE), "guarantee"),
+    (re.compile(r"\bensure[s]?\b", re.IGNORECASE), "ensure"),
+    (re.compile(r"\bcertif(?:y|ies|ied|ication)\b", re.IGNORECASE), "certify"),
+    (re.compile(r"\bwarranty\b", re.IGNORECASE), "warranty"),
+    (re.compile(r"\bzero\s+downtime\b", re.IGNORECASE), "zero_downtime"),
+    (re.compile(r"\bnever\s+fails?\b", re.IGNORECASE), "never_fails"),
+    (re.compile(r"\bproduction[- ]grade\b", re.IGNORECASE), "production_grade"),
+    (re.compile(r"\benterprise[- ]only\b", re.IGNORECASE), "enterprise_only"),
+)
 
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+", re.UNICODE)
 _WHITESPACE_PATTERN = re.compile(r"\s+")
@@ -555,3 +570,150 @@ def _has_scope_mismatch(statement_tokens: set[str], excerpt_tokens: set[str]) ->
 
 def _has_negation(value: str) -> bool:
     return bool(_NEGATION_PATTERN.search(value) or _CJK_NEGATION_PATTERN.search(value))
+
+
+def _query_asks_technical_explanation_for_readme_verification(query: str | None) -> bool:
+    """Mirror acquisition technical-explanation detection (narrow; no deployment queries)."""
+    if query is None:
+        return False
+    lower = query.lower()
+    if any(term in lower for term in ("deploy", "deployment", "docker", "install")):
+        return False
+    if "what is" in lower and "how" in lower and "work" in lower:
+        return True
+    if "what are" in lower and "how" in lower and "work" in lower:
+        return True
+    if "technical explanation" in lower or "execution model" in lower:
+        return True
+    return lower.startswith("explain ") and ("how" in lower or "architecture" in lower)
+
+
+def try_repository_readme_normalized_composite_verification(
+    *,
+    source_text: str,
+    statement: str,
+    draft_excerpt: str,
+    start_offset: int,
+    end_offset: int,
+    query: str,
+) -> tuple[VerificationSpanMatch | None, dict[str, Any]]:
+    """
+    Strictly scoped composite support for repository README heading+bullet claims.
+
+    Uses the drafting ``draft_excerpt`` (heading + bullet region) as evidence; does not
+    relax global lexical thresholds elsewhere.
+    """
+    from services.orchestrator.app.claims.drafting import classify_query_intent
+
+    diag: dict[str, Any] = {
+        "repository_normalized_support_method": None,
+        "repository_normalized_support_token_hits": [],
+        "repository_normalized_support_missing_terms": [],
+        "repository_normalized_support_rejection": None,
+    }
+    if not _query_asks_technical_explanation_for_readme_verification(query):
+        diag["repository_normalized_support_rejection"] = "query_not_technical_explanation"
+        return None, diag
+
+    evidence_norm = _normalize_whitespace(draft_excerpt).lower()
+    stmt_norm = _normalize_whitespace(statement).lower()
+    if not evidence_norm or not stmt_norm:
+        diag["repository_normalized_support_rejection"] = "empty_statement_or_excerpt"
+        return None, diag
+
+    if _has_negation(statement) != _has_negation(draft_excerpt):
+        diag["repository_normalized_support_rejection"] = "negation_mismatch"
+        return None, diag
+
+    intent = classify_query_intent(query)
+    subject_terms = [
+        t.strip().lower()
+        for t in intent.subject_terms
+        if isinstance(t, str) and len(t.strip()) >= 4
+    ]
+    if subject_terms:
+        subjects_in_statement = [t for t in subject_terms if t in stmt_norm]
+        if not subjects_in_statement:
+            diag["repository_normalized_support_rejection"] = "subject_term_missing_from_claim"
+            return None, diag
+        for term in subjects_in_statement:
+            if term not in evidence_norm:
+                diag["repository_normalized_support_rejection"] = "subject_term_missing_from_readme"
+                diag["repository_normalized_support_missing_terms"] = [term]
+                return None, diag
+
+    stmt_meaningful = _meaningful_tokens(set(_tokenize(statement)))
+    evidence_tokens = set(_tokenize(draft_excerpt))
+    hits = sorted(stmt_meaningful & evidence_tokens)
+    missing = sorted(stmt_meaningful - evidence_tokens)
+    required_hits = max(2, min(5, max(2, (len(stmt_meaningful) + 1) // 2)))
+    if len(stmt_meaningful) < 2:
+        diag["repository_normalized_support_rejection"] = "too_few_meaningful_claim_terms"
+        return None, diag
+    if len(hits) < required_hits:
+        diag["repository_normalized_support_rejection"] = "insufficient_token_overlap"
+        diag["repository_normalized_support_token_hits"] = hits
+        diag["repository_normalized_support_missing_terms"] = missing
+        return None, diag
+
+    for pattern, label in _README_COMPOSITE_CAPABILITY_PATTERNS:
+        if pattern.search(statement) and not pattern.search(draft_excerpt):
+            diag["repository_normalized_support_rejection"] = f"capability_not_in_readme:{label}"
+            diag["repository_normalized_support_token_hits"] = hits
+            diag["repository_normalized_support_missing_terms"] = missing
+            return None, diag
+
+    try:
+        validate_citation_span(source_text, start_offset, end_offset, draft_excerpt)
+    except CitationSpanValidationError:
+        diag["repository_normalized_support_rejection"] = "citation_span_invalid"
+        return None, diag
+
+    stmt_toks = set(_tokenize(statement))
+    excerpt_toks = set(_tokenize(draft_excerpt))
+    if _has_numeric_or_date_mismatch(statement, draft_excerpt):
+        diag["repository_normalized_support_rejection"] = "numeric_or_date_mismatch"
+        diag["repository_normalized_support_token_hits"] = hits
+        diag["repository_normalized_support_missing_terms"] = missing
+        return None, diag
+    if _has_scope_mismatch(stmt_toks, excerpt_toks):
+        diag["repository_normalized_support_rejection"] = "scope_mismatch"
+        diag["repository_normalized_support_token_hits"] = hits
+        diag["repository_normalized_support_missing_terms"] = missing
+        return None, diag
+
+    citation_precision, citation_precision_reason = _citation_precision(
+        source_text,
+        start_offset=start_offset,
+        end_offset=end_offset,
+        excerpt=draft_excerpt,
+    )
+    overlap_ratio = len(hits) / max(len(stmt_meaningful), 1)
+    match = VerificationSpanMatch(
+        relation_type=CLAIM_EVIDENCE_RELATION_SUPPORT,
+        relation_detail="readme_composite_token_support",
+        support_level="strong",
+        start_offset=start_offset,
+        end_offset=end_offset,
+        excerpt=draft_excerpt,
+        score=0.86,
+        overlap_ratio=round(overlap_ratio, 4),
+        meaningful_overlap_ratio=round(overlap_ratio, 4),
+        verifier_method=VERIFIER_METHOD_README_REPOSITORY_NORMALIZED_COMPOSITE,
+        citation_precision=citation_precision,
+        citation_precision_reason=citation_precision_reason,
+        reasons=("readme_repository_normalized_composite",),
+        flags={
+            "negation_differs": False,
+            "numeric_or_date_mismatch": False,
+            "scope_mismatch": False,
+            "shallow_generic_overlap": False,
+        },
+    )
+
+    diag["repository_normalized_support_method"] = (
+        VERIFIER_METHOD_README_REPOSITORY_NORMALIZED_COMPOSITE
+    )
+    diag["repository_normalized_support_token_hits"] = hits
+    diag["repository_normalized_support_missing_terms"] = missing
+    return match, diag

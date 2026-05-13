@@ -245,7 +245,7 @@ def test_http_acquisition_client_limits_redirects() -> None:
     result = fetch_client.fetch("https://example.com/first")
 
     assert result.http_status == 302
-    assert result.error_code == "too_many_redirects"
+    assert result.error_code == "redirect_loop"
     assert result.content is None
     assert len(result.trace["redirect_chain"]) == 1
 
@@ -309,3 +309,63 @@ def test_http_acquisition_client_rejects_oversized_bodies() -> None:
     assert result.error_code == "body_too_large"
     assert result.content is None
     assert result.trace["max_response_bytes"] == 32
+    assert result.trace.get("response_cap_source") == "global"
+    assert result.trace.get("cap_decision") == "global_default"
+
+
+def test_http_acquisition_client_trusted_docs_allowlist_raises_body_cap() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"x" * 48,
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    fetch_client = HttpAcquisitionClient(
+        timeout_seconds=5.0,
+        max_redirects=3,
+        max_response_bytes=32,
+        user_agent="deepresearch-tests/1.0",
+        resolver=StaticResolver("93.184.216.34"),
+        client=client,
+        trusted_docs_domains=frozenset({"docs.langchain.com"}),
+        trusted_docs_max_response_bytes=64,
+    )
+
+    result = fetch_client.fetch("https://docs.langchain.com/langgraph/overview")
+
+    assert result.http_status == 200
+    assert result.error_code is None
+    assert len(result.content or b"") == 48
+    assert result.trace.get("response_cap_source") == "trusted_docs_allowlist"
+    assert result.trace.get("effective_max_response_bytes") == 64
+
+
+def test_http_acquisition_client_non_allowlisted_host_keeps_global_cap() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"x" * 48,
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+    fetch_client = HttpAcquisitionClient(
+        timeout_seconds=5.0,
+        max_redirects=3,
+        max_response_bytes=32,
+        user_agent="deepresearch-tests/1.0",
+        resolver=StaticResolver("93.184.216.34"),
+        client=client,
+        trusted_docs_domains=frozenset({"docs.langchain.com"}),
+        trusted_docs_max_response_bytes=64,
+    )
+
+    result = fetch_client.fetch("https://evil.example/large")
+
+    assert result.error_code == "body_too_large"
+    assert result.trace.get("cap_decision") == "global_not_allowlisted_host"
+    assert result.trace.get("effective_max_response_bytes") == 32

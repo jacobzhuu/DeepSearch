@@ -44,6 +44,7 @@ class ParseEntryResponse(BaseModel):
     sheet_names: list[str] | None = None
     cell_ranges: list[str] | None = None
     updated_existing: bool
+    chunk_validation: dict[str, Any] | None = None
 
 
 class RunParseResponse(BaseModel):
@@ -52,7 +53,13 @@ class RunParseResponse(BaseModel):
     updated: int
     skipped_existing: int
     skipped_unsupported: int
+    skipped_static_html_hold: int = 0
+    skipped_no_valid_chunks: int = 0
     failed: int
+    invalid_chunk_rejection_count: int = 0
+    invalid_chunk_rejection_reason_distribution: dict[str, int] = Field(default_factory=dict)
+    snapshots_with_no_valid_chunks: int = 0
+    parser_invalid_output_count: int = 0
     entries: list[ParseEntryResponse]
 
 

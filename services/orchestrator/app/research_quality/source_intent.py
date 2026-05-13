@@ -29,7 +29,7 @@ class _ProjectOwnershipProfile(TypedDict):
 
 _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
     "langgraph": {
-        "owned_domains": ("langchain.com",),
+        "owned_domains": ("langchain.com", "blog.langchain.dev"),
         "github_repos": (("langchain-ai", "langgraph"),),
         "secondary_domains": (
             "github.langchain.ac.cn",
@@ -38,7 +38,7 @@ _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
         ),
     },
     "langchain": {
-        "owned_domains": ("langchain.com",),
+        "owned_domains": ("langchain.com", "blog.langchain.dev"),
         "github_repos": (("langchain-ai", "langchain"),),
         "secondary_domains": ("github.langchain.ac.cn", "langchain-doc.cn"),
     },
@@ -149,6 +149,7 @@ _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
 class SourceIntentClassification:
     source_category: str
     source_intent: str
+    source_role: str
     fetch_priority_score: int
     fetch_priority_reason: str
     source_quality_score: float
@@ -166,6 +167,7 @@ class SourceIntentClassification:
             "source_quality_score": self.source_quality_score,
             "source_category": self.source_category,
             "source_intent": self.source_intent,
+            "source_role": self.source_role,
             "source_selection_reason": self.source_selection_reason,
             "selected_reason": self.selected_reason,
             "selected_by": self.selected_by,
@@ -211,9 +213,17 @@ def classify_source_intent(
         score = max(score, 13)
     reason = _fetch_priority_reason(score)
     selected_reason = _selected_reason_for_source_category(category, score)
+    role = _source_role(
+        source_category=category,
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+    )
     return SourceIntentClassification(
         source_category=category,
         source_intent=category,
+        source_role=role,
         fetch_priority_score=score,
         fetch_priority_reason=reason,
         source_quality_score=_source_quality_score_for_fetch_priority(score),
@@ -304,6 +314,61 @@ def source_intent_priority(category: str, *, query: str | None = None) -> int:
         "forum_social_video": 90,
         "low_quality_or_blocked": 99,
     }.get(category, 50)
+
+
+def source_role_for_category(
+    category: str,
+    *,
+    canonical_url: str = "",
+    domain: str | None = None,
+    title: str | None = None,
+    query: str | None = None,
+) -> str:
+    return _source_role(
+        source_category=category,
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+    )
+
+
+def _source_role(
+    *,
+    source_category: str,
+    canonical_url: str,
+    domain: str | None,
+    title: str | None,
+    query: str | None,
+) -> str:
+    normalized_domain = (domain or "").strip().lower().removeprefix("www.")
+    path = urlsplit(canonical_url or "").path.strip().lower()
+    normalized_title = (title or "").strip().lower()
+    if source_category in {"low_quality_or_blocked", "forum_social_video"}:
+        return source_category
+    if source_category == "standards_or_academic":
+        return "academic_or_standard" if _academic_role_relevant(query) else "secondary_reference"
+    if source_category in {"official_repository", "github_readme_or_repo"}:
+        return "official_repository"
+    if _looks_like_official_blog_or_changelog(
+        domain=normalized_domain,
+        path=path,
+        title=normalized_title,
+    ) and source_category.startswith("official"):
+        return "official_blog_or_changelog"
+    if source_category in {"official_docs_reference", "official_api_dev"}:
+        if normalized_domain.startswith("reference.") or "/reference" in path or "/api" in path:
+            return "official_reference"
+        return "official_docs"
+    if source_category in {"official_about", "official_home", "official_architecture_admin"}:
+        return "official_docs"
+    if source_category in {"official_installation_admin"}:
+        return "official_docs"
+    if source_category in {"wikipedia_reference", "secondary_reference", "package_registry"}:
+        return "high_quality_secondary_reference"
+    if source_category == "generic_article":
+        return "generic_article"
+    return source_category or "generic_article"
 
 
 def _source_category(
@@ -404,6 +469,42 @@ def _is_docs_home(*, canonical_url: str, domain: str | None, title: str | None) 
         domain=normalized_domain,
         path=path,
         title=normalized_title,
+    )
+
+
+def _looks_like_official_blog_or_changelog(*, domain: str, path: str, title: str) -> bool:
+    if domain.startswith(("blog.", "blogs.", "news.")):
+        return True
+    return any(
+        marker in path or marker in title
+        for marker in (
+            "blog",
+            "changelog",
+            "release-notes",
+            "release_notes",
+            "releases",
+            "announcement",
+            "announcements",
+            "news",
+        )
+    )
+
+
+def _academic_role_relevant(query: str | None) -> bool:
+    if query is None:
+        return False
+    lower = query.lower()
+    return any(
+        term in lower
+        for term in (
+            "academic",
+            "paper",
+            "research",
+            "standard",
+            "specification",
+            "benchmark",
+            "evaluation",
+        )
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -50,9 +51,16 @@ from services.orchestrator.app.reporting import (
 )
 from services.orchestrator.app.research_quality import (
     build_slot_coverage_summary,
+    classify_source_intent,
     contribution_level_for_counts,
     slot_ids_for_claim_category,
+    source_role_for_category,
     summarize_evidence_yield,
+)
+from services.orchestrator.app.research_quality.readme_normalized_signals import (
+    is_raw_github_readme_url,
+    normalized_from_readme_from_notes,
+    readme_composite_support_relation_count_from_report_claims,
 )
 from services.orchestrator.app.services.research_tasks import TaskNotFoundError
 from services.orchestrator.app.storage import SnapshotObjectStore
@@ -64,7 +72,6 @@ _REPORT_REVIEW_EXCLUDE_DECISIONS = {
     "duplicate",
     "vague",
     "split_needed",
-    "keep_example",
     "keep_context",
 }
 _REPORT_ACCEPT_MIN_CONFIDENCE = 0.65
@@ -121,6 +128,26 @@ _QUERY_FOCUS_STOPWORDS = {
     "works",
 }
 
+_REPORT_COMPONENT_FOCUS_OFFICIAL_SOURCE_ROLES = frozenset(
+    {
+        "official_docs",
+        "official_reference",
+        "official_repository",
+        "official_blog_or_changelog",
+    }
+)
+_REPORT_COMPONENT_FOCUS_TECHNICAL_SLOTS = frozenset(
+    {
+        "architecture",
+        "core_abstractions",
+        "definition",
+        "execution_model",
+        "limitations",
+        "official_sources",
+        "workflow_lifecycle",
+    }
+)
+
 
 class ReportArtifactNotFoundError(Exception):
     def __init__(self, task_id: UUID) -> None:
@@ -171,6 +198,33 @@ class PreparedReport:
     sources: list[ReportSourceItem]
     report_language: str
     report_writer: dict[str, object]
+    report_focus_diagnostics: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _ReportComponentFocusEvidence:
+    canonical_url: str | None
+    domain: str | None
+    source_role: str | None
+
+
+@dataclass(frozen=True)
+class _ReportComponentFocusAlignment:
+    aligned: bool
+    terms: tuple[str, ...] = ()
+    failed_reason: str | None = None
+    missing_metadata: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "aligned": self.aligned,
+            "terms": list(self.terms),
+        }
+        if self.failed_reason:
+            payload["failed_reason"] = self.failed_reason
+        if self.missing_metadata:
+            payload["missing_metadata"] = list(self.missing_metadata)
+        return payload
 
 
 class ReportSynthesisService:
@@ -244,6 +298,44 @@ class ReportSynthesisService:
             dropped_sources=cast(
                 list[dict[str, Any]],
                 report_diagnostics["dropped_sources"],
+            ),
+            report_diagnostics=cast(
+                dict[str, Any],
+                {
+                    "claims_by_answer_slot": report_diagnostics.get("claims_by_answer_slot", {}),
+                    "claims_by_source_role": report_diagnostics.get("claims_by_source_role", {}),
+                    "report_input_claims_by_slot": report_diagnostics.get(
+                        "report_input_claims_by_slot", {}
+                    ),
+                    "report_input_claims_by_source_role": report_diagnostics.get(
+                        "report_input_claims_by_source_role", {}
+                    ),
+                    "weak_slots_without_claims": report_diagnostics.get(
+                        "weak_slots_without_claims", []
+                    ),
+                    "source_roles_fetched_but_not_reported": report_diagnostics.get(
+                        "source_roles_fetched_but_not_reported", []
+                    ),
+                    "normalized_from_readme_claim_count": report_diagnostics.get(
+                        "normalized_from_readme_claim_count", 0
+                    ),
+                    "repository_normalized_claim_count": report_diagnostics.get(
+                        "repository_normalized_claim_count", 0
+                    ),
+                    "repository_normalized_supported_claim_count": report_diagnostics.get(
+                        "repository_normalized_supported_claim_count", 0
+                    ),
+                    "readme_composite_support_relation_count": report_diagnostics.get(
+                        "readme_composite_support_relation_count", 0
+                    ),
+                    "official_repository_report_input_count": report_diagnostics.get(
+                        "official_repository_report_input_count", 0
+                    ),
+                    "raw_readme_sources_in_report_count": report_diagnostics.get(
+                        "raw_readme_sources_in_report_count", 0
+                    ),
+                    **prepared_report.report_focus_diagnostics,
+                },
             ),
         )
         latest_artifact = self.report_artifact_repository.get_latest_for_task_format(
@@ -372,6 +464,7 @@ class ReportSynthesisService:
         report_claims: list[ReportClaimItem] = []
         source_items: dict[UUID, ReportSourceItem] = {}
         excluded_low_quality_claim_count = 0
+        focus_diag = _new_report_focus_diagnostics()
         report_filter_counts: dict[str, int] = {
             "excluded_from_report_example_misaligned": 0,
             "excluded_from_report_weak_support": 0,
@@ -431,6 +524,12 @@ class ReportSynthesisService:
                 )
                 if effective_relation_type != evidence.relation_type and relation_metadata:
                     continue
+                source_classification = classify_source_intent(
+                    canonical_url=source_document.canonical_url,
+                    domain=source_document.domain,
+                    title=source_document.title,
+                    query=task.query,
+                )
                 report_evidence = ReportEvidenceItem(
                     claim_evidence_id=evidence.id,
                     citation_span_id=citation_span.id,
@@ -444,6 +543,8 @@ class ReportSynthesisService:
                     start_offset=citation_span.start_offset,
                     end_offset=citation_span.end_offset,
                     excerpt=citation_span.excerpt,
+                    source_role=source_classification.source_role,
+                    source_intent=source_classification.source_intent,
                     relation_detail=_string_or_none(relation_metadata.get("relation_detail")),
                     support_level=_string_or_none(relation_metadata.get("support_level")),
                     verifier_method=_string_or_none(relation_metadata.get("verifier_method")),
@@ -483,13 +584,20 @@ class ReportSynthesisService:
                 contradict_evidence=contradict_evidence,
                 slot_ids=slot_ids,
                 review_decision=review_decision,
+                focus_diag=focus_diag,
             )
+            component_focus = eligibility.get("component_focus")
             _set_report_eligibility(
                 claim,
                 eligible=eligibility["eligible"],
                 reasons=cast(list[str], eligibility["reasons"]),
                 slot_ids=slot_ids,
                 review_decision=review_decision,
+                component_focus=(
+                    cast(dict[str, object], component_focus)
+                    if isinstance(component_focus, dict)
+                    else None
+                ),
             )
             if not eligibility["eligible"]:
                 _record_report_exclusion_counts(
@@ -505,6 +613,8 @@ class ReportSynthesisService:
                     canonical_url=evidence.canonical_url,
                     domain=evidence.domain,
                     title=None,
+                    source_role=evidence.source_role,
+                    source_intent=evidence.source_intent,
                 )
 
             report_claims.append(
@@ -527,6 +637,9 @@ class ReportSynthesisService:
                     ),
                     verifier_method=_claim_verifier_method(claim),
                     support_level=_claim_support_level(claim),
+                    normalized_from_readme=normalized_from_readme_from_notes(
+                        claim.notes_json if isinstance(claim.notes_json, dict) else None
+                    ),
                 )
             )
 
@@ -611,12 +724,14 @@ class ReportSynthesisService:
             **report_writer,
             "report_filter_summary": dict(report_filter_counts),
         }
+        finalized_focus = _finalize_report_focus_diagnostics(focus_diag)
         return PreparedReport(
             rendered=rendered,
             claims=report_claims,
             sources=sources,
             report_language=report_language,
             report_writer=report_writer,
+            report_focus_diagnostics=finalized_focus,
         )
 
     def _artifact_matches(
@@ -804,6 +919,7 @@ def _report_claim_eligibility(
     contradict_evidence: list[ReportEvidenceItem],
     slot_ids: list[str],
     review_decision: dict[str, object],
+    focus_diag: dict[str, object] | None = None,
 ) -> dict[str, object]:
     reasons: list[str] = []
     if normalized_status == "draft":
@@ -811,7 +927,7 @@ def _report_claim_eligibility(
     if not support_evidence and not contradict_evidence:
         reasons.append("missing_persisted_evidence")
     decision = _string_or_none(review_decision.get("decision"))
-    if decision in _REPORT_REVIEW_EXCLUDE_DECISIONS:
+    if _review_decision_excluded_from_report(decision=decision, slot_ids=slot_ids):
         reasons.append(f"claim_review_{decision}")
     if decision in {"keep_main", "keep_supporting"}:
         confidence = _numeric_note(review_decision.get("confidence"))
@@ -857,11 +973,74 @@ def _report_claim_eligibility(
         reasons.append("event_or_announcement_noise")
     if claim_score.rejected_reason:
         reasons.append(f"claim_score_rejected:{claim_score.rejected_reason}")
-    if _claim_focus_required_for_report(query=query, slot_ids=slot_ids) and not (
-        _claim_focus_matches_query(claim.statement, query=query)
-    ):
+    focus_required = _claim_focus_required_for_report(query=query, slot_ids=slot_ids)
+    direct_focus = (
+        _claim_focus_matches_query(claim.statement, query=query) if focus_required else True
+    )
+    component_ok = False
+    component_terms: list[str] = []
+    component_alignment: _ReportComponentFocusAlignment | None = None
+    if focus_required and not direct_focus:
+        if focus_diag is not None:
+            focus_diag["report_component_focus_evaluated_count"] = (
+                int(focus_diag.get("report_component_focus_evaluated_count") or 0) + 1
+            )
+        component_alignment = _technical_component_focus_alignment(
+            statement=claim.statement,
+            query=query,
+            slot_ids=slot_ids,
+            support_evidence=support_evidence,
+            claim_notes=claim.notes_json if isinstance(claim.notes_json, dict) else {},
+        )
+        component_ok = component_alignment.aligned
+        component_terms = list(component_alignment.terms)
+        if component_ok and focus_diag is not None:
+            focus_diag["report_focus_component_match_count"] = (
+                int(focus_diag.get("report_focus_component_match_count") or 0) + 1
+            )
+            focus_diag["report_component_focus_rescued_count"] = (
+                int(focus_diag.get("report_component_focus_rescued_count") or 0) + 1
+            )
+            focus_diag["report_query_focus_rescued_by_component_count"] = (
+                int(focus_diag.get("report_query_focus_rescued_by_component_count") or 0) + 1
+            )
+            raw_hits = focus_diag.get("_component_term_hits")
+            if not isinstance(raw_hits, set):
+                raw_hits = set()
+                focus_diag["_component_term_hits"] = raw_hits
+            for term in component_terms:
+                if isinstance(term, str) and term.strip():
+                    raw_hits.add(term.strip())
+        elif focus_diag is not None:
+            _record_component_focus_failure(focus_diag, component_alignment)
+    if focus_required and not (direct_focus or component_ok):
         reasons.append("query_focus_mismatch")
-    return {"eligible": not reasons, "reasons": list(dict.fromkeys(reasons))}
+        if focus_diag is not None:
+            focus_diag["report_query_focus_mismatch_count"] = (
+                int(focus_diag.get("report_query_focus_mismatch_count") or 0) + 1
+            )
+            by_slot = focus_diag.get("report_query_focus_mismatch_by_slot")
+            if not isinstance(by_slot, dict):
+                by_slot = {}
+                focus_diag["report_query_focus_mismatch_by_slot"] = by_slot
+            slot_labels = slot_ids or ["unknown"]
+            for slot in slot_labels:
+                if not isinstance(slot, str) or not slot.strip():
+                    continue
+                sid = slot.strip()
+                by_slot[sid] = int(by_slot.get(sid) or 0) + 1
+    result: dict[str, object] = {"eligible": not reasons, "reasons": list(dict.fromkeys(reasons))}
+    if component_alignment is not None:
+        result["component_focus"] = component_alignment.to_payload()
+    return result
+
+
+def _review_decision_excluded_from_report(*, decision: str | None, slot_ids: list[str]) -> bool:
+    if decision in _REPORT_REVIEW_EXCLUDE_DECISIONS:
+        return True
+    if decision == "keep_example":
+        return "examples_use_cases" not in set(slot_ids)
+    return False
 
 
 def _set_report_eligibility(
@@ -871,17 +1050,21 @@ def _set_report_eligibility(
     reasons: list[str],
     slot_ids: list[str],
     review_decision: dict[str, object],
+    component_focus: dict[str, object] | None = None,
 ) -> None:
     notes = claim.notes_json or {}
+    eligibility: dict[str, object] = {
+        "eligible": eligible,
+        "reasons": reasons,
+        "slot_ids": slot_ids,
+        "review_decision": review_decision,
+    }
+    if component_focus is not None:
+        eligibility["component_focus"] = component_focus
     claim.notes_json = {
         **notes,
         "report_eligible": eligible,
-        "report_eligibility": {
-            "eligible": eligible,
-            "reasons": reasons,
-            "slot_ids": slot_ids,
-            "review_decision": review_decision,
-        },
+        "report_eligibility": eligibility,
     }
 
 
@@ -912,9 +1095,13 @@ def _report_claim_slot_ids(
     query: str,
 ) -> list[str]:
     notes = claim.notes_json or {}
-    noted_slots = [
-        item for item in notes.get("slot_ids", []) if isinstance(item, str) and item.strip()
-    ]
+    noted_slots = _string_list_note(notes.get("slot_ids"))
+    evidence_candidate = notes.get("evidence_candidate")
+    if isinstance(evidence_candidate, dict):
+        noted_slots.extend(_string_list_note(evidence_candidate.get("slot_ids")))
+        metadata = evidence_candidate.get("metadata")
+        if isinstance(metadata, dict):
+            noted_slots.extend(_string_list_note(metadata.get("slot_ids")))
     if noted_slots:
         return list(dict.fromkeys(noted_slots))
     return _slot_ids_from_claim_category(claim_score.claim_category, query=query)
@@ -1090,6 +1277,311 @@ def _tokenize_focus(value: str) -> list[str]:
     return [token.lower() for token in re.findall(r"[A-Za-z0-9_.-]+", value)]
 
 
+def _new_report_focus_diagnostics() -> dict[str, object]:
+    return {
+        "report_focus_component_match_count": 0,
+        "report_focus_component_match_terms": [],
+        "report_component_focus_evaluated_count": 0,
+        "report_component_focus_rescued_count": 0,
+        "report_component_focus_failed_reason_distribution": {},
+        "report_component_focus_missing_metadata_distribution": {},
+        "report_query_focus_mismatch_count": 0,
+        "report_query_focus_mismatch_by_slot": {},
+        "report_query_focus_rescued_by_component_count": 0,
+        "_component_term_hits": set(),
+    }
+
+
+def _finalize_report_focus_diagnostics(diag: dict[str, object]) -> dict[str, object]:
+    raw_hits = diag.get("_component_term_hits")
+    if isinstance(raw_hits, set):
+        term_hits = {str(item) for item in raw_hits if isinstance(item, str) and item.strip()}
+        diag["report_focus_component_match_terms"] = sorted(term_hits)
+    diag.pop("_component_term_hits", None)
+    by_slot = diag.get("report_query_focus_mismatch_by_slot")
+    if isinstance(by_slot, dict):
+        diag["report_query_focus_mismatch_by_slot"] = dict(
+            sorted(
+                ((str(k), int(v)) for k, v in by_slot.items() if isinstance(k, str)),
+                key=lambda item: item[0],
+            )
+        )
+    for key in (
+        "report_component_focus_failed_reason_distribution",
+        "report_component_focus_missing_metadata_distribution",
+    ):
+        value = diag.get(key)
+        if isinstance(value, dict):
+            diag[key] = dict(
+                sorted(
+                    ((str(k), int(v)) for k, v in value.items() if isinstance(k, str)),
+                    key=lambda item: item[0],
+                )
+            )
+    return diag
+
+
+def _record_component_focus_failure(
+    focus_diag: dict[str, object],
+    alignment: _ReportComponentFocusAlignment,
+) -> None:
+    reason = alignment.failed_reason or "unknown"
+    reasons = focus_diag.get("report_component_focus_failed_reason_distribution")
+    if not isinstance(reasons, dict):
+        reasons = {}
+        focus_diag["report_component_focus_failed_reason_distribution"] = reasons
+    reasons[reason] = int(reasons.get(reason) or 0) + 1
+    missing = focus_diag.get("report_component_focus_missing_metadata_distribution")
+    if not isinstance(missing, dict):
+        missing = {}
+        focus_diag["report_component_focus_missing_metadata_distribution"] = missing
+    for item in alignment.missing_metadata:
+        missing[item] = int(missing.get(item) or 0) + 1
+
+
+def _langgraph_official_report_evidence(ev: object) -> bool:
+    url = (ev.canonical_url or "").lower()
+    domain = (ev.domain or "").strip().lower().removeprefix("www.")
+    if not url or not domain:
+        return False
+    if domain == "github.com" and "langchain-ai/langgraph" in url:
+        return True
+    if "langgraph" in url and domain.endswith("langchain.com"):
+        return True
+    return False
+
+
+@dataclass(frozen=True)
+class _ReportComponentFocusEntity:
+    query_focus_terms: frozenset[str]
+    subject_terms: frozenset[str]
+    component_tokens: frozenset[str]
+    anchor_tokens: frozenset[str]
+    component_phrases: tuple[str, ...]
+    official_evidence: Callable[[object], bool]
+
+
+_LANGGRAPH_COMPONENT_TOKENS = frozenset(
+    {
+        "stategraph",
+        "messagegraph",
+        "graph",
+        "node",
+        "edge",
+        "state",
+        "checkpoint",
+        "checkpointer",
+        "reducer",
+        "command",
+        "interrupt",
+        "persistence",
+    }
+)
+_LANGGRAPH_COMPONENT_ANCHOR_TOKENS = frozenset(
+    {
+        "stategraph",
+        "messagegraph",
+        "checkpointer",
+        "checkpoint",
+        "reducer",
+        "command",
+        "interrupt",
+        "persistence",
+    }
+)
+
+_REPORT_COMPONENT_FOCUS_ENTITIES: dict[str, _ReportComponentFocusEntity] = {
+    "langgraph": _ReportComponentFocusEntity(
+        query_focus_terms=frozenset({"langgraph"}),
+        subject_terms=frozenset({"langgraph"}),
+        component_tokens=_LANGGRAPH_COMPONENT_TOKENS,
+        anchor_tokens=_LANGGRAPH_COMPONENT_ANCHOR_TOKENS,
+        component_phrases=("durable execution",),
+        official_evidence=_langgraph_official_report_evidence,
+    ),
+}
+
+
+def _resolve_report_component_focus_entity(
+    *, query: str, intent: object
+) -> _ReportComponentFocusEntity | None:
+    subject_terms = getattr(intent, "subject_terms", ()) or ()
+    lowered_subjects = {str(item).lower() for item in subject_terms if isinstance(item, str)}
+    for entity in _REPORT_COMPONENT_FOCUS_ENTITIES.values():
+        if lowered_subjects & entity.subject_terms:
+            return entity
+    required = _query_required_focus_terms(query)
+    for entity in _REPORT_COMPONENT_FOCUS_ENTITIES.values():
+        if required & entity.query_focus_terms:
+            return entity
+    return None
+
+
+def _technical_component_focus_alignment(
+    *,
+    statement: str,
+    query: str,
+    slot_ids: list[str],
+    support_evidence: list[ReportEvidenceItem],
+    claim_notes: dict[str, object] | None = None,
+) -> _ReportComponentFocusAlignment:
+    intent = classify_query_intent(query)
+    if intent.intent_name != "definition_mechanism":
+        return _ReportComponentFocusAlignment(False, failed_reason="intent_mismatch")
+    if not support_evidence:
+        return _ReportComponentFocusAlignment(
+            False,
+            failed_reason="missing_support_evidence",
+            missing_metadata=("support_evidence",),
+        )
+    slot_set = {item for item in slot_ids if isinstance(item, str) and item.strip()}
+    if not slot_set & _REPORT_COMPONENT_FOCUS_TECHNICAL_SLOTS:
+        return _ReportComponentFocusAlignment(
+            False,
+            failed_reason="slot_mismatch",
+            missing_metadata=("technical_slot",) if not slot_set else (),
+        )
+    entity = _resolve_report_component_focus_entity(query=query, intent=intent)
+    if entity is None:
+        return _ReportComponentFocusAlignment(False, failed_reason="entity_missing")
+    focus_evidence = _component_focus_evidence_sources(
+        support_evidence=support_evidence,
+        claim_notes=claim_notes or {},
+    )
+    source_roles = {
+        (item.source_role or "").strip()
+        for item in focus_evidence
+        if (item.source_role or "").strip()
+    }
+    if not source_roles:
+        return _ReportComponentFocusAlignment(
+            False,
+            failed_reason="source_role_missing",
+            missing_metadata=("source_role",),
+        )
+    if not source_roles & _REPORT_COMPONENT_FOCUS_OFFICIAL_SOURCE_ROLES:
+        return _ReportComponentFocusAlignment(False, failed_reason="official_source_role_missing")
+    if not any(
+        (item.canonical_url or "").strip() and (item.domain or "").strip()
+        for item in focus_evidence
+    ):
+        return _ReportComponentFocusAlignment(
+            False,
+            failed_reason="source_url_missing",
+            missing_metadata=("source_url", "source_domain"),
+        )
+    if not any(entity.official_evidence(item) for item in focus_evidence):
+        return _ReportComponentFocusAlignment(False, failed_reason="official_url_check_failed")
+    lowered = statement.lower()
+    tokens = set(_tokenize_focus(statement))
+    matched: list[str] = []
+    phrase_hit = False
+    for phrase in entity.component_phrases:
+        if phrase in lowered:
+            phrase_hit = True
+            matched.append(phrase)
+    weak_tokens = entity.component_tokens - entity.anchor_tokens
+    anchor_hits = sorted(tokens & entity.anchor_tokens)
+    matched.extend(anchor_hits)
+    weak_hits = tokens & weak_tokens
+    if not phrase_hit and not anchor_hits and len(weak_hits) < 2:
+        return _ReportComponentFocusAlignment(False, failed_reason="component_term_mismatch")
+    for tok in sorted(weak_hits):
+        if tok not in matched:
+            matched.append(tok)
+    matched = list(dict.fromkeys(matched))
+    if not matched:
+        return _ReportComponentFocusAlignment(False, failed_reason="component_term_mismatch")
+    return _ReportComponentFocusAlignment(True, terms=tuple(matched))
+
+
+def _component_focus_evidence_sources(
+    *,
+    support_evidence: list[ReportEvidenceItem],
+    claim_notes: dict[str, object],
+) -> list[object]:
+    sources: list[object] = list(support_evidence)
+    for source in _component_focus_evidence_from_claim_notes(claim_notes):
+        sources.append(source)
+    return sources
+
+
+def _component_focus_evidence_from_claim_notes(
+    notes: dict[str, object],
+) -> list[_ReportComponentFocusEvidence]:
+    rows: list[_ReportComponentFocusEvidence] = []
+
+    def add_from_values(
+        *,
+        canonical_url: object,
+        domain: object,
+        source_role: object,
+        source_intent: object = None,
+    ) -> None:
+        url_value = canonical_url if isinstance(canonical_url, str) else None
+        domain_value = domain if isinstance(domain, str) else None
+        role_value = source_role if isinstance(source_role, str) and source_role.strip() else None
+        if role_value is None and isinstance(source_intent, str) and source_intent.strip():
+            role_value = source_role_for_category(
+                source_intent,
+                canonical_url=url_value or "",
+                domain=domain_value,
+            )
+        if role_value is None and url_value and domain_value:
+            role_value = classify_source_intent(
+                canonical_url=url_value,
+                domain=domain_value,
+                title=None,
+                query=None,
+            ).source_role
+        if url_value or domain_value or role_value:
+            rows.append(
+                _ReportComponentFocusEvidence(
+                    canonical_url=url_value,
+                    domain=domain_value,
+                    source_role=role_value,
+                )
+            )
+
+    add_from_values(
+        canonical_url=notes.get("source_url"),
+        domain=notes.get("source_domain"),
+        source_role=notes.get("source_role"),
+        source_intent=notes.get("source_intent"),
+    )
+    evidence_candidate = notes.get("evidence_candidate")
+    if isinstance(evidence_candidate, dict):
+        add_from_values(
+            canonical_url=evidence_candidate.get("source_url"),
+            domain=evidence_candidate.get("source_domain"),
+            source_role=evidence_candidate.get("source_role"),
+            source_intent=evidence_candidate.get("source_intent"),
+        )
+        metadata = evidence_candidate.get("metadata")
+        if isinstance(metadata, dict):
+            add_from_values(
+                canonical_url=metadata.get("source_url"),
+                domain=metadata.get("source_domain"),
+                source_role=metadata.get("source_role"),
+                source_intent=evidence_candidate.get("source_intent")
+                or metadata.get("source_intent"),
+            )
+    verification = notes.get("verification")
+    if isinstance(verification, dict):
+        relations = verification.get("evidence_relations")
+        if isinstance(relations, list):
+            for row in relations:
+                if not isinstance(row, dict):
+                    continue
+                add_from_values(
+                    canonical_url=row.get("source_url"),
+                    domain=row.get("source_domain"),
+                    source_role=row.get("source_role"),
+                    source_intent=row.get("source_intent"),
+                )
+    return rows
+
+
 def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | None:
     claim_quality_score = _numeric_note(notes.get("claim_quality_score"))
     query_answer_score = _numeric_note(notes.get("query_answer_score"))
@@ -1100,16 +1592,25 @@ def _claim_score_from_notes(notes: dict[str, object]) -> ClaimCandidateScore | N
     rejected_reason = notes.get("rejected_reason")
     answer_role = notes.get("answer_role")
     answer_relevant = notes.get("answer_relevant")
-    
+
     from services.orchestrator.app.claims.drafting import CandidateTriageStatus
+
     triage_status_val = notes.get("triage_status")
     if isinstance(triage_status_val, str):
         try:
             triage_status = CandidateTriageStatus(triage_status_val)
         except ValueError:
-            triage_status = CandidateTriageStatus.REJECT_FATAL if rejected_reason else CandidateTriageStatus.ACCEPT_CANDIDATE
+            triage_status = (
+                CandidateTriageStatus.REJECT_FATAL
+                if rejected_reason
+                else CandidateTriageStatus.ACCEPT_CANDIDATE
+            )
     else:
-        triage_status = CandidateTriageStatus.REJECT_FATAL if rejected_reason else CandidateTriageStatus.ACCEPT_CANDIDATE
+        triage_status = (
+            CandidateTriageStatus.REJECT_FATAL
+            if rejected_reason
+            else CandidateTriageStatus.ACCEPT_CANDIDATE
+        )
 
     return ClaimCandidateScore(
         claim_category=claim_category if isinstance(claim_category, str) else "other",
@@ -1227,10 +1728,40 @@ def _build_report_diagnostics(
                 if claim.support_evidence
                 else None
             ),
+            "source_role": (
+                claim.support_evidence[0].source_role
+                if claim.support_evidence and claim.support_evidence[0].source_role
+                else "report_evidence_source"
+            ),
+            "normalized_from_readme": claim.normalized_from_readme,
             "support_level": claim.support_level or "strong",
         }
         for claim in claims
     ]
+    normalized_readme_claim_total = sum(
+        1 for claim in claims if claim.normalized_from_readme
+    )
+    normalized_readme_supported_total = sum(
+        1
+        for claim in claims
+        if claim.normalized_from_readme and claim.verification_status == "supported"
+    )
+    official_repository_report_input_total = sum(
+        1
+        for claim in claims
+        if claim.support_evidence
+        and str(claim.support_evidence[0].source_role or "").strip() == "official_repository"
+    )
+    raw_readme_sources_total = len(
+        {
+            s.source_document_id
+            for s in sources
+            if is_raw_github_readme_url(s.canonical_url)
+        }
+    )
+    readme_composite_relations = readme_composite_support_relation_count_from_report_claims(
+        claims
+    )
     accepted_candidate_ids: set[str] = set()
     for item in evidence_candidate_rows:
         evidence_candidate_id = item.get("evidence_candidate_id")
@@ -1241,25 +1772,82 @@ def _build_report_diagnostics(
         claims=claims,
         evidence_candidates=evidence_candidate_rows,
     )
+    slot_coverage_summary = build_slot_coverage_summary(
+        query,
+        evidence_candidates=evidence_candidate_rows,
+        claim_rows=claim_rows,
+    )
+    claims_by_answer_slot = _count_claim_rows_by_slot(claim_rows)
+    claims_by_source_role = _count_claim_rows_by_source_role(claim_rows)
+    weak_slots_without_claims = sorted(
+        {
+            str(row.get("slot_id"))
+            for row in slot_coverage_summary
+            if row.get("status") == "weak"
+            and int(row.get("supported_claim_count") or 0)
+            + int(row.get("weak_supported_claim_count") or 0)
+            <= 0
+        }
+    )
     return {
-        "slot_coverage_summary": build_slot_coverage_summary(
-            query,
-            evidence_candidates=evidence_candidate_rows,
-            claim_rows=claim_rows,
-        ),
+        "slot_coverage_summary": slot_coverage_summary,
         "evidence_yield_summary": summarize_evidence_yield(
             evidence_candidate_rows,
             accepted_candidate_ids=accepted_candidate_ids,
             query=query,
         ),
         "source_yield_summary": source_yield_summary,
-        "verification_summary": _report_verification_summary(claims),
+        "claims_by_answer_slot": claims_by_answer_slot,
+        "claims_by_source_role": claims_by_source_role,
+        "report_input_claims_by_slot": claims_by_answer_slot,
+        "report_input_claims_by_source_role": claims_by_source_role,
+        "weak_slots_without_claims": weak_slots_without_claims,
+        "source_roles_fetched_but_not_reported": sorted(
+            {
+                str(row.get("source_role"))
+                for row in source_yield_summary
+                if row.get("contribution_level") == "none"
+                and row.get("dropped_reasons")
+                and isinstance(row.get("source_role"), str)
+                and str(row.get("source_role")).strip()
+            }
+        ),
+        "normalized_from_readme_claim_count": normalized_readme_claim_total,
+        "repository_normalized_claim_count": normalized_readme_claim_total,
+        "repository_normalized_supported_claim_count": normalized_readme_supported_total,
+        "readme_composite_support_relation_count": readme_composite_relations,
+        "official_repository_report_input_count": official_repository_report_input_total,
+        "raw_readme_sources_in_report_count": raw_readme_sources_total,
+        "verification_summary": _report_verification_summary(
+            claims,
+            readme_composite_support_relation_count=readme_composite_relations,
+        ),
         "dropped_sources": [
             row
             for row in source_yield_summary
             if row.get("contribution_level") == "none" and row.get("dropped_reasons")
         ],
     }
+
+
+def _count_claim_rows_by_slot(claim_rows: list[dict[str, object]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in claim_rows:
+        for slot_id in row.get("slot_ids") or []:
+            if not isinstance(slot_id, str) or not slot_id.strip():
+                continue
+            counts[slot_id] = counts.get(slot_id, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _count_claim_rows_by_source_role(claim_rows: list[dict[str, object]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in claim_rows:
+        source_role = row.get("source_role")
+        if not isinstance(source_role, str) or not source_role.strip():
+            continue
+        counts[source_role] = counts.get(source_role, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _evidence_candidate_from_claim(
@@ -1278,6 +1866,7 @@ def _evidence_candidate_from_claim(
         "slot_ids": list(claim.slot_ids)
         or _slot_ids_from_claim_category(claim.claim_category, query=query),
         "source_intent": "report_evidence_source",
+        "source_role": evidence.source_role or "report_evidence_source",
         "excerpt": evidence.excerpt,
         "start_offset": evidence.start_offset,
         "end_offset": evidence.end_offset,
@@ -1290,6 +1879,8 @@ def _evidence_candidate_from_claim(
             "verification_status": claim.verification_status,
             "support_level": claim.support_level,
             "evidence_kind": claim.evidence_kind,
+            "source_role": evidence.source_role,
+            "source_intent": evidence.source_intent,
         },
     }
 
@@ -1324,7 +1915,10 @@ def _report_source_yield_summary(
                 "canonical_url": source.canonical_url,
                 "domain": source.domain,
                 "title": source.title,
-                "source_intent": "report_evidence_source",
+                "source_intent": source.source_intent or "report_evidence_source",
+                "source_role": source.source_role
+                or source.source_intent
+                or "report_evidence_source",
                 "attempted": True,
                 "fetched": True,
                 "parsed": True,
@@ -1340,7 +1934,11 @@ def _report_source_yield_summary(
     return rows
 
 
-def _report_verification_summary(claims: list[ReportClaimItem]) -> dict[str, object]:
+def _report_verification_summary(
+    claims: list[ReportClaimItem],
+    *,
+    readme_composite_support_relation_count: int = 0,
+) -> dict[str, object]:
     methods = sorted({claim.verifier_method for claim in claims if claim.verifier_method})
     return {
         "verifier_methods": methods,
@@ -1361,6 +1959,7 @@ def _report_verification_summary(claims: list[ReportClaimItem]) -> dict[str, obj
         "unsupported_claim_count": sum(
             1 for claim in claims if claim.verification_status == "unsupported"
         ),
+        "readme_composite_support_relation_count": int(readme_composite_support_relation_count),
         "limitations": [
             "report uses persisted verifier metadata",
             "weak support is not treated as a main-answer fact",

@@ -44,6 +44,13 @@ Response `200 OK`:
   "app_version": "0.1.0",
   "git_commit": "commit-hash-or-null",
   "git_commit_available": true,
+  "process_cwd": "/share/zhuzy/projects/DeepSearch",
+  "python_executable": "/path/to/python",
+  "python_argv": ["uvicorn", "services.orchestrator.app.main:app"],
+  "pythonpath": "/share/zhuzy/projects/DeepSearch",
+  "reporting_module_file": "/share/zhuzy/projects/DeepSearch/services/orchestrator/app/services/reporting.py",
+  "reporting_module_sha256": "sha256-hex-or-null",
+  "reporting_component_focus_diagnostics_enabled": true,
   "research_quality_diagnostics_fields": [
     "selected_sources",
     "attempted_sources",
@@ -255,7 +262,7 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 
 - `running_mode` and `dependencies`, when a pre-run plan or pipeline start event recorded the active search/index/LLM modes
 - planner status/source fields: `planner_status`, `planner_mode`, and `plan_source`, where planner failures use deterministic fallback instead of blocking the task
-- planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`; for LangGraph overview planner-LLM runs, deterministic owned-source domain corrections are also visible under `research_plan.source_preferences.secondary_preferred_domains` and `research_plan.source_preferences.planner_domain_corrections`
+- planner guardrail fields: `raw_planner_queries`, `final_search_queries`, `dropped_or_downweighted_planner_queries`, `planner_guardrail_warnings`, `intent_classification`, and `extracted_entity`; technical-explanation plans may include per-query `metadata.target_slots`, `metadata.query_matrix_slot`, `metadata.query_template`, and `metadata.source_role`; for LangGraph overview planner-LLM runs, deterministic owned-source domain corrections are also visible under `research_plan.source_preferences.secondary_preferred_domains` and `research_plan.source_preferences.planner_domain_corrections`
 - `search_result_count`
 - `search_queries`, including provider, per-query result counts, candidate counts, selected counts,
   rejected/noisy counts, fallback-used flags, unresponsive engines, authoritative-source resolver
@@ -286,10 +293,11 @@ When a task has generated a pre-run plan, has been queued, or has run through th
 - `answer_coverage` for definition, mechanism, privacy, and feature coverage
 - `answer_slots` and `report_slot_coverage`, derived from the query-specific deterministic answer-slot contract
 - `slot_coverage_summary`, with per-slot evidence candidate, accepted evidence, strong support, weak support, unsupported, source-count, and `covered|weak|missing` status fields
-- `source_yield_summary`, with per-source attempted/fetched/parsed/indexed flags, candidate/accepted/claim/rejected counts, contribution level, and dropped-source reasons
+- `source_yield_summary`, with per-source attempted/fetched/parsed/indexed flags, source intent, source role, candidate/accepted/claim/rejected counts, contribution level, target slot ids, and dropped-source reasons
 - `dropped_sources`, using the stable reason taxonomy `not_selected_low_priority`, `blocked_by_policy`, `fetch_failed`, `unsupported_content_type`, `parse_failed`, `low_chunk_quality`, `no_evidence_candidates`, `evidence_rejected`, `duplicate_or_near_duplicate`, `off_intent`, and `unknown`
 - `evidence_yield_summary`, with total, accepted, hard-rejected, and unselected candidate counts plus by-slot, by-source, and top rejection-reason summaries. Score-only filters such as low claim quality, low answer score, or weak answer relevance are treated as unselected/ranking signals instead of hard rejections.
 - `verification_summary`, including deterministic verifier method names, strong support counts, weak support counts, contradiction counts, and explicit limitations
+- `report_diagnostics`, when reporting has run, including report input claim counts by slot/source role plus query-focus and component-focus eligibility counters such as component rescues, focus mismatches by slot, failed component-focus predicates, and missing metadata distributions
 - `gap_analysis` and `gap_rounds`, when required answer slots were missing or weak after verification and the runner generated supplemental search queries before reporting
 - `supplemental_acquisition` with trigger status, reason, attempted sources, and skipped sources
 - `failure_diagnostics` with top rejected candidates, why required source intents were not attempted, backward-compatible about/Wikipedia details, unattempted high-quality sources, and next action when a stage fails with structured details
@@ -300,7 +308,7 @@ Compatibility contract:
 - `fetch_succeeded` and `fetch_failed` are cumulative over initial acquisition plus any `RESEARCHING_MORE` gap-round acquisition payloads; per-round details remain available in `gap_rounds`
 - legacy tasks that predate source-yield, evidence-yield, slot-coverage, or verification summaries still return stable empty values when another observability field is present
 - list fields default to `[]`: `selected_sources`, `attempted_sources`, `dropped_sources`, `source_yield_summary`, and `slot_coverage_summary`
-- object fields default to `{}`: `evidence_yield_summary` and `verification_summary`
+- object fields default to `{}`: `evidence_yield_summary`, `verification_summary`, and `report_diagnostics`
 - `REPORTING` stage report-manifest summaries do not replace the full pipeline `source_yield_summary` or `evidence_yield_summary`; task detail keeps the drafting/verification observability stable after the report artifact is generated
 - clients must continue to tolerate `progress.observability = null` for tasks with no pipeline/search/report events
 
@@ -744,6 +752,7 @@ Read contract:
   - ``response_cap_policy_distribution`` / ``response_cap_decision_distribution`` (bounded scan of recent ``fetch_attempt.trace_json``), ``trusted_docs_elevated_cap_fetch_attempts``, ``fetch_batch_success_target_continue_total`` (sum of per-batch ``success_target_continue_count`` from ``acquisition.fetch_batch_summary`` events)
   - ``browser_fallback_task_metrics`` aggregates recent ``acquisition.browser_fallback`` ``task_event`` payloads (considered / attempted / succeeded / failed / skipped-after-consideration)
   - ``body_too_large`` groups ``body_too_large`` attempts by ``candidate_url.domain`` and snapshot ``mime_type`` (``unknown`` when no snapshot row), plus configured ``max_response_bytes``
+  - ``official_repository_readme_*`` counters (narrow: ``raw.githubusercontent.com`` README rows with ``source_intent=official_repository_readme`` and ``official_repository_readme_derivative``) cover candidate → triage/queue → ``fetch_job`` / ``fetch_attempt`` / ``content_snapshot`` / ``source_document`` stages, ``official_repository_readme_not_selected_reason_distribution``, ``official_repository_readme_parse_rejection_reason_distribution`` (from recent parse ``task_event`` payloads when present), plus ``official_repository_readme_loose_derivative_flag_count`` for rows that set the derivative flag without passing the narrow URL gate
 - ``parser_*_distribution`` fields are **not** fully ledger-backed: they are reconstructed from the most recent ``task_event`` payloads (see ``diagnostics_meta.parser_distributions`` for scan limit and a proposed durable parse-outcome model)
 - safe read-only endpoint; does not mutate ledger rows
 

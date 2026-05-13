@@ -5,6 +5,7 @@ from services.orchestrator.app.research_quality.answer_slots import (
     claim_categories_for_slots,
     missing_answer_slots,
     slot_ids_for_claim_category,
+    technical_slot_ids_for_text,
 )
 from services.orchestrator.app.research_quality.evidence import (
     CONTRIBUTION_LEVELS,
@@ -48,6 +49,7 @@ from services.orchestrator.app.research_quality.source_intent import (
     classify_source_intent,
     source_intent_metadata,
     source_intent_priority,
+    source_role_for_category,
 )
 from services.orchestrator.app.research_quality.source_judge import (
     SOURCE_JUDGE_PROMPT_VERSION,
@@ -95,5 +97,7 @@ __all__ = [
     "slot_ids_for_claim_category",
     "source_intent_metadata",
     "source_intent_priority",
+    "source_role_for_category",
     "summarize_evidence_yield",
+    "technical_slot_ids_for_text",
 ]

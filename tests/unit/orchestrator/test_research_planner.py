@@ -89,10 +89,46 @@ def test_noop_planner_returns_valid_research_plan() -> None:
     )
 
     assert plan.planner_mode == "noop"
-    assert plan.intent == "definition_how_it_works"
+    assert plan.intent == "technical_explanation"
     assert any("What is SearXNG" in item for item in plan.subquestions)
-    assert any("privacy" in item.lower() for item in plan.subquestions)
-    assert any("upstream search engines" in item.query_text for item in plan.search_queries)
+    assert any("core abstractions" in item.lower() for item in plan.subquestions)
+    assert any("execution model" in item.query_text for item in plan.search_queries)
+
+
+def test_langgraph_technical_explanation_plan_uses_slot_query_matrix() -> None:
+    plan = build_default_research_plan(
+        query="What is LangGraph and how does it work?",
+        max_subquestions=5,
+        max_search_queries=8,
+    )
+
+    slot_ids = [slot["slot_id"] for slot in plan.answer_slots]
+    query_texts = [item.query_text for item in plan.search_queries]
+
+    assert plan.intent == "technical_explanation"
+    assert len(plan.search_queries) == 8
+    assert slot_ids == [
+        "definition",
+        "motivation_problem",
+        "core_abstractions",
+        "architecture",
+        "execution_model",
+        "workflow_lifecycle",
+        "key_features",
+        "examples_use_cases",
+        "limitations",
+        "comparison_positioning",
+        "official_sources",
+    ]
+    assert any("site:docs.langchain.com" in text for text in query_texts)
+    assert any("site:reference.langchain.com" in text for text in query_texts)
+    assert any("github langchain-ai langgraph README" in text for text in query_texts)
+    assert {
+        "official_docs",
+        "official_reference",
+        "official_repository",
+    } <= {str(item.metadata.get("source_role")) for item in plan.search_queries}
+    assert plan.source_preferences["source_role_quotas"]["generic_article"] == 0
 
 
 def test_planner_json_parsing_and_validation() -> None:
@@ -186,7 +222,7 @@ def test_planner_accepts_fenced_json_after_extraction() -> None:
         constraints={},
     )
 
-    assert plan.intent == "definition_how_it_works"
+    assert plan.intent == "technical_explanation"
     assert plan.search_queries[0].query_text == "What is SearXNG and how does it work?"
     assert plan.planner_diagnostics["json_extraction_method"] == "single_fenced_json_object"
     assert plan.planner_diagnostics["schema_validated"] is True
@@ -276,8 +312,9 @@ def test_optional_planner_disabled_uses_deterministic_fallback() -> None:
     assert result.failure is None
     assert result.plan.planner_mode == "deterministic"
     assert "No LLM planner is active; deterministic planner used." in result.warnings
+    assert any("site:docs.langchain.com" in item.query_text for item in result.plan.search_queries)
     assert any(
-        "state graph nodes edges workflow" in item.query_text for item in result.plan.search_queries
+        "StateGraph graph state reference" in item.query_text for item in result.plan.search_queries
     )
 
 
@@ -493,7 +530,7 @@ def test_optional_planner_generated_queries_are_bounded_and_deduplicated() -> No
     assert query_texts == ["DeepSearch planner behavior", "DeepSearch planner failures"]
 
 
-def test_searxng_query_plan_contains_definition_mechanism_privacy() -> None:
+def test_searxng_query_plan_contains_technical_explanation_slots() -> None:
     plan = _planner(NoopLLMProvider()).plan(
         task_id=uuid4(),
         query="What is SearXNG and how does it work?",
@@ -502,8 +539,9 @@ def test_searxng_query_plan_contains_definition_mechanism_privacy() -> None:
 
     combined = " ".join([*plan.subquestions, *(item.query_text for item in plan.search_queries)])
     assert "What is SearXNG" in combined
-    assert "upstream search engines" in combined
-    assert "privacy" in combined.lower()
+    assert "core abstractions" in combined
+    assert "execution model" in combined
+    assert "limitations comparison" in combined
 
 
 def test_non_searxng_technical_plan_uses_generic_framework_mechanism_terms() -> None:
@@ -514,7 +552,8 @@ def test_non_searxng_technical_plan_uses_generic_framework_mechanism_terms() -> 
     )
 
     combined = " ".join(item.query_text for item in plan.search_queries)
-    assert "how it works state graph nodes edges workflow" in combined
+    assert "site:docs.langchain.com concepts state graph nodes edges" in combined
+    assert "StateGraph graph state reference" in combined
     assert "metasearch engine" not in combined
     assert "human-in-the-loop" in combined
 
@@ -559,15 +598,12 @@ def test_llm_langgraph_plan_preserves_owned_source_guardrail_queries() -> None:
     assert result.planner_status == "success"
     query_texts = [item.query_text for item in result.plan.search_queries]
     assert "What is LangGraph and how does it work?" in query_texts
-    assert "LangGraph official documentation" in query_texts
-    assert "LangGraph site:docs.langchain.com how it works" in query_texts
-    assert "LangGraph site:reference.langchain.com how it works" in query_texts
-    assert "LangGraph site:www.langchain.com/langgraph how it works" in query_texts
-    assert "LangGraph github langchain-ai langgraph" in query_texts
-    assert "LangGraph how it works state graph nodes edges workflow" in query_texts
+    assert "LangGraph official documentation overview" in query_texts
+    assert "LangGraph site:docs.langchain.com concepts state graph nodes edges" in query_texts
+    assert "LangGraph site:reference.langchain.com StateGraph graph state reference" in query_texts
     assert any(
         item["query_source"] == "guardrail_query"
-        and item["query_text"] == "LangGraph github langchain-ai langgraph"
+        and item["metadata"]["source_role"] == "official_docs"
         for item in result.plan.final_search_queries
     )
 
@@ -656,9 +692,9 @@ def test_llm_langgraph_broad_queries_are_downweighted_after_mechanism_guardrails
     )
 
     query_texts = [item.query_text for item in plan.search_queries]
-    assert query_texts.index("LangGraph how it works state graph nodes edges workflow") < (
-        query_texts.index("LangGraph how it works tutorial")
-    )
+    assert query_texts.index(
+        "LangGraph site:docs.langchain.com concepts state graph nodes edges"
+    ) < (query_texts.index("LangGraph how it works tutorial"))
     reasons = {
         item["query_text"]: item["downrank_reason"]
         for item in plan.dropped_or_downweighted_planner_queries
@@ -672,9 +708,8 @@ def test_llm_langgraph_broad_queries_are_downweighted_after_mechanism_guardrails
         reasons["LangGraph how it works tutorial"]
         == "generic_tutorial_query_downweighted_for_overview"
     )
-    assert (
-        reasons["LangGraph GitHub repository"]
-        == "broad_repository_query_supplemented_by_upstream_repo"
+    assert reasons["LangGraph GitHub repository"] == (
+        "broad_repository_query_supplemented_by_upstream_repo"
     )
 
 
@@ -760,18 +795,16 @@ def test_searxng_what_how_search_queries_include_baseline_guardrails() -> None:
     query_texts = [item.query_text for item in plan.search_queries]
     assert query_texts[:4] == [
         "What is SearXNG and how does it work?",
-        "SearXNG official documentation",
-        "SearXNG about how does it work",
-        "SearXNG Wikipedia",
+        "SearXNG official documentation overview",
+        "SearXNG core concepts architecture official documentation",
+        "SearXNG API reference core concepts",
     ]
     assert len(query_texts) <= 8
-    assert query_texts.index("SearXNG privacy") < query_texts.index(
-        "SearXNG how it works architecture"
+    assert any(
+        item["query_text"] == "SearXNG how it works architecture" and item["action"] == "dropped"
+        for item in plan.dropped_or_downweighted_planner_queries
     )
     assert plan.search_queries[0].query_source == "original_user_query"
     assert plan.search_queries[1].query_source == "guardrail_query"
     assert plan.final_search_queries[0]["query_text"] == "What is SearXNG and how does it work?"
-    assert any(
-        item["downrank_reason"] == "architecture_or_admin_query_downweighted_for_overview"
-        for item in plan.dropped_or_downweighted_planner_queries
-    )
+    assert plan.source_preferences["source_role_quotas"]["official_docs"] == 3

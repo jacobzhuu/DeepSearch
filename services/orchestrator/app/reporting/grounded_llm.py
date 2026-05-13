@@ -135,11 +135,13 @@ def _system_prompt(report_language: str) -> str:
             "Use Simplified Chinese for all user-visible report prose.\n"
             "你的任务是生成一份高质量、详尽的研究报告，字数要求在 3000 到 5000 字之间。\n"
             "你必须先回答原始用户问题 (original_user_question)。\n"
-            "章节顺序应尽可能参考 planner_research_plan.answer_outline 或 subquestions，并做必要的展开和深入分析。\n"
+            "章节顺序应尽可能参考 planner_research_plan.answer_outline 或 subquestions，"
+            "并做必要的展开和深入分析。\n"
             "【严禁幻觉】verified_claims 和引用摘录是唯一的可靠事实来源。\n"
             "planner_research_plan 仅用于构建结构和预期，不能作为事实依据。\n"
             "如果某个规划的子问题缺乏已验证的 claim，请将其列为“覆盖缺口”或“未解决项”。\n"
-            "不要机械地列出 claim。将相关的 claim 组合成连贯、逻辑严密、细节丰富的长段落和深度分析。\n"
+            "不要机械地列出 claim。将相关的 claim 组合成连贯、逻辑严密、"
+            "细节丰富的长段落和深度分析。\n"
             "每个章节应以简明扼要的结论或范围说明开始，随后进行详细的论述。\n"
             "每个事实段落必须携带有效的 claim_ids 和 claim_evidence_ids。\n"
             "弱支持/混合/不支持/反驳的 claim 不能作为既定事实，仅能用于讨论不确定性。\n"
@@ -170,7 +172,8 @@ def _system_prompt(report_language: str) -> str:
 
     return (
         "You are an expert grounded research report writer for an OSINT research ledger.\n"
-        "Your task is to generate a high-quality, comprehensive research report between 3000 and 5000 words in length.\n"
+        "Your task is to generate a high-quality, comprehensive research report between "
+        "3000 and 5000 words in length.\n"
         "You must answer the original_user_question first.\n"
         "Section order should follow planner_research_plan.answer_outline or subquestions "
         "where possible, expanding and providing deep analysis for each point.\n"
@@ -221,6 +224,7 @@ def _build_grounding_bundle(
     original_user_question: str | None = None,
     research_plan: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+    slot_coverage_summary = _slot_coverage_rows(claims, research_question)
     return {
         "task_id": str(task_id),
         "revision_no": revision_no,
@@ -243,6 +247,9 @@ def _build_grounding_bundle(
             }
             for slot in answer_slots_for_query(research_question)
         ],
+        "slot_coverage_summary": slot_coverage_summary,
+        "claims_by_slot": _claims_by_slot(claims),
+        "source_role_diversity": _source_role_distribution(sources=sources, claims=claims),
         "verified_claims": [_serialize_claim(claim) for claim in claims],
         "sources": [
             {
@@ -250,6 +257,8 @@ def _build_grounding_bundle(
                 "domain": source.domain,
                 "title": source.title,
                 "canonical_url": source.canonical_url,
+                "source_role": source.source_role,
+                "source_intent": source.source_intent,
             }
             for source in sources
         ],
@@ -283,6 +292,8 @@ def _serialize_evidence(evidence: ReportEvidenceItem) -> dict[str, object]:
         "score": evidence.score,
         "canonical_url": evidence.canonical_url,
         "domain": evidence.domain,
+        "source_role": evidence.source_role,
+        "source_intent": evidence.source_intent,
         "chunk_no": evidence.chunk_no,
         "start_offset": evidence.start_offset,
         "end_offset": evidence.end_offset,
@@ -290,6 +301,36 @@ def _serialize_evidence(evidence: ReportEvidenceItem) -> dict[str, object]:
         "relation_detail": evidence.relation_detail,
         "support_level": evidence.support_level,
         "reasons": list(evidence.reasons),
+    }
+
+
+def _claims_by_slot(claims: list[ReportClaimItem]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for claim in claims:
+        for slot_id in claim.slot_ids:
+            grouped.setdefault(slot_id, []).append(str(claim.claim_id))
+    return {slot_id: claim_ids for slot_id, claim_ids in sorted(grouped.items())}
+
+
+def _source_role_distribution(
+    *,
+    sources: list[ReportSourceItem],
+    claims: list[ReportClaimItem],
+) -> dict[str, object]:
+    source_roles: dict[str, int] = {}
+    for source in sources:
+        role = source.source_role or source.source_intent or "unknown"
+        source_roles[role] = source_roles.get(role, 0) + 1
+
+    evidence_roles: dict[str, int] = {}
+    for claim in claims:
+        for evidence in [*claim.support_evidence, *claim.contradict_evidence]:
+            role = evidence.source_role or evidence.source_intent or "unknown"
+            evidence_roles[role] = evidence_roles.get(role, 0) + 1
+
+    return {
+        "source_roles": dict(sorted(source_roles.items())),
+        "evidence_roles": dict(sorted(evidence_roles.items())),
     }
 
 

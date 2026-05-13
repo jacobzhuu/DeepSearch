@@ -58,13 +58,13 @@ def test_evidence_yield_and_slot_coverage_summaries_are_structured() -> None:
         {
             "evidence_candidate_id": "ec_2",
             "source_document_id": "source-1",
-            "slot_ids": ["mechanism"],
+            "slot_ids": ["core_abstractions"],
             "rejection_reasons": [],
         },
         {
             "evidence_candidate_id": "ec_3",
             "source_document_id": "source-1",
-            "slot_ids": ["privacy"],
+            "slot_ids": ["limitations"],
             "rejection_reasons": ["off_intent"],
         },
     ]
@@ -94,9 +94,9 @@ def test_evidence_yield_and_slot_coverage_summaries_are_structured() -> None:
     assert evidence_summary["rejected_candidates"] == 1
     assert evidence_summary["top_rejection_reasons"] == [{"reason": "off_intent", "count": 1}]
     definition = next(row for row in slot_summary if row["slot_id"] == "definition")
-    mechanism = next(row for row in slot_summary if row["slot_id"] == "mechanism")
+    core_abs = next(row for row in slot_summary if row["slot_id"] == "core_abstractions")
     assert definition["status"] == "covered"
-    assert mechanism["status"] == "weak"
+    assert core_abs["status"] == "weak"
 
 
 def test_source_yield_summary_uses_taxonomy_and_contribution_levels() -> None:
@@ -117,6 +117,7 @@ def test_source_yield_summary_uses_taxonomy_and_contribution_levels() -> None:
         source_document_id="source-1",
         url="https://example.com",
         source_intent="generic_article",
+        source_role="secondary",
         attempted=True,
         fetched=True,
         parsed=True,

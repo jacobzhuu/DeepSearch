@@ -20,6 +20,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+browser = [
+  "playwright==1.49.1",
+]
 dev = [
   "black==25.1.0",
   "mypy==1.15.0",

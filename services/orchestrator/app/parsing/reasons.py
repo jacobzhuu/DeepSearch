@@ -10,6 +10,8 @@ class ParseResultReason(StrEnum):
     UNSUPPORTED_MIME_TYPE = "unsupported_mime_type"
     EMPTY_EXTRACTED_TEXT = "empty_extracted_text"
     PARSE_ERROR = "parse_error"
+    ACQUISITION_STATIC_HTML_PARSE_HELD = "acquisition_static_html_parse_held"
+    NO_VALID_CHUNKS = "no_valid_chunks"
 
 
 PARSE_RESULT_REASON_VALUES = tuple(reason.value for reason in ParseResultReason)

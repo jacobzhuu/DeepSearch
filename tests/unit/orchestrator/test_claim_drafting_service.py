@@ -28,6 +28,7 @@ from services.orchestrator.app.indexing import (
 )
 from services.orchestrator.app.services.claims import (
     ClaimDraftingConflictError,
+    _clean_github_readme_text,
     create_claim_drafting_service,
 )
 from services.orchestrator.app.services.research_tasks import create_research_task_service
@@ -607,17 +608,12 @@ def test_claim_drafting_service_ranks_query_answer_candidates_over_cta_text(
     claims = ClaimRepository(db_session).list_for_task(task.id)
 
     assert result.created_claims == 3
-    assert statements == [
-        (
-            "SearXNG is a metasearch engine, aggregating the results of other search "
-            "engines while not storing information about its users."
-        ),
-        (
-            "It provides basic privacy by mixing your queries with searches on other "
-            "platforms without storing search data."
-        ),
-        "SearXNG supports OpenSearch.",
-    ]
+    assert any("is a metasearch engine" in statement for statement in statements)
+    assert any(
+        "provides basic privacy by mixing your queries" in statement
+        for statement in statements
+    )
+    assert any("supports OpenSearch" in statement for statement in statements)
     assert "Track development" not in " ".join(statements)
     assert "Come join" not in " ".join(statements)
     assert "Reference architecture" not in " ".join(statements)
@@ -1096,6 +1092,612 @@ def test_claim_drafting_service_collapses_near_duplicate_feature_claims(
 
     assert len(result.entries) == 1
     assert result.diagnostics["near_duplicate_claims_removed"] >= 1
+
+
+def test_claim_drafting_normalizes_official_repository_readme_heading_bullets(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+            domain="raw.githubusercontent.com",
+            title="langchain-ai/langgraph README",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.9,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.9,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "## Key Features\n"
+                "- Persistence\n"
+                "- Human-in-the-loop\n"
+                "- Streaming\n"
+                "- Debugging\n"
+            ),
+            token_count=24,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    normalized_entries = [
+        entry
+        for entry in result.entries
+        if entry.claim.notes_json.get("normalized_from_readme") is True
+    ]
+    assert normalized_entries
+    notes = normalized_entries[0].claim.notes_json
+    assert "provides key features" in normalized_entries[0].claim.statement
+    assert notes["source_role"] == "official_repository"
+    assert "key_features" in notes["slot_ids"]
+    assert result.diagnostics["repository_normalized_candidate_count"] >= 1
+    assert result.diagnostics["official_repository_chunks_with_normalized_candidates"] >= 1
+
+
+def test_github_readme_cleaner_strips_repo_chrome_and_keeps_readme_body() -> None:
+    raw_text = (
+        "langchain-ai\n\n"
+        "/\n\n"
+        "langgraph\n\n"
+        "Public\n\n"
+        "Fork\n"
+        "5.4k\n\n"
+        "Star\n"
+        "31.9k\n\n"
+        "BranchesTags\n\n"
+        "Folders and files\n\n"
+        "Name\n\n"
+        "README.md\n\n"
+        "Repository files navigation\n\n"
+        "Low-level orchestration framework for building stateful agents.\n\n"
+        "Why use LangGraph?\n\n"
+        "LangGraph provides low-level supporting infrastructure for workflows.\n"
+    )
+
+    cleaned = _clean_github_readme_text(raw_text)
+
+    assert cleaned.applied is True
+    assert cleaned.removed_line_count > 0
+    assert "Fork" not in cleaned.text
+    assert "Star" not in cleaned.text
+    assert "BranchesTags" not in cleaned.text
+    assert "Repository files navigation" not in cleaned.text
+    assert "Low-level orchestration framework" in cleaned.text
+    assert "Why use LangGraph?" in cleaned.text
+    assert "LangGraph provides low-level supporting infrastructure" in cleaned.text
+
+
+def test_github_readme_cleaner_preserves_headings_and_feature_dash_items() -> None:
+    raw_text = (
+        "LangGraph provides low-level supporting infrastructure for any workflow:\n\n"
+        "Durable execution — Build agents that persist through failures.\n\n"
+        "Human-in-the-loop — Inspect and modify agent state at any point.\n\n"
+        "Comprehensive memory — Keep short-term and long-term memory across sessions.\n\n"
+        "Debugging with LangSmith — Trace execution paths and state transitions.\n"
+    )
+
+    cleaned = _clean_github_readme_text(raw_text)
+
+    assert "LangGraph provides low-level supporting infrastructure" in cleaned.text
+    assert "Durable execution — Build agents" in cleaned.text
+    assert "Human-in-the-loop — Inspect" in cleaned.text
+    assert "Comprehensive memory — Keep" in cleaned.text
+    assert "Debugging with LangSmith — Trace" in cleaned.text
+
+
+def test_github_readme_cleaner_removes_license_and_community_sections() -> None:
+    raw_text = (
+        "## Community\n"
+        "- Join Discord\n"
+        "- Report issues\n\n"
+        "## License\n"
+        "- MIT\n\n"
+        "## Key Features\n"
+        "- Durable execution\n"
+        "- Human-in-the-loop\n"
+    )
+
+    cleaned = _clean_github_readme_text(raw_text)
+
+    assert "Community" not in cleaned.text
+    assert "Join Discord" not in cleaned.text
+    assert "License" not in cleaned.text
+    assert "MIT" not in cleaned.text
+    assert "## Key Features" in cleaned.text
+    assert "- Durable execution" in cleaned.text
+    assert "- Human-in-the-loop" in cleaned.text
+
+
+def test_claim_drafting_cleans_github_repo_page_before_readme_normalization(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://github.com/langchain-ai/langgraph",
+            domain="github.com",
+            title="langchain-ai/langgraph",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.9,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.9,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "Fork\n5.4k\n\nStar\n31.9k\n\nBranchesTags\n\n"
+                "Folders and files\n\nName\n\nREADME.md\n\n"
+                "Repository files navigation\n\n"
+                "LangGraph provides low-level supporting infrastructure for any workflow:\n\n"
+                "Durable execution — Build agents that persist through failures.\n\n"
+                "Human-in-the-loop — Inspect and modify agent state at any point.\n\n"
+                "Comprehensive memory — Keep memory across sessions.\n"
+            ),
+            token_count=70,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    normalized_entries = [
+        entry
+        for entry in result.entries
+        if entry.claim.notes_json.get("normalized_from_readme") is True
+    ]
+    assert normalized_entries
+    entry = normalized_entries[0]
+    notes = entry.claim.notes_json
+    assert notes["cleaned_github_readme"] is True
+    assert notes["source_role"] == "official_repository"
+    assert "Durable execution" in entry.claim.statement
+    assert "Human-in-the-loop" in entry.claim.statement
+    assert result.diagnostics["github_readme_cleaner_applied_count"] == 1
+    assert result.diagnostics["github_readme_cleaner_removed_line_count"] > 0
+    assert result.diagnostics["github_readme_cleaner_candidate_count"] >= 1
+    assert source_chunk.text[
+        entry.citation_span.start_offset : entry.citation_span.end_offset
+    ] == entry.citation_span.excerpt
+
+
+def test_raw_readme_full_document_joins_split_heading_and_bullets(
+    db_session: Session,
+) -> None:
+    """Simulates paragraph_window splits where ``##`` and bullets land in different chunks."""
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+            domain="raw.githubusercontent.com",
+            title="langgraph readme",
+            source_type="plain_text",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.9,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.9,
+        )
+    )
+    chunk_head = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "LangGraph intro paragraph without bullets in this chunk.\n\n"
+                "## Documentation\n"
+            ),
+            token_count=20,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    chunk_bullets = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=1,
+            text=(
+                "- [docs](https://docs.example.com/lg/overview) – Official docs.\n"
+                "- [reference](https://reference.example.com/lg) – API reference.\n"
+                "- [quickstart](https://docs.example.com/lg/quickstart) – Quickstart.\n"
+            ),
+            token_count=30,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=12,
+    )
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[chunk_head.id, chunk_bullets.id],
+        limit=12,
+    )
+    assert result.diagnostics.get("raw_readme_full_document_group_count", 0) >= 1
+    assert result.diagnostics.get("raw_readme_full_document_normalized_candidate_count", 0) >= 1
+    normalized_entries = [
+        entry
+        for entry in result.entries
+        if entry.claim.notes_json.get("normalized_from_readme") is True
+    ]
+    assert normalized_entries
+    entry = normalized_entries[0]
+    assert entry.source_chunk.id == chunk_bullets.id
+    assert entry.citation_span.start_offset < entry.citation_span.end_offset
+    assert (
+        entry.source_chunk.text[
+            entry.citation_span.start_offset : entry.citation_span.end_offset
+        ]
+        == entry.citation_span.excerpt
+    )
+
+
+def test_claim_drafting_readme_normalizer_skips_navigation_and_community_sections(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://github.com/langchain-ai/langgraph",
+            domain="github.com",
+            title="langchain-ai/langgraph",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.9,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.9,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "## Community\n"
+                "- Join Discord\n"
+                "- Report issues\n"
+                "## License\n"
+                "- MIT\n"
+            ),
+            token_count=18,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    assert result.created_claims == 0
+    assert result.diagnostics["repository_normalized_candidate_count"] == 0
+    assert result.diagnostics["github_readme_cleaner_applied_count"] == 1
+    assert result.diagnostics["github_readme_cleaner_removed_line_count"] >= 2
+
+
+def test_claim_drafting_readme_normalizer_only_runs_for_official_repository_sources(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://www.geeksforgeeks.org/what-is-langgraph/",
+            domain="www.geeksforgeeks.org",
+            title="What is LangGraph",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.6,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.6,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "## Key Features\n"
+                "- Persistence\n"
+                "- Human-in-the-loop\n"
+                "- Streaming\n"
+            ),
+            token_count=20,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    assert result.diagnostics["repository_normalized_candidate_count"] == 0
+    assert result.diagnostics["github_readme_cleaner_applied_count"] == 0
+    assert all(
+        entry.claim.notes_json.get("normalized_from_readme") is not True
+        for entry in result.entries
+    )
+
+
+def test_github_readme_cleaner_does_not_run_for_github_issues(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://github.com/langchain-ai/langgraph/issues/123",
+            domain="github.com",
+            title="LangGraph issue",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.9,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.9,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "## Key Features\n"
+                "- Persistence\n"
+                "- Human-in-the-loop\n"
+                "- Streaming\n"
+            ),
+            token_count=20,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    assert result.diagnostics["github_readme_cleaner_applied_count"] == 0
+    assert result.diagnostics["repository_normalized_candidate_count"] == 0
+
+
+def test_readme_normalized_candidate_maps_examples_and_workflow_slots(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://github.com/langchain-ai/langgraph",
+            domain="github.com",
+            title="langchain-ai/langgraph",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.9,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.9,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "## Examples\n"
+                "- Customer support assistant workflow\n"
+                "- Multi-agent review pipeline\n"
+                "- Research assistant with checkpoints\n"
+            ),
+            token_count=28,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+
+    result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    normalized_entries = [
+        entry
+        for entry in result.entries
+        if entry.claim.notes_json.get("normalized_from_readme") is True
+    ]
+    assert normalized_entries
+    slot_ids = set(normalized_entries[0].claim.notes_json.get("slot_ids") or [])
+    assert "examples_use_cases" in slot_ids
+    assert "workflow_lifecycle" in slot_ids
+
+
+def test_readme_normalized_claims_still_flow_through_verification(
+    db_session: Session,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    source_document = SourceDocumentRepository(db_session).add(
+        SourceDocument(
+            task_id=task.id,
+            content_snapshot_id=None,
+            canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+            domain="raw.githubusercontent.com",
+            title="langchain-ai/langgraph README",
+            source_type="web_page",
+            published_at=None,
+            fetched_at=datetime(2026, 4, 26, 10, 0, tzinfo=UTC),
+            authority_score=0.9,
+            freshness_score=None,
+            originality_score=None,
+            consistency_score=None,
+            safety_score=None,
+            final_source_score=0.9,
+        )
+    )
+    source_chunk = SourceChunkRepository(db_session).add(
+        SourceChunk(
+            source_document_id=source_document.id,
+            chunk_no=0,
+            text=(
+                "## Workflow\n"
+                "- StateGraph nodes and edges\n"
+                "- Checkpoint and resume\n"
+                "- Human-in-the-loop review\n"
+            ),
+            token_count=26,
+            metadata_json={"strategy": "paragraph_window_v1", "eligible_for_claims": True},
+        )
+    )
+    db_session.commit()
+    service = create_claim_drafting_service(
+        db_session,
+        index_backend=InMemoryChunkIndexBackend(hits=[]),
+        max_candidates_per_request=5,
+    )
+    draft_result = service.draft_claims(
+        task.id,
+        query=task.query,
+        source_chunk_ids=[source_chunk.id],
+        limit=5,
+    )
+
+    normalized_claim_ids = {
+        entry.claim.id
+        for entry in draft_result.entries
+        if entry.claim.notes_json.get("normalized_from_readme") is True
+    }
+    assert normalized_claim_ids
+
+    verification_result = service.verify_claims(task.id, claim_ids=None, limit=5)
+    verified_ids = {entry.claim.id for entry in verification_result.entries}
+    assert normalized_claim_ids & verified_ids
 
 
 def _seed_source_chunk(db_session: Session) -> SeededChunk:

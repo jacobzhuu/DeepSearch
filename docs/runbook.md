@@ -92,6 +92,10 @@ The current v1 path supports:
 
 ### Search and acquisition
 
+Ledger-backed funnel diagnostics (search → candidate → snapshot → document → chunk rates, fetch
+error codes, domain failure histogram, and best-effort parse decision summaries from recent task
+events) are available at `GET /api/v1/research/tasks/{task_id}/acquisition/funnel-metrics`.
+
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `SEARCH_PROVIDER` | `searxng` for real search or `smoke` for explicit development smoke mode | `searxng` |
@@ -106,6 +110,10 @@ The current v1 path supports:
 | `ACQUISITION_TIMEOUT_SECONDS` | HTTP fetch timeout | `10` |
 | `ACQUISITION_MAX_REDIRECTS` | Redirect cap | `3` |
 | `ACQUISITION_MAX_RESPONSE_BYTES` | Response byte cap | `1048576` |
+| `ACQUISITION_TRUSTED_DOCS_DOMAINS` | Comma-separated hostnames (post-SSRF) allowed a higher static HTTP body cap when `ACQUISITION_TRUSTED_DOCS_MAX_RESPONSE_BYTES` exceeds the global cap | empty |
+| `ACQUISITION_TRUSTED_DOCS_MAX_RESPONSE_BYTES` | Optional elevated cap for allowlisted hosts only; must be greater than `ACQUISITION_MAX_RESPONSE_BYTES` to take effect | unset |
+| `ACQUISITION_MIN_SUCCESSFUL_AUTHORITATIVE_SNAPSHOTS` | When >0, delays stopping on `target_successful_snapshots` until at least this many authoritative snapshots exist while budget and authoritative candidates remain | `0` |
+| `ACQUISITION_DEFER_SUCCESS_TARGET_FOR_HIGH_PRIORITY` | When true, delays stopping on `target_successful_snapshots` while unattempted triage `must_fetch`, authoritative, or doc-lane candidates remain | `false` |
 | `ACQUISITION_MAX_CANDIDATES_PER_REQUEST` | Max candidates per `POST /fetches` | `5` |
 | `ACQUISITION_TARGET_SUCCESSFUL_SNAPSHOTS` | Target successful snapshots before ordinary acquisition may stop | `2` |
 | `ACQUISITION_MIN_ANSWER_SOURCES` | Minimum answer-source target for planner-enabled overview runs | `3` |
@@ -130,6 +138,11 @@ The current v1 path supports:
 | `RESEARCH_WORKER_BATCH_SIZE` | Queued tasks processed per worker poll | `1` |
 | `ACQUISITION_USER_AGENT` | Acquisition user agent | `deepresearch-orchestrator/0.1` |
 | `ACQUISITION_TRUST_ENV_PROXY` | Let HTTP acquisition inherit `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` from the process environment | `false` |
+| `BROWSER_FETCH_BACKEND` | Optional rendered fetch: `none` (default), `playwright` (headless Chromium fallback after static HTTP when `should_attempt_browser_fallback` is true), or reserved `mcp` | `none` |
+| `BROWSER_FETCH_TIMEOUT_SECONDS` | Playwright navigation / DOM capture budget (seconds) | `45` |
+| `BROWSER_FETCH_MAX_SCROLLS` | Max deterministic viewport scroll steps after load | `3` |
+| `BROWSER_FETCH_WAIT_UNTIL` | Playwright `page.goto` wait stage: `commit`, `domcontentloaded`, `load`, or `networkidle` | `domcontentloaded` |
+| `BROWSER_FETCH_CAPTURE_SCREENSHOT` | When `true`, record screenshot byte length and SHA-256 in browser attempt trace (no separate snapshot row) | `false` |
 
 Parser support in this MVP:
 
@@ -138,8 +151,9 @@ Parser support in this MVP:
 - unsupported MIME types are skipped with an auditable parse decision
 - Office macros, scripts, external resources, and embedded objects are not executed
 - PDF page numbers are best-effort; unreliable cases record a locator fallback reason
-- browser-rendered fetch and recursive attachment crawling are deferred until a stronger sandbox and
-  parent/child source model are added
+- weak static HTML may trigger a second ledger pass: `fetch_job.mode = BROWSER_RENDERED` with its own `fetch_attempt` / `content_snapshot` when `BROWSER_FETCH_BACKEND=playwright` and the static outcome matches `should_attempt_browser_fallback`; install optional `playwright` and run `playwright install chromium` for real renders
+- browser fallback observability: structured log event `fetch.browser_fallback` (fields include `browser_fallback_*` diagnostics); when the backend setting is non-`none`, a `task_event` row is written with `event_type=acquisition.browser_fallback` (same payload shape); static `fetch_attempt.trace_json` gains a `browser_fallback` object summarizing the decision; Prometheus counters `deepresearch_browser_fallback_considered_total`, `deepresearch_browser_fallback_attempted_total`, `deepresearch_browser_fallback_succeeded_total`, `deepresearch_browser_fallback_failed_total`, `deepresearch_browser_fallback_skipped_total`
+- Playwright SSRF: every document/subresource request is checked with the same policy as `HttpAcquisitionClient.validate_fetch_target`; blocked requests increment `browser_blocked_request_count` and append samples to `browser_blocked_request_reasons` on the browser `fetch_attempt.trace_json`; `page.url` / final URL is re-validated after navigation and after bounded scrolling
 
 ### Object storage
 
@@ -203,6 +217,19 @@ If strict claim filters produce no claims, the service runs a narrow determinist
 The pipeline also computes answer-yield metrics per `source_document`, separating raw `candidate_sentence_count` from `answer_relevant_candidate_count` and final accepted claim counts. If claim drafting creates zero claims, or a what/how query produces only one claim without required definition/mechanism coverage, it runs at most one supplemental acquisition pass over unattempted high-value candidates such as official about pages, Wikipedia references, official home pages, upstream GitHub README/repo pages, or generic articles. Developer, API, architecture, installation, social, forum, and video pages stay downranked unless the query explicitly asks for them.
 
 For technical library/framework overview queries such as `What is LangGraph and how does it work?`, deterministic source selection now requires owned project-domain or upstream repository evidence before classifying a result as `official_about`, `official_docs_reference`, or `github_readme_or_repo`. Standalone search discovery can inject bounded official docs, project homepages, upstream repositories, package registries, Wikipedia/reference pages, and academic/tutorial sources for recognized technical projects and research concepts before generic SearXNG results are used. These candidates are persisted through normal `search_query` and `candidate_url` rows with `candidate_source=authoritative_source_resolver`, so acquisition, parsing, indexing, claims, and reports still use the ledger. The worker/debug pipeline disables that authoritative resolver in the main `SEARCHING` loop and relies on planner guardrails plus known-path fallback, keeping the first acquisition budget provider/plan driven and preventing repeated resolver queries during gap rounds. For comparison queries, acquisition interleaves authoritative candidates by recognized entity so one entity's docs do not consume all early fetch slots. For LangGraph, `docs.langchain.com`, `reference.langchain.com`, `langchain.com`, and `github.com/langchain-ai/langgraph` are high-value owned sources; `github.langchain.ac.cn`, `langgraph.com.cn`, `langchain-doc.cn`, and third-party GitHub tutorial repositories are secondary references, not official-owned sources. If main `SEARCHING` gets `searxng_empty_results_with_unresponsive_engines` for LangGraph before any candidate URLs exist, the runner injects bounded known-path candidates for Python docs, JavaScript docs, reference docs, state-graph reference docs, upstream GitHub, and the official product page, then continues to acquisition. Injected candidates are marked with `candidate_source=known_path_fallback`, `fallback_reason`, and `original_search_provider`. The product page remains available but is ranked behind docs/reference/upstream GitHub for how-it-works acquisition. Job boards, freelance sites, job-search URLs, SEO repost pages, obvious unrelated listings, and off-entity specialty-engine results are low quality for overview queries. If gap rounds still find missing required slots and search returns duplicates or low-value results, the runner falls back to existing unattempted high-value candidates and LangGraph gap analysis emits bounded targeted searches for LangChain docs/reference/GitHub. No-LLM planning and claim scoring use framework-oriented mechanism and feature terms such as graph/state/nodes/edges/workflow/orchestration/routing, durable execution, streaming, memory, checkpointing, human-in-the-loop, integrations, APIs, and limitations.
+
+Technical explanation tasks now use the `technical_explanation` research template when the query
+asks what a technical system is and how it works. The template creates answer slots for definition,
+motivation/problem solved, core abstractions, architecture, execution model, workflow lifecycle,
+key features, examples/use cases, limitations, comparison/positioning, and official sources. The
+planner emits a bounded slot query matrix with `target_slots`, `query_matrix_slot`, and
+`source_role` metadata. For LangGraph this includes official docs, reference docs, the upstream
+GitHub README, architecture/runtime, durable execution/checkpointing/streaming, examples, and
+limitations/comparison queries. Acquisition uses source-role quotas for technical explanations:
+prefer official docs, official reference, official repository, official blog/changelog, and a small
+number of high-quality secondary references; do not globally relax `generic_article` selection.
+Claim drafting and report grounding preserve technical slot ids and source roles, so thicker reports
+come from more covered dimensions and traceable evidence rather than filler prose.
 
 ### Optional LLM planner
 
@@ -437,15 +464,22 @@ python scripts/live_acceptance.py \
 `scripts/live_acceptance.py` creates a fresh task for the selected profile, queues `/run`, waits
 for a terminal status, fetches task detail, `source_documents`, `source_chunks`, `claims`,
 `claim_evidence`, report, events, search queries, and candidate URLs, writes the raw payloads to
-the artifact directory, and prints a pass/fail JSON summary. The
+the artifact directory, writes `benchmark.json` when the profile exposes benchmark metrics, and
+prints a pass/fail JSON summary. The
 `langgraph-technical-explanation` profile uses the query
 `What is LangGraph and how does it work?` with `report_language=en-US`. It checks completion
 through `real-search+opensearch+planner+report-LLM`, explicit planner/report LLM use or grounded
 fallback diagnostics, report claim/evidence/citation traceability, non-empty technical explanation
 sections, and official or high-authority LangGraph sources such as LangChain docs/reference pages
-or the upstream `langchain-ai/langgraph` repository. Deployment-specific Docker evidence checks
-remain isolated to the `searxng-docker-deployment` profile and are not applied to the LangGraph
-query.
+or the upstream `langchain-ai/langgraph` repository. Its benchmark summary includes planned and
+persisted search-query counts, candidate URL count, source documents/domains/roles, chunks, claims,
+supported claims, claim evidence, report length, citation density, answer-slot coverage, and
+gap-summary counters. Deployment-specific Docker evidence checks remain isolated to the
+`searxng-docker-deployment` profile and are not applied to the LangGraph query.
+For LangGraph component-focus report eligibility checks, inspect the report artifact manifest
+`report_diagnostics` or the `REPORTING` stage event `result.report_diagnostics`; these expose
+component-focus evaluations, component rescues, focus mismatches by slot, failed predicate
+distributions, and missing metadata distributions.
 
 SEARCHING-stage partial failures are expected to be bounded: if a later search query fails after
 usable candidate URLs have already been persisted, the pipeline records the search diagnostic and
@@ -601,6 +635,29 @@ python scripts/benchmark_queries.py --json --limit 2
 python scripts/benchmark_queries.py --json --query-id 3
 python scripts/benchmark_queries.py --run --limit 2 --wait-seconds 420 --output /tmp/deepsearch-benchmark.json
 ```
+
+Acquisition A/B yield (ledger + funnel metrics, no task creation):
+
+1. Run the same fixed query list twice: once with ``BROWSER_FETCH_BACKEND=none`` and once with
+   ``BROWSER_FETCH_BACKEND=playwright`` (restart orchestrator + worker between modes so settings
+   take effect). Record each ``task_id``.
+2. From the repository root, with ``DATABASE_URL`` pointing at the same DB the API used:
+
+```bash
+PYTHONPATH=. python scripts/benchmark_acquisition_yield.py \
+  --task-ids <uuid1>,<uuid2>,...
+
+PYTHONPATH=. python scripts/benchmark_acquisition_yield.py \
+  --pairs <none_task_uuid>:<playwright_task_uuid>,... \
+  --format both \
+  --output /tmp/acquisition-ab.json
+```
+
+The script prints enriched ``compute_acquisition_funnel_diagnostics`` output plus
+``claim_evidence_count``, ``report_markdown_character_count`` (when the report object exists on
+disk for the configured storage backend), and ``body_too_large_cases`` (domain, URL, observed
+bytes vs cap from ``fetch_attempt.trace_json``). ``--format comparison`` emits a compact delta
+table (snapshots, documents, chunks, claims, evidence links, browser fallback counters).
 
 Evidence quality benchmark:
 
@@ -1258,7 +1315,10 @@ At minimum, that route would still need:
   `application/pdf`, DOCX, PPTX, and XLSX OpenXML documents
 - inspect task events or `GET /api/v1/research/tasks/<task_id>` for `progress.observability.parse_decisions`
 - parse decisions include `snapshot_id`, `canonical_url`, `mime_type`, `storage_bucket`, `storage_key`, `snapshot_bytes`, `body_length`, `decision`, `parser_error`, `extractor_strategy_used`, `fallback_used`, `removed_boilerplate_count`, `extracted_text_length`, `text_cleanup_applied`, `dropped_broken_link_fragments`, and `preserved_link_text_count`
-- default pipeline parsing selects successful fetch snapshots before applying the parse limit; failed HTTP responses may still have stored snapshots for audit, but they should not consume ordinary parse budget
+- default pipeline parsing selects successful fetch snapshots before applying the parse limit; many
+  failed HTTP attempts omit `content_snapshot` rows (for example empty 2xx bodies, blocked binary
+  MIME types, or static HTML quality gates), while other failures may still persist response bytes on
+  the attempt trace without consuming ordinary parse budget
 - for Wikipedia/MediaWiki pages, expected extraction is article-body text from `main`, `article`, `#content`, `#bodyContent`, `#mw-content-text`, or `.mw-parser-output`, with paragraph fallback from `.mw-parser-output p`, `#mw-content-text p`, or readable body paragraphs if strict extraction would otherwise be empty
 - for Sphinx docs pages, link text should be preserved when present; if a docs page still produces broken residue such as `from up to 251 .`, the extractor applies conservative cleanup and records cleanup metadata rather than fabricating missing content
 - a chunk that starts with `References` should remain ineligible, but a chunk with useful `Privacy` prose followed by trailing `See also` or `References` headings should remain eligible when its quality score passes

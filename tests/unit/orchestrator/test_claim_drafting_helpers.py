@@ -206,6 +206,32 @@ def test_chinese_transformer_scoring_uses_source_suitability_without_punctuation
         assert score.claim_quality_score >= 0.45
 
 
+def test_readme_repository_sources_get_narrow_suitability_boost() -> None:
+    query = "What is LangGraph and how does it work?"
+    statement = "LangGraph supports durable execution and human-in-the-loop workflows."
+    raw_non_readme = score_claim_statement(
+        statement=statement,
+        query=query,
+        domain="raw.githubusercontent.com",
+        source_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/src/core.py",
+    )
+    raw_readme = score_claim_statement(
+        statement=statement,
+        query=query,
+        domain="raw.githubusercontent.com",
+        source_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+    )
+    github_repo = score_claim_statement(
+        statement=statement,
+        query=query,
+        domain="github.com",
+        source_url="https://github.com/langchain-ai/langgraph",
+    )
+
+    assert raw_readme.source_suitability_score > raw_non_readme.source_suitability_score
+    assert github_repo.source_suitability_score >= raw_non_readme.source_suitability_score
+
+
 def test_query_aware_claim_filters_accept_answer_sentences() -> None:
     query = "What is SearXNG and how does it work?"
     accepted_sentences = [
@@ -400,10 +426,12 @@ def test_langgraph_cjk_framework_claims_cover_definition_and_mechanism_slots() -
 
     coverage = answer_slot_coverage(query, categories)
     required_coverage = {
-        row["slot_id"]: row["covered"] for row in coverage if row["slot_id"] in categories
+        row["slot_id"]: row["covered"]
+        for row in coverage
+        if row["slot_id"] in {"definition", "core_abstractions"}
     }
     assert required_coverage["definition"] is True
-    assert required_coverage["mechanism"] is True
+    assert required_coverage["core_abstractions"] is True
 
 
 def test_draft_claim_statement_strips_leading_dash_fragment_before_definition() -> None:

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Response, status
 
 from packages.observability import render_metrics
 from services.orchestrator.app.research_quality import QUALITY_DIAGNOSTIC_FIELDS
+from services.orchestrator.app.services import reporting as reporting_service_module
 from services.orchestrator.app.settings import get_settings
 
 router = APIRouter(tags=["system"])
@@ -32,11 +37,19 @@ def readyz() -> dict[str, str]:
 @router.get("/versionz")
 def versionz() -> dict[str, Any]:
     git_commit = _git_commit_hash()
+    reporting_path = inspect.getsourcefile(reporting_service_module)
     return {
         "service": get_settings().app_name,
         "app_version": APP_VERSION,
         "git_commit": git_commit,
         "git_commit_available": git_commit is not None,
+        "process_cwd": os.getcwd(),
+        "python_executable": sys.executable,
+        "python_argv": list(sys.argv),
+        "pythonpath": os.environ.get("PYTHONPATH"),
+        "reporting_module_file": reporting_path,
+        "reporting_module_sha256": _file_sha256(reporting_path),
+        "reporting_component_focus_diagnostics_enabled": True,
         "research_quality_diagnostics_fields": list(QUALITY_DIAGNOSTIC_FIELDS),
         "research_quality_diagnostics_enabled": True,
     }
@@ -68,3 +81,12 @@ def _git_commit_hash() -> str | None:
         return None
     commit = result.stdout.strip()
     return commit or None
+
+
+def _file_sha256(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None

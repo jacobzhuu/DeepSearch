@@ -3,7 +3,9 @@ from __future__ import annotations
 from services.orchestrator.app.research_quality import (
     answer_slot_coverage,
     answer_slots_for_query,
+    build_slot_coverage_summary,
     classify_source_intent,
+    technical_slot_ids_for_text,
 )
 
 
@@ -112,6 +114,7 @@ def test_langgraph_mirrors_and_third_party_github_are_not_official_owned() -> No
     assert localized_docs.source_intent == "secondary_reference"
     assert mirror_docs.downrank_reason == "secondary_reference_not_official_owned"
     assert official_github.source_intent == "github_readme_or_repo"
+    assert official_github.source_role == "official_repository"
     assert third_party_github.source_intent == "secondary_reference"
     assert official_github.fetch_priority_score < third_party_github.fetch_priority_score
     assert freelancer.source_intent == "low_quality_or_blocked"
@@ -213,3 +216,123 @@ def test_answer_slots_are_query_intent_specific() -> None:
     assert any(
         row["slot_id"] == "privacy_advantages" and row["covered"] for row in privacy_coverage
     )
+
+
+def test_technical_explanation_answer_slots_and_source_roles() -> None:
+    query = "What is LangGraph and how does it work?"
+    slots = answer_slots_for_query(query)
+    docs = classify_source_intent(
+        canonical_url="https://docs.langchain.com/oss/python/langgraph/overview",
+        domain="docs.langchain.com",
+        title="LangGraph overview - Docs by LangChain",
+        query=query,
+    )
+    reference = classify_source_intent(
+        canonical_url="https://reference.langchain.com/python/langgraph/graphs/",
+        domain="reference.langchain.com",
+        title="Graphs - LangGraph reference",
+        query=query,
+    )
+    evidence_slots = technical_slot_ids_for_text(
+        text=(
+            "LangGraph uses StateGraph, nodes, edges, checkpointing, and durable execution "
+            "to orchestrate long-running agent workflows."
+        ),
+        category="mechanism",
+        query=query,
+        source_intent=docs.source_intent,
+    )
+
+    assert [slot.slot_id for slot in slots][:6] == [
+        "definition",
+        "motivation_problem",
+        "core_abstractions",
+        "architecture",
+        "execution_model",
+        "workflow_lifecycle",
+    ]
+    assert docs.source_role == "official_docs"
+    assert reference.source_role == "official_reference"
+    assert {
+        "core_abstractions",
+        "execution_model",
+        "workflow_lifecycle",
+        "official_sources",
+    } <= set(evidence_slots)
+
+
+def test_technical_slot_ids_limitations_from_experimental_phrase() -> None:
+    query = "What is LangGraph and how does it work?"
+    slots = technical_slot_ids_for_text(
+        text="Streaming mode remains experimental in production deployments.",
+        category="feature",
+        query=query,
+        source_intent="official_docs",
+    )
+    assert "limitations" in slots
+
+
+def test_technical_slot_ids_include_readme_examples_and_workflow_markers() -> None:
+    query = "What is LangGraph and how does it work?"
+    source = classify_source_intent(
+        canonical_url="https://github.com/langchain-ai/langgraph",
+        domain="github.com",
+        title="langchain-ai/langgraph",
+        query=query,
+    )
+    slots = technical_slot_ids_for_text(
+        text=(
+            "Quickstart guide and tutorial examples show how to build sample multi-agent "
+            "workflows with the LangGraph API."
+        ),
+        category="feature",
+        query=query,
+        source_intent=source.source_intent,
+    )
+
+    assert source.source_role == "official_repository"
+    assert {
+        "examples_use_cases",
+        "workflow_lifecycle",
+        "key_features",
+        "official_sources",
+    } <= set(slots)
+
+
+def test_examples_slot_covered_with_grounded_examples_claims() -> None:
+    query = "What is LangGraph and how does it work?"
+    evidence_candidates = [
+        {
+            "evidence_candidate_id": "candidate_1",
+            "source_document_id": "doc_1",
+            "source_chunk_id": "chunk_1",
+            "citation_span_id": "span_1",
+            "slot_ids": ["examples_use_cases"],
+            "source_role": "official_repository",
+            "source_intent": "github_readme_or_repo",
+        }
+    ]
+    claim_rows = [
+        {
+            "claim_id": "claim_1",
+            "verification_status": "supported",
+            "slot_ids": ["examples_use_cases"],
+            "source_document_id": "doc_1",
+            "support_level": "strong",
+        },
+        {
+            "claim_id": "claim_2",
+            "verification_status": "supported",
+            "slot_ids": ["examples_use_cases"],
+            "source_document_id": "doc_1",
+            "support_level": "strong",
+        },
+    ]
+
+    summary = build_slot_coverage_summary(
+        query,
+        evidence_candidates=evidence_candidates,
+        claim_rows=claim_rows,
+    )
+    examples_row = next(row for row in summary if row["slot_id"] == "examples_use_cases")
+    assert examples_row["status"] == "covered"

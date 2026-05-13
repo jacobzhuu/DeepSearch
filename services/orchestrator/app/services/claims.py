@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, replace
+import re
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import UUID
 
@@ -49,6 +51,11 @@ from services.orchestrator.app.claims import (
     select_verification_span,
     validate_citation_span,
 )
+from services.orchestrator.app.claims.verification import (
+    VERIFIER_METHOD_README_REPOSITORY_NORMALIZED_COMPOSITE,
+    _query_asks_technical_explanation_for_readme_verification,
+    try_repository_readme_normalized_composite_verification,
+)
 from services.orchestrator.app.indexing import ChunkIndexBackend, IndexedChunkRecord
 from services.orchestrator.app.research_quality import (
     EvidenceCandidate,
@@ -56,13 +63,38 @@ from services.orchestrator.app.research_quality import (
     classify_source_intent,
     evidence_candidate_id,
     slot_ids_for_candidate_category,
+    technical_slot_ids_for_text,
 )
+from services.orchestrator.app.research_quality.candidate_target_slots import (
+    ROLES_ELIGIBLE_FOR_PLANNER_TARGET_SLOT_MERGE,
+    load_candidate_target_slots_by_source_document,
+    merge_technical_lexical_and_planner_slots,
+    weak_optional_slots_without_planner_propagation,
+)
+from services.orchestrator.app.services.acquisition import _query_asks_technical_explanation
 from services.orchestrator.app.services.research_tasks import (
     PHASE2_ACTIVE_STATUS,
     TaskNotFoundError,
 )
 
 logger = get_logger(__name__)
+
+
+def _limitations_official_planner_target_slot_id(
+    *,
+    technical_explanation: bool,
+    document_target_slots: dict[UUID, frozenset[str]] | None,
+    source_document_id: UUID,
+    source_role: str | None,
+) -> str | None:
+    """Only when planner merged ``limitations`` applies scoring alignment (official roles only)."""
+    if not technical_explanation or document_target_slots is None:
+        return None
+    if (source_role or "").strip() not in ROLES_ELIGIBLE_FOR_PLANNER_TARGET_SLOT_MERGE:
+        return None
+    if "limitations" not in document_target_slots.get(source_document_id, frozenset()):
+        return None
+    return "limitations"
 
 
 class ClaimDraftingConflictError(Exception):
@@ -131,12 +163,69 @@ class DraftClaimCandidate:
     original_rejected_reason: str | None = None
     evidence_kind: str = "sentence"
     evidence_slot_ids: tuple[str, ...] = ()
+    lexical_evidence_slot_ids: tuple[str, ...] = ()
+    candidate_target_slot_ids: tuple[str, ...] = ()
+    normalized_from_readme: bool = False
+    cleaned_github_readme: bool = False
 
 
 @dataclass(frozen=True)
 class DraftChunkSelection:
     chunks_seen: list[tuple[SourceChunk, float | None]]
     eligible_chunks: list[tuple[SourceChunk, float | None]]
+
+
+def _append_target_slot_diagnostics(
+    diagnostics: dict[str, Any],
+    diversified: list[DraftClaimCandidate],
+    *,
+    document_target_slots: dict[UUID, frozenset[str]] | None,
+    target_slot_load_meta: dict[str, int] | None,
+    query: str,
+    technical_explanation: bool,
+) -> None:
+    if not technical_explanation:
+        diagnostics.update(
+            {
+                "candidate_target_slots_seen_count": 0,
+                "candidate_urls_joined_for_target_slots": 0,
+                "candidate_target_slots_applied_count": 0,
+                "claims_with_candidate_target_slots_count": 0,
+                "claim_slots_from_lexical_count": 0,
+                "claim_slots_from_candidate_target_count": 0,
+                "limitations_claims_from_candidate_target_slots_count": 0,
+                "weak_slots_without_candidate_target_claims": [],
+            }
+        )
+        return
+    meta = target_slot_load_meta or {}
+    diagnostics["candidate_target_slots_seen_count"] = int(meta.get("documents_with_slots", 0))
+    diagnostics["candidate_urls_joined_for_target_slots"] = int(
+        meta.get("candidate_urls_joined", 0)
+    )
+    diagnostics["candidate_target_slots_applied_count"] = sum(
+        len(c.candidate_target_slot_ids) for c in diversified
+    )
+    diagnostics["claims_with_candidate_target_slots_count"] = sum(
+        1 for c in diversified if c.candidate_target_slot_ids
+    )
+    diagnostics["claim_slots_from_lexical_count"] = sum(
+        (
+            len(c.lexical_evidence_slot_ids)
+            if c.lexical_evidence_slot_ids
+            else len(c.evidence_slot_ids)
+        )
+        for c in diversified
+    )
+    diagnostics["claim_slots_from_candidate_target_count"] = sum(
+        len(c.candidate_target_slot_ids) for c in diversified
+    )
+    diagnostics["limitations_claims_from_candidate_target_slots_count"] = sum(
+        1 for c in diversified if "limitations" in c.candidate_target_slot_ids
+    )
+    diagnostics["weak_slots_without_candidate_target_claims"] = (
+        weak_optional_slots_without_planner_propagation(query=query, diversified=diversified)
+    )
 
 
 @dataclass(frozen=True)
@@ -151,6 +240,15 @@ class ClaimDraftBatchResult:
     reused_claim_evidence: int
     entries: list[DraftClaimEntry]
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class GithubReadmeCleanResult:
+    text: str
+    line_spans: tuple[tuple[int, int], ...]
+    applied: bool
+    removed_line_count: int
+    kept_line_count: int
 
 
 @dataclass(frozen=True)
@@ -188,6 +286,7 @@ class VerificationEvidenceCandidate:
     content_hash: str | None
     chunk_text_hash: str
     span_text_hash: str
+    readme_composite_metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -195,6 +294,81 @@ class EvidenceReuseTracker:
     chunk_counts: dict[str, int]
     span_counts: dict[str, int]
     content_counts: dict[str, int]
+
+
+_README_COMPOSITE_ALLOWED_SOURCE_INTENTS: frozenset[str] = frozenset(
+    {"official_repository_readme", "github_readme_or_repo"}
+)
+_README_COMPOSITE_DIAGNOSTIC_KEY = "repository_normalized_readme_composite_diagnostic"
+
+
+def _readme_set_diag(track: dict[str, Any], composite_diag: dict[str, Any]) -> None:
+    track[_README_COMPOSITE_DIAGNOSTIC_KEY] = composite_diag
+
+
+def _init_readme_verification_tracker() -> dict[str, Any]:
+    return {
+        "repository_normalized_verification_attempt_count": 0,
+        "repository_normalized_verification_supported_count": 0,
+        "repository_normalized_verification_rejection_reason_distribution": Counter(),
+        "repository_normalized_support_method_distribution": Counter(),
+        _README_COMPOSITE_DIAGNOSTIC_KEY: None,
+    }
+
+
+def _finalize_readme_verification_tracker(track: dict[str, Any]) -> dict[str, Any]:
+    reject = track.get("repository_normalized_verification_rejection_reason_distribution")
+    methods = track.get("repository_normalized_support_method_distribution")
+    reject_dict: dict[str, int] = {}
+    methods_dict: dict[str, int] = {}
+    if isinstance(reject, Counter):
+        reject_dict = dict(sorted(reject.items(), key=lambda item: item[0]))
+    if isinstance(methods, Counter):
+        methods_dict = dict(sorted(methods.items(), key=lambda item: item[0]))
+    return {
+        "repository_normalized_verification_attempt_count": int(
+            track.get("repository_normalized_verification_attempt_count", 0)
+        ),
+        "repository_normalized_verification_supported_count": int(
+            track.get("repository_normalized_verification_supported_count", 0)
+        ),
+        "repository_normalized_verification_rejection_reason_distribution": reject_dict,
+        "repository_normalized_support_method_distribution": methods_dict,
+        "repository_normalized_readme_composite_diagnostic": track.get(
+            _README_COMPOSITE_DIAGNOSTIC_KEY
+        ),
+    }
+
+
+def _claim_eligible_for_readme_repository_normalized_composite(
+    claim: Claim,
+    task: ResearchTask,
+    source_chunk: SourceChunk,
+) -> bool:
+    del task  # reserved for future tightening; eligibility is claim+chunk local
+    notes = claim.notes_json or {}
+    if notes.get("normalized_from_readme") is not True:
+        return False
+    if str(notes.get("source_role") or "").strip() != "official_repository":
+        return False
+    intent = str(notes.get("source_intent") or "").strip()
+    if intent not in _README_COMPOSITE_ALLOWED_SOURCE_INTENTS:
+        return False
+    raw_scid = notes.get("source_chunk_id")
+    if not isinstance(raw_scid, str):
+        return False
+    try:
+        if UUID(raw_scid) != source_chunk.id:
+            return False
+    except ValueError:
+        return False
+    domain = (source_chunk.source_document.domain or "").lower().rstrip(".")
+    if domain != "raw.githubusercontent.com":
+        return False
+    url = (source_chunk.source_document.canonical_url or "").lower()
+    if not (url.endswith("/readme.md") or url.endswith("/readme.markdown")):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -206,6 +380,7 @@ class ClaimVerificationBatchResult:
     created_claim_evidence: int
     reused_claim_evidence: int
     entries: list[VerifiedClaimEntry]
+    readme_normalized_verification: dict[str, Any] = field(default_factory=dict)
 
 
 class ClaimDraftingService:
@@ -285,6 +460,7 @@ class ClaimDraftingService:
             chunks_seen=chunk_selection.chunks_seen,
             query=effective_query,
             limit=effective_limit,
+            task_id=task.id,
         )
 
         for selection_rank, candidate in enumerate(ranked_candidates, start=1):
@@ -463,7 +639,9 @@ class ClaimDraftingService:
             content_counts={},
         )
 
+        readme_batch_tracker = _init_readme_verification_tracker()
         for claim in claims:
+            readme_claim_tracker = _init_readme_verification_tracker()
             verification_candidates: list[VerificationEvidenceCandidate] = []
             seen_verification_spans: set[tuple[UUID, int, int]] = set()
             retrieval_hits = self.index_backend.retrieve_chunks(
@@ -501,6 +679,8 @@ class ClaimDraftingService:
                     task=task,
                     claim=claim,
                     seen_spans=seen_verification_spans,
+                    readme_batch_tracker=readme_batch_tracker,
+                    readme_claim_tracker=readme_claim_tracker,
                 )
             )
 
@@ -529,8 +709,7 @@ class ClaimDraftingService:
                     relation_type=matched_span.relation_type,
                     score=candidate.rank_score,
                 )
-                evidence_relation_details.append(
-                    {
+                row: dict[str, object] = {
                         "claim_evidence_id": str(claim_evidence.id),
                         "claim_evidence_reused": reused_evidence,
                         "claim_id": str(claim.id),
@@ -555,7 +734,17 @@ class ClaimDraftingService:
                         "span_text_hash": candidate.span_text_hash,
                         **matched_span.to_metadata(),
                     }
-                )
+                meta = candidate.readme_composite_metadata
+                if meta:
+                    for key in (
+                        "repository_normalized_support_method",
+                        "repository_normalized_support_token_hits",
+                        "repository_normalized_support_missing_terms",
+                        "repository_normalized_support_rejection",
+                    ):
+                        if key in meta and meta[key] is not None:
+                            row[key] = meta[key]
+                evidence_relation_details.append(row)
                 _record_candidate_reuse(reuse_tracker, candidate)
                 if reused_evidence:
                     reused_claim_evidence += 1
@@ -576,12 +765,21 @@ class ClaimDraftingService:
                 contradict_count=contradict_count,
                 weak_support_count=weak_support_count,
             )
+            claim_readme_diag = _finalize_readme_verification_tracker(readme_claim_tracker)
+            any_composite = any(
+                candidate.readme_composite_metadata for candidate in selected_candidates
+            )
+            verifier_primary = (
+                VERIFIER_METHOD_README_REPOSITORY_NORMALIZED_COMPOSITE
+                if any_composite
+                else VERIFIER_METHOD_LEXICAL_HEURISTIC_V2
+            )
             claim.verification_status = verification_status
             claim.notes_json = {
                 **claim.notes_json,
                 "verification": {
-                    "method": VERIFIER_METHOD_LEXICAL_HEURISTIC_V2,
-                    "verifier_method": VERIFIER_METHOD_LEXICAL_HEURISTIC_V2,
+                    "method": verifier_primary,
+                    "verifier_method": verifier_primary,
                     "verification_query": claim.statement,
                     "support_evidence_count": support_count,
                     "strong_support_evidence_count": support_count,
@@ -603,6 +801,22 @@ class ClaimDraftingService:
                         evidence_relation_details,
                     ),
                     "rationale": rationale,
+                    "readme_repository_normalized": {
+                        "repository_normalized_verification_attempt_count": claim_readme_diag[
+                            "repository_normalized_verification_attempt_count"
+                        ],
+                        "repository_normalized_verification_supported_count": claim_readme_diag[
+                            "repository_normalized_verification_supported_count"
+                        ],
+                        "repository_normalized_verification_rejection_reason_distribution": (
+                            claim_readme_diag[
+                                "repository_normalized_verification_rejection_reason_distribution"
+                            ]
+                        ),
+                        "repository_normalized_support_method_distribution": claim_readme_diag[
+                            "repository_normalized_support_method_distribution"
+                        ],
+                    },
                 },
             }
             entries.append(
@@ -639,6 +853,9 @@ class ClaimDraftingService:
             created_claim_evidence=created_claim_evidence,
             reused_claim_evidence=reused_claim_evidence,
             entries=entries,
+            readme_normalized_verification=_finalize_readme_verification_tracker(
+                readme_batch_tracker
+            ),
         )
 
     def _select_chunks(
@@ -736,13 +953,29 @@ class ClaimDraftingService:
         chunks_seen: list[tuple[SourceChunk, float | None]],
         query: str,
         limit: int,
+        task_id: UUID,
     ) -> tuple[list[DraftClaimCandidate], dict[str, Any]]:
         candidates: list[DraftClaimCandidate] = []
         deployment_query = classify_query_intent(query).intent_name == "deployment"
+        technical_explanation = (
+            _query_asks_technical_explanation(query) and not deployment_query
+        )
+        document_target_slots: dict[UUID, frozenset[str]] | None = None
+        target_slot_load_meta: dict[str, int] = {}
+        if technical_explanation:
+            document_target_slots, target_slot_load_meta = (
+                load_candidate_target_slots_by_source_document(self.session, task_id)
+            )
         for source_chunk, retrieval_score in chunks_seen:
             content_quality_score = _chunk_content_quality_score(source_chunk)
             source_quality_score = _source_quality_score(source_chunk)
             page_title = source_chunk.source_document.title
+            source_classification = classify_source_intent(
+                canonical_url=source_chunk.source_document.canonical_url,
+                domain=source_chunk.source_document.domain,
+                title=source_chunk.source_document.title,
+                query=query,
+            )
             for supporting_span in iter_supporting_spans(source_chunk.text):
                 try:
                     statement = draft_claim_statement(supporting_span.excerpt)
@@ -754,6 +987,12 @@ class ClaimDraftingService:
                     statement, page_title=page_title, query=query
                 )
 
+                limitations_slot = _limitations_official_planner_target_slot_id(
+                    technical_explanation=technical_explanation,
+                    document_target_slots=document_target_slots,
+                    source_document_id=source_chunk.source_document_id,
+                    source_role=source_classification.source_role,
+                )
                 score = score_claim_statement(
                     statement=statement,
                     query=query,
@@ -762,13 +1001,35 @@ class ClaimDraftingService:
                     domain=source_chunk.source_document.domain,
                     source_url=source_chunk.source_document.canonical_url,
                     page_title=page_title,
+                    target_slot_id=limitations_slot,
                 )
                 evidence_slot_ids: tuple[str, ...] = ()
+                lexical_evidence_slot_ids: tuple[str, ...] = ()
+                planner_only_slots: tuple[str, ...] = ()
                 if deployment_query:
                     evidence_slot_ids = deployment_slot_ids_for_claim_text(
                         statement,
                         supporting_span.excerpt,
                     )
+                    lexical_evidence_slot_ids = evidence_slot_ids
+                else:
+                    lexical_evidence_slot_ids = technical_slot_ids_for_text(
+                        text=f"{statement}\n{supporting_span.excerpt}",
+                        category=score.claim_category,
+                        query=query,
+                        source_intent=source_classification.source_intent,
+                    )
+                    if technical_explanation and document_target_slots is not None:
+                        evidence_slot_ids, planner_only_slots = (
+                            merge_technical_lexical_and_planner_slots(
+                                lexical_slots=lexical_evidence_slot_ids,
+                                source_document_id=source_chunk.source_document_id,
+                                source_role=source_classification.source_role,
+                                document_target_slots=document_target_slots,
+                            )
+                        )
+                    else:
+                        evidence_slot_ids = lexical_evidence_slot_ids
                 rejected_rules = _strict_rejected_rules(source_chunk, statement, query, score)
                 candidates.append(
                     DraftClaimCandidate(
@@ -784,6 +1045,36 @@ class ClaimDraftingService:
                         rejected_rules=tuple(rejected_rules),
                         original_rejected_reason=_first_rejection_reason(rejected_rules, score),
                         evidence_slot_ids=evidence_slot_ids,
+                        lexical_evidence_slot_ids=lexical_evidence_slot_ids,
+                        candidate_target_slot_ids=planner_only_slots,
+                    )
+                )
+            if (
+                not deployment_query
+                and _should_normalize_repository_readme_candidates(
+                    query=query,
+                    source_chunk=source_chunk,
+                    source_role=source_classification.source_role,
+                )
+            ):
+                readme_clean_result = _github_readme_clean_result_for_claims(
+                    query=query,
+                    source_chunk=source_chunk,
+                    source_role=source_classification.source_role,
+                )
+                candidates.extend(
+                    _repository_readme_normalized_candidates(
+                        source_chunk=source_chunk,
+                        query=query,
+                        page_title=page_title,
+                        content_quality_score=content_quality_score,
+                        source_quality_score=source_quality_score,
+                        source_intent=source_classification.source_intent,
+                        source_role=source_classification.source_role,
+                        clean_result=readme_clean_result,
+                        document_target_slots=document_target_slots
+                        if technical_explanation
+                        else None,
                     )
                 )
             if not deployment_query:
@@ -799,6 +1090,10 @@ class ClaimDraftingService:
                     source_url=source_chunk.source_document.canonical_url,
                 )
                 rejected_rules = _strict_rejected_rules(source_chunk, statement, query, score)
+                dep_slots = deployment_slot_ids_for_evidence(
+                    statement,
+                    supporting_span.excerpt,
+                )
                 candidates.append(
                     DraftClaimCandidate(
                         source_chunk=source_chunk,
@@ -813,19 +1108,46 @@ class ClaimDraftingService:
                         rejected_rules=tuple(rejected_rules),
                         original_rejected_reason=_first_rejection_reason(rejected_rules, score),
                         evidence_kind="deployment_code_or_config",
-                        evidence_slot_ids=deployment_slot_ids_for_evidence(
-                            statement,
-                            supporting_span.excerpt,
-                        ),
+                        evidence_slot_ids=dep_slots,
+                        lexical_evidence_slot_ids=dep_slots,
+                        candidate_target_slot_ids=(),
                     )
                 )
+
+        full_readme_extra: list[DraftClaimCandidate] = []
+        full_readme_diag: dict[str, int] = {
+            "raw_readme_full_document_group_count": 0,
+            "raw_readme_full_document_normalized_candidate_count": 0,
+        }
+        if not deployment_query:
+            full_readme_extra, full_readme_diag = _raw_readme_full_document_normalized_candidates(
+                source_chunk_repository=self.source_chunk_repository,
+                chunks_seen=chunks_seen,
+                query=query,
+                existing_candidates=candidates,
+                document_target_slots=document_target_slots
+                if technical_explanation
+                else None,
+            )
+            candidates.extend(full_readme_extra)
 
         diagnostics = _build_claim_drafting_diagnostics(
             chunks_seen=chunks_seen,
             candidates=candidates,
             query=query,
         )
+        diagnostics.update({k: int(v) for k, v in full_readme_diag.items()})
         if not candidates:
+            _append_target_slot_diagnostics(
+                diagnostics,
+                [],
+                document_target_slots=document_target_slots
+                if technical_explanation
+                else None,
+                target_slot_load_meta=target_slot_load_meta if technical_explanation else None,
+                query=query,
+                technical_explanation=technical_explanation,
+            )
             return [], diagnostics
 
         strict_candidates = [candidate for candidate in candidates if not candidate.rejected_rules]
@@ -840,6 +1162,18 @@ class ClaimDraftingService:
                 "fallback_candidates_count": len(fallback_candidates),
             }
             if not fallback_candidates:
+                _append_target_slot_diagnostics(
+                    diagnostics,
+                    [],
+                    document_target_slots=document_target_slots
+                    if technical_explanation
+                    else None,
+                    target_slot_load_meta=target_slot_load_meta
+                    if technical_explanation
+                    else None,
+                    query=query,
+                    technical_explanation=technical_explanation,
+                )
                 return [], diagnostics
             ordered_fallback_candidates = sorted(
                 fallback_candidates,
@@ -855,10 +1189,24 @@ class ClaimDraftingService:
                 "accepted_claims_by_category": _accepted_candidates_by_category(diversified),
                 "category_coverage_missing": _category_coverage_missing(query, diversified),
                 "near_duplicate_claims_removed": near_duplicate_removed,
+                "repository_normalized_claim_count": sum(
+                    1 for candidate in diversified if candidate.normalized_from_readme
+                ),
+                "repository_normalized_supported_claim_count": 0,
                 "accepted_evidence_candidate_ids": [
                     _candidate_evidence_id(candidate) for candidate in diversified
                 ],
             }
+            _append_target_slot_diagnostics(
+                diagnostics,
+                diversified,
+                document_target_slots=document_target_slots
+                if technical_explanation
+                else None,
+                target_slot_load_meta=target_slot_load_meta if technical_explanation else None,
+                query=query,
+                technical_explanation=technical_explanation,
+            )
             return (
                 diversified,
                 diagnostics,
@@ -878,10 +1226,22 @@ class ClaimDraftingService:
             "accepted_claims_by_category": _accepted_candidates_by_category(diversified),
             "category_coverage_missing": _category_coverage_missing(query, diversified),
             "near_duplicate_claims_removed": near_duplicate_removed,
+            "repository_normalized_claim_count": sum(
+                1 for candidate in diversified if candidate.normalized_from_readme
+            ),
+            "repository_normalized_supported_claim_count": 0,
             "accepted_evidence_candidate_ids": [
                 _candidate_evidence_id(candidate) for candidate in diversified
             ],
         }
+        _append_target_slot_diagnostics(
+            diagnostics,
+            diversified,
+            document_target_slots=document_target_slots if technical_explanation else None,
+            target_slot_load_meta=target_slot_load_meta if technical_explanation else None,
+            query=query,
+            technical_explanation=technical_explanation,
+        )
         return (diversified, diagnostics)
 
     def _fallback_claim_candidates(
@@ -906,6 +1266,11 @@ class ClaimDraftingService:
                     draft_mode="fallback_relaxed",
                     fallback_reason="strict_filters_produced_no_claims",
                     original_rejected_reason=candidate.original_rejected_reason,
+                    evidence_slot_ids=candidate.evidence_slot_ids,
+                    lexical_evidence_slot_ids=candidate.lexical_evidence_slot_ids,
+                    candidate_target_slot_ids=candidate.candidate_target_slot_ids,
+                    normalized_from_readme=candidate.normalized_from_readme,
+                    cleaned_github_readme=candidate.cleaned_github_readme,
                 )
             )
         return fallback_candidates
@@ -1014,6 +1379,89 @@ class ClaimDraftingService:
                         covered_slots.update(candidate.evidence_slot_ids)
                         break
 
+        technical_slot_order = _technical_slot_order_for_query(query)
+        if technical_slot_order:
+            candidate_positions = {
+                id(candidate): index for index, candidate in enumerate(candidates)
+            }
+            normalized_repo_candidates = sorted(
+                (
+                    candidate
+                    for candidate in candidates
+                    if not candidate.rejected_rules
+                    and candidate.normalized_from_readme
+                    and _candidate_source_role(candidate, query=query) == "official_repository"
+                ),
+                key=lambda candidate: _technical_source_role_candidate_sort_key(
+                    candidate,
+                    candidate_position=candidate_positions[id(candidate)],
+                ),
+            )
+            for candidate in normalized_repo_candidates[:2]:
+                add_candidate(candidate, enforce_paragraph_diversity=False)
+            for role in _technical_source_role_order_for_query(query):
+                if len(selected) >= limit:
+                    break
+                selected_role_present = any(
+                    _candidate_source_role(candidate, query=query) == role for candidate in selected
+                )
+                if selected_role_present:
+                    continue
+                role_candidates = sorted(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate_key(candidate) not in selected_keys
+                        and _candidate_source_role(candidate, query=query) == role
+                        and (
+                            candidate.score.answer_relevant
+                            or (
+                                role == "official_repository"
+                                and _repository_candidate_allowed_for_slot_backfill(candidate)
+                            )
+                        )
+                    ),
+                    key=lambda candidate: _technical_source_role_candidate_sort_key(
+                        candidate,
+                        candidate_position=candidate_positions[id(candidate)],
+                    ),
+                )
+                for candidate in role_candidates:
+                    if add_candidate(candidate, enforce_paragraph_diversity=False):
+                        break
+
+            covered_slots = {
+                slot_id
+                for candidate in selected
+                for slot_id in candidate.evidence_slot_ids
+                if slot_id in technical_slot_order
+            }
+            while len(selected) < limit:
+                remaining_slots = set(technical_slot_order) - covered_slots
+                if not remaining_slots:
+                    break
+                slot_candidates = sorted(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate_key(candidate) not in selected_keys
+                        and set(candidate.evidence_slot_ids) & remaining_slots
+                        and candidate.score.answer_relevant
+                    ),
+                    key=lambda candidate: _technical_slot_candidate_sort_key(
+                        candidate,
+                        remaining_slots=remaining_slots,
+                        slot_order=technical_slot_order,
+                        candidate_position=candidate_positions[id(candidate)],
+                    ),
+                )
+                if not slot_candidates:
+                    break
+                if add_candidate(slot_candidates[0], enforce_paragraph_diversity=False):
+                    covered_slots.update(slot_candidates[0].evidence_slot_ids)
+                else:
+                    break
+
         if _query_needs_source_balanced_candidates(query):
             covered_source_documents = {
                 candidate.source_chunk.source_document_id for candidate in selected
@@ -1058,6 +1506,10 @@ class ClaimDraftingService:
     ) -> dict[str, Any]:
         slot_ids_value = evidence_candidate.get("slot_ids")
         slot_ids = list(slot_ids_value) if isinstance(slot_ids_value, list | tuple) else []
+        evidence_metadata = evidence_candidate.get("metadata")
+        source_role = evidence_candidate.get("source_role")
+        if source_role is None and isinstance(evidence_metadata, dict):
+            source_role = evidence_metadata.get("source_role")
         return {
             "draft_query": query,
             "draft_method": "query_aware_sentence_ranker_v1",
@@ -1072,8 +1524,11 @@ class ClaimDraftingService:
             "paragraph_index": candidate.paragraph_key[1],
             "slot_ids": slot_ids,
             "source_intent": evidence_candidate.get("source_intent"),
+            "source_role": source_role,
             "evidence_candidate_id": evidence_candidate.get("evidence_candidate_id"),
             "evidence_kind": candidate.evidence_kind,
+            "normalized_from_readme": candidate.normalized_from_readme,
+            "cleaned_github_readme": candidate.cleaned_github_readme,
             "evidence_quality_score": evidence_candidate.get("quality_score"),
             "evidence_salience_score": evidence_candidate.get("salience_score"),
             "evidence_rejection_reasons": evidence_candidate.get("rejection_reasons", []),
@@ -1098,6 +1553,8 @@ class ClaimDraftingService:
         task: ResearchTask,
         claim: Claim,
         seen_spans: set[tuple[UUID, int, int]],
+        readme_batch_tracker: dict[str, Any],
+        readme_claim_tracker: dict[str, Any],
     ) -> list[VerificationEvidenceCandidate]:
         notes = claim.notes_json or {}
         slot_ids = tuple(item for item in notes.get("slot_ids", []) if isinstance(item, str))
@@ -1116,7 +1573,71 @@ class ClaimDraftingService:
                 continue
             if not _source_chunk_eligible_for_claims(source_chunk):
                 continue
-            matched_span = select_verification_span(source_chunk.text, claim.statement)
+            lexical_span = select_verification_span(source_chunk.text, claim.statement)
+            matched_span = lexical_span
+            readme_meta: dict[str, Any] | None = None
+            if (
+                matched_span is not None
+                and not deployment_claim
+                and matched_span.relation_type != CLAIM_EVIDENCE_RELATION_SUPPORT
+                and _claim_eligible_for_readme_repository_normalized_composite(
+                    claim, task, source_chunk
+                )
+                and _query_asks_technical_explanation_for_readme_verification(task.query)
+            ):
+                matched_span = None
+
+            if matched_span is None and not deployment_claim:
+                if (
+                    _claim_eligible_for_readme_repository_normalized_composite(
+                        claim, task, source_chunk
+                    )
+                    and _query_asks_technical_explanation_for_readme_verification(task.query)
+                ):
+                    readme_batch_tracker["repository_normalized_verification_attempt_count"] += 1
+                    readme_claim_tracker["repository_normalized_verification_attempt_count"] += 1
+                    composite_span, composite_diag = (
+                        try_repository_readme_normalized_composite_verification(
+                            source_text=source_chunk.text,
+                            statement=claim.statement,
+                            draft_excerpt=citation_span.excerpt,
+                            start_offset=citation_span.start_offset,
+                            end_offset=citation_span.end_offset,
+                            query=task.query,
+                        )
+                    )
+                    if composite_span is not None:
+                        matched_span = composite_span
+                        readme_meta = composite_diag
+                        readme_batch_tracker[
+                            "repository_normalized_verification_supported_count"
+                        ] += 1
+                        readme_claim_tracker[
+                            "repository_normalized_verification_supported_count"
+                        ] += 1
+                        method = composite_diag.get("repository_normalized_support_method")
+                        if isinstance(method, str):
+                            batch_methods = readme_batch_tracker[
+                                "repository_normalized_support_method_distribution"
+                            ]
+                            claim_methods = readme_claim_tracker[
+                                "repository_normalized_support_method_distribution"
+                            ]
+                            batch_methods[method] += 1
+                            claim_methods[method] += 1
+                        _readme_set_diag(readme_batch_tracker, composite_diag)
+                        _readme_set_diag(readme_claim_tracker, composite_diag)
+                    else:
+                        _readme_set_diag(readme_batch_tracker, composite_diag)
+                        _readme_set_diag(readme_claim_tracker, composite_diag)
+                        rej = composite_diag.get("repository_normalized_support_rejection")
+                        if isinstance(rej, str):
+                            readme_batch_tracker[
+                                "repository_normalized_verification_rejection_reason_distribution"
+                            ][rej] += 1
+                            readme_claim_tracker[
+                                "repository_normalized_verification_rejection_reason_distribution"
+                            ][rej] += 1
             if matched_span is None:
                 continue
             if (
@@ -1137,6 +1658,7 @@ class ClaimDraftingService:
                     source_chunk=source_chunk,
                     matched_span=matched_span,
                     retrieval_score=evidence.score,
+                    readme_composite_metadata=readme_meta,
                 )
             )
         return candidates
@@ -1373,6 +1895,7 @@ def _verification_evidence_candidate(
     source_chunk: SourceChunk,
     matched_span: VerificationSpanMatch,
     retrieval_score: float | None,
+    readme_composite_metadata: dict[str, Any] | None = None,
 ) -> VerificationEvidenceCandidate:
     source_quality_score = _source_quality_score(source_chunk)
     content_quality_score = _chunk_content_quality_score(source_chunk)
@@ -1402,6 +1925,7 @@ def _verification_evidence_candidate(
         content_hash=_source_content_hash(source_chunk),
         chunk_text_hash=_source_chunk_text_hash(source_chunk),
         span_text_hash=normalized_excerpt_hash(matched_span.excerpt),
+        readme_composite_metadata=readme_composite_metadata,
     )
 
 
@@ -1657,6 +2181,843 @@ def _source_chunk_hard_excluded_for_claims(source_chunk: SourceChunk) -> bool:
     return source_score is not None and source_score < 0.2
 
 
+_README_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
+_README_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.+?)\s*$")
+_README_DASH_ITEM_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 /&+_.-]{2,80})\s+[—-]\s+(.+?)\s*$")
+_README_IGNORE_SECTION_MARKERS = (
+    "license",
+    "contributing",
+    "contribution",
+    "community",
+    "support",
+    "contributors",
+    "acknowledg",
+    "acknowledgement",
+    "roadmap",
+    "changelog",
+    "release notes",
+    "faq",
+    "installation",
+    "install",
+    "requirements",
+    "prerequisite",
+    "security policy",
+)
+_README_IGNORE_BULLET_MARKERS = (
+    "http://",
+    "https://",
+    "badge",
+    "license",
+    "contributing",
+    "community",
+    "star",
+    "fork",
+    "issue",
+    "pull request",
+    "discord",
+    "slack",
+    "join ",
+    "follow ",
+    "pip install",
+    "npm install",
+    "brew install",
+    "git clone",
+)
+_README_NORMALIZED_MAX_CANDIDATES_PER_CHUNK = 2
+_README_NORMALIZED_MAX_GROUPS_PER_FULL_RAW_README_DOC = 4
+_GITHUB_README_UI_LINE_KEYS = frozenset(
+    {
+        "actions",
+        "activity",
+        "branches",
+        "branchestags",
+        "code",
+        "contributors",
+        "fork",
+        "forks",
+        "foldersandfiles",
+        "history",
+        "insights",
+        "issues",
+        "lastcommitdate",
+        "lastcommitmessage",
+        "latestcommit",
+        "license",
+        "name",
+        "notifications",
+        "openmoreactionsmenu",
+        "packages",
+        "projects",
+        "public",
+        "pullrequests",
+        "readmemd",
+        "releases",
+        "repositoryfilesnavigation",
+        "resources",
+        "security",
+        "star",
+        "stars",
+        "tags",
+        "watch",
+    }
+)
+_GITHUB_README_DROP_SECTION_HEADINGS = frozenset(
+    {
+        "about",
+        "activity",
+        "branches",
+        "code of conduct",
+        "community",
+        "contributing",
+        "contributing guide",
+        "contributors",
+        "forks",
+        "license",
+        "packages",
+        "releases",
+        "resources",
+        "security",
+        "security policy",
+        "stars",
+        "topics",
+    }
+)
+_GITHUB_README_DROP_LINE_PREFIXES = (
+    "contributing guide",
+    "code of conduct",
+    "discussions:",
+    "forked from ",
+    "open more actions menu",
+    "you must be signed in",
+)
+_GITHUB_COUNTER_LINE_RE = re.compile(r"^\d+(?:[.,]\d+)?[kKmM]?$")
+_GITHUB_COMMIT_COUNT_LINE_RE = re.compile(r"^\d[\d,]*\s+commits?$", re.IGNORECASE)
+_GITHUB_TOC_LINK_LINE_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+\.)\s+\[[^\]]+\]\(#[^)]+\)\s*$"
+)
+_GITHUB_BADGE_LINE_RE = re.compile(
+    r"(?:!\[[^\]]*\]\([^)]+(?:badge|shields|actions/workflows)[^)]+\)|"
+    r"shields\.io|badge\.svg)",
+    re.IGNORECASE,
+)
+
+
+def _should_normalize_repository_readme_candidates(
+    *,
+    query: str,
+    source_chunk: SourceChunk,
+    source_role: str,
+) -> bool:
+    if source_role != "official_repository":
+        return False
+    if not _technical_slot_order_for_query(query):
+        return False
+    if classify_query_intent(query).intent_name == "deployment":
+        return False
+    return _is_repository_readme_or_overview_url(
+        canonical_url=source_chunk.source_document.canonical_url,
+        domain=source_chunk.source_document.domain,
+    )
+
+
+def _github_readme_clean_result_for_claims(
+    *,
+    query: str,
+    source_chunk: SourceChunk,
+    source_role: str,
+    readme_body_text: str | None = None,
+) -> GithubReadmeCleanResult:
+    body = readme_body_text if readme_body_text is not None else source_chunk.text
+    if not _should_clean_github_readme_for_claims(
+        query=query,
+        source_chunk=source_chunk,
+        source_role=source_role,
+    ):
+        return GithubReadmeCleanResult(
+            text=body,
+            line_spans=_line_spans_for_text(body),
+            applied=False,
+            removed_line_count=0,
+            kept_line_count=len(body.splitlines()),
+        )
+    return _clean_github_readme_text(body)
+
+
+def _should_clean_github_readme_for_claims(
+    *,
+    query: str,
+    source_chunk: SourceChunk,
+    source_role: str,
+) -> bool:
+    if source_role != "official_repository":
+        return False
+    if not _technical_slot_order_for_query(query):
+        return False
+    if classify_query_intent(query).intent_name == "deployment":
+        return False
+    return _is_repository_readme_or_overview_url(
+        canonical_url=source_chunk.source_document.canonical_url,
+        domain=source_chunk.source_document.domain,
+    )
+
+
+def _is_raw_github_readme_readme_document_chunk(source_chunk: SourceChunk) -> bool:
+    """Narrow: raw GitHub README markdown only (not arbitrary raw paths)."""
+    doc = source_chunk.source_document
+    domain = (doc.domain or "").lower().rstrip(".")
+    if domain != "raw.githubusercontent.com":
+        return False
+    url = (doc.canonical_url or "").lower()
+    return url.endswith("/readme.md") or url.endswith("/readme.markdown")
+
+
+def _readme_first_bullet_original_start_in_range(full_raw: str, o_st: int, o_en: int) -> int | None:
+    segment = full_raw[o_st:o_en]
+    pos = o_st
+    for raw_line in segment.splitlines(keepends=True):
+        stripped = raw_line.strip()
+        if not stripped:
+            pos += len(raw_line)
+            continue
+        is_bullet_line = _readme_bullet_text(stripped) is not None or _readme_dash_item_text(
+            stripped
+        ) is not None
+        if is_bullet_line:
+            return pos
+        pos += len(raw_line)
+    return None
+
+
+def _readme_best_owner_chunk_local_span(
+    ordered_chunks: list[SourceChunk],
+    full_raw: str,
+    global_start: int,
+    global_end: int,
+) -> tuple[SourceChunk, int, int] | None:
+    """Pick the chunk with the largest character overlap for [global_start, global_end)."""
+    best: tuple[int, SourceChunk, int, int] | None = None
+    pos = 0
+    for chunk in ordered_chunks:
+        base = pos
+        ceiling = base + len(chunk.text)
+        lo = max(global_start, base)
+        hi = min(global_end, ceiling)
+        if hi > lo:
+            overlap = hi - lo
+            local_start = lo - base
+            local_end = hi - base
+            if best is None or overlap > best[0]:
+                best = (overlap, chunk, local_start, local_end)
+        pos = ceiling + 1
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def _task_raw_readme_readme_document_ids(
+    repository: SourceChunkRepository,
+    task_id: UUID,
+    *,
+    cap: int = 2,
+) -> set[UUID]:
+    """Up to ``cap`` raw README ``source_document`` ids for a task (stable fetch order)."""
+    ordered: list[UUID] = []
+    seen: set[UUID] = set()
+    for chunk in repository.list_for_task(task_id, limit=800):
+        if not _is_raw_github_readme_readme_document_chunk(chunk):
+            continue
+        doc_id = chunk.source_document_id
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        ordered.append(doc_id)
+        if len(ordered) >= cap:
+            break
+    return set(ordered)
+
+
+def _raw_readme_full_document_normalized_candidates(
+    *,
+    source_chunk_repository: SourceChunkRepository,
+    chunks_seen: list[tuple[SourceChunk, float | None]],
+    query: str,
+    existing_candidates: list[DraftClaimCandidate],
+    document_target_slots: dict[UUID, frozenset[str]] | None = None,
+) -> tuple[list[DraftClaimCandidate], dict[str, int]]:
+    """
+    Paragraph chunking often splits markdown ``##`` headings from their bullet lists. The
+    per-chunk normalizer then produces zero groups. For raw ``README.md`` / ``README.markdown``
+    on ``raw.githubusercontent.com`` only, join all eligible chunks for the document, extract
+    heading/bullet groups once, and attach citations to the chunk that contains the bulk of the
+    bullet lines (bounded; technical-explanation queries only).
+    """
+    diag = {
+        "raw_readme_full_document_group_count": 0,
+        "raw_readme_full_document_normalized_candidate_count": 0,
+    }
+    if classify_query_intent(query).intent_name == "deployment":
+        return [], diag
+    if not _technical_slot_order_for_query(query):
+        return [], diag
+
+    if not chunks_seen:
+        return [], diag
+
+    task_id = chunks_seen[0][0].source_document.task_id
+
+    doc_ids: set[UUID] = {
+        ch.source_document_id
+        for ch, _ in chunks_seen
+        if _is_raw_github_readme_readme_document_chunk(ch)
+    }
+    doc_ids |= _task_raw_readme_readme_document_ids(source_chunk_repository, task_id, cap=2)
+    if not doc_ids:
+        return [], diag
+
+    existing_identities = {normalize_claim_identity(c.statement) for c in existing_candidates}
+    out: list[DraftClaimCandidate] = []
+
+    for doc_id in doc_ids:
+        ordered = [
+            c
+            for c in source_chunk_repository.list_for_document(doc_id)
+            if _source_chunk_eligible_for_claims(c)
+        ]
+        if len(ordered) < 2:
+            continue
+        head_chunk = ordered[0]
+        classification = classify_source_intent(
+            canonical_url=head_chunk.source_document.canonical_url,
+            domain=head_chunk.source_document.domain,
+            title=head_chunk.source_document.title,
+            query=query,
+        )
+        if not _should_normalize_repository_readme_candidates(
+            query=query,
+            source_chunk=head_chunk,
+            source_role=classification.source_role,
+        ):
+            continue
+
+        full_raw = "\n".join(c.text for c in ordered)
+        if len(full_raw) < 80:
+            continue
+
+        clean_result = _github_readme_clean_result_for_claims(
+            query=query,
+            source_chunk=head_chunk,
+            source_role=classification.source_role,
+            readme_body_text=full_raw,
+        )
+        groups = _repository_heading_bullet_groups(
+            clean_result.text,
+            original_text=full_raw,
+            original_line_spans=clean_result.line_spans,
+        )
+        if not groups:
+            continue
+
+        capped = groups[:_README_NORMALIZED_MAX_GROUPS_PER_FULL_RAW_README_DOC]
+        diag["raw_readme_full_document_group_count"] += len(capped)
+        subject = _repository_subject_name(source_chunk=head_chunk, query=query)
+        seen_local: set[str] = set()
+
+        for heading, items, _ost, oen, _excerpt in capped:
+            statement = _repository_readme_statement(subject=subject, heading=heading, items=items)
+            if not statement:
+                continue
+            ident = normalize_claim_identity(statement)
+            if ident in existing_identities or ident in seen_local:
+                continue
+
+            bullet_start = _readme_first_bullet_original_start_in_range(full_raw, _ost, oen)
+            if bullet_start is None:
+                bullet_start = _ost
+            mapped = _readme_best_owner_chunk_local_span(ordered, full_raw, bullet_start, oen)
+            if mapped is None:
+                continue
+            owner, ls, le = mapped
+            if le <= ls or not owner.text[ls:le].strip():
+                continue
+
+            span_excerpt = owner.text[ls:le]
+            supporting_span = SupportingSpan(start_offset=ls, end_offset=le, excerpt=span_excerpt)
+            page_title = owner.source_document.title
+            content_quality_score = _chunk_content_quality_score(owner)
+            source_quality_score = _source_quality_score(owner)
+            lim_slot = _limitations_official_planner_target_slot_id(
+                technical_explanation=document_target_slots is not None,
+                document_target_slots=document_target_slots,
+                source_document_id=owner.source_document_id,
+                source_role=classification.source_role,
+            )
+            score = score_claim_statement(
+                statement=statement,
+                query=query,
+                content_quality_score=content_quality_score,
+                source_quality_score=source_quality_score,
+                domain=owner.source_document.domain,
+                source_url=owner.source_document.canonical_url,
+                page_title=page_title,
+                target_slot_id=lim_slot,
+            )
+            evidence_slot_ids = technical_slot_ids_for_text(
+                text=f"{statement}\n{span_excerpt}",
+                category=score.claim_category,
+                query=query,
+                source_intent=classification.source_intent,
+            )
+            lexical_slots = evidence_slot_ids
+            planner_only: tuple[str, ...] = ()
+            if document_target_slots is not None:
+                evidence_slot_ids, planner_only = merge_technical_lexical_and_planner_slots(
+                    lexical_slots=lexical_slots,
+                    source_document_id=owner.source_document_id,
+                    source_role=classification.source_role,
+                    document_target_slots=document_target_slots,
+                )
+            rejected_rules = _strict_rejected_rules(owner, statement, query, score)
+            if score.rejected_reason == "reference_or_citation":
+                rejected_rules = [
+                    rule for rule in rejected_rules if rule != "reference_or_citation"
+                ]
+            out.append(
+                DraftClaimCandidate(
+                    source_chunk=owner,
+                    supporting_span=supporting_span,
+                    statement=statement,
+                    score=score,
+                    retrieval_score=None,
+                    paragraph_key=(owner.id, _paragraph_index(owner.text, ls)),
+                    rejected_rules=tuple(rejected_rules),
+                    original_rejected_reason=_first_rejection_reason(rejected_rules, score),
+                    evidence_slot_ids=evidence_slot_ids,
+                    lexical_evidence_slot_ids=lexical_slots,
+                    candidate_target_slot_ids=planner_only,
+                    normalized_from_readme=True,
+                    cleaned_github_readme=clean_result.applied,
+                )
+            )
+            seen_local.add(ident)
+            existing_identities.add(ident)
+
+    diag["raw_readme_full_document_normalized_candidate_count"] = len(out)
+    return out, diag
+
+
+def _clean_github_readme_text(text: str) -> GithubReadmeCleanResult:
+    raw_lines = text.splitlines(keepends=True)
+    if not raw_lines:
+        return GithubReadmeCleanResult(
+            text="",
+            line_spans=(),
+            applied=True,
+            removed_line_count=0,
+            kept_line_count=0,
+        )
+
+    original_lines: list[tuple[str, int, int]] = []
+    cursor = 0
+    for raw_line in raw_lines:
+        start = cursor
+        end = cursor + len(raw_line)
+        original_lines.append((raw_line, start, end))
+        cursor = end
+
+    body_start_index = _github_readme_body_start_index(original_lines)
+    kept_lines: list[str] = []
+    kept_spans: list[tuple[int, int]] = []
+    removed_line_count = body_start_index
+    seen_short_line_keys: set[str] = set()
+    drop_section = False
+
+    for raw_line, start, end in original_lines[body_start_index:]:
+        stripped = raw_line.strip()
+        if not stripped:
+            if kept_lines and kept_lines[-1].strip():
+                kept_lines.append(raw_line)
+                kept_spans.append((start, end))
+            continue
+
+        if _github_readme_drop_section_heading(stripped):
+            drop_section = True
+            removed_line_count += 1
+            continue
+        if drop_section:
+            if _readme_heading_text(stripped) is not None:
+                drop_section = False
+            else:
+                removed_line_count += 1
+                continue
+
+        if _github_readme_noise_line(stripped, seen_short_line_keys=seen_short_line_keys):
+            removed_line_count += 1
+            continue
+
+        line_key = _github_readme_line_key(stripped)
+        if _looks_like_duplicate_nav_line(stripped) and line_key in seen_short_line_keys:
+            removed_line_count += 1
+            continue
+        if _looks_like_duplicate_nav_line(stripped):
+            seen_short_line_keys.add(line_key)
+
+        kept_lines.append(raw_line)
+        kept_spans.append((start, end))
+
+    while kept_lines and not kept_lines[-1].strip():
+        kept_lines.pop()
+        kept_spans.pop()
+
+    return GithubReadmeCleanResult(
+        text="".join(kept_lines),
+        line_spans=tuple(kept_spans),
+        applied=True,
+        removed_line_count=removed_line_count,
+        kept_line_count=len(kept_lines),
+    )
+
+
+def _line_spans_for_text(text: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for raw_line in text.splitlines(keepends=True):
+        start = cursor
+        end = cursor + len(raw_line)
+        spans.append((start, end))
+        cursor = end
+    return tuple(spans)
+
+
+def _github_readme_body_start_index(lines: list[tuple[str, int, int]]) -> int:
+    for index, (raw_line, _, _) in enumerate(lines):
+        if raw_line.strip().lower() == "repository files navigation":
+            return index + 1
+    return 0
+
+
+def _github_readme_noise_line(
+    line: str,
+    *,
+    seen_short_line_keys: set[str],
+) -> bool:
+    lower = _clean_markdown_text(line).lower()
+    key = _github_readme_line_key(line)
+    if key in _GITHUB_README_UI_LINE_KEYS:
+        return True
+    if any(lower.startswith(prefix) for prefix in _GITHUB_README_DROP_LINE_PREFIXES):
+        return True
+    if _GITHUB_COUNTER_LINE_RE.match(line) or _GITHUB_COMMIT_COUNT_LINE_RE.match(line):
+        return True
+    if _GITHUB_BADGE_LINE_RE.search(line) or _GITHUB_TOC_LINK_LINE_RE.match(line):
+        return True
+    if key in seen_short_line_keys and _looks_like_duplicate_nav_line(line):
+        return True
+    return False
+
+
+def _github_readme_drop_section_heading(line: str) -> bool:
+    cleaned = _clean_markdown_text(line).lower().strip()
+    if cleaned in _GITHUB_README_DROP_SECTION_HEADINGS:
+        return True
+    return any(
+        cleaned.startswith(f"{heading} ") for heading in _GITHUB_README_DROP_SECTION_HEADINGS
+    )
+
+
+def _looks_like_duplicate_nav_line(line: str) -> bool:
+    if len(line) > 80 or not line:
+        return False
+    if any(mark in line for mark in ".:;!?"):
+        return False
+    return bool(_github_readme_line_key(line))
+
+
+def _github_readme_line_key(line: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _clean_markdown_text(line).lower())
+
+
+def _is_repository_readme_or_overview_url(*, canonical_url: str, domain: str) -> bool:
+    lower_url = canonical_url.lower()
+    lower_domain = domain.lower()
+    if lower_domain == "raw.githubusercontent.com":
+        return lower_url.endswith("/readme.md")
+    if lower_domain == "github.com":
+        if "/issues" in lower_url or "/pull" in lower_url or "/discussions" in lower_url:
+            return False
+        path_parts = [part for part in lower_url.split("github.com/", 1)[-1].split("/") if part]
+        if len(path_parts) == 2:
+            return True
+        if len(path_parts) >= 4 and path_parts[2] == "blob" and path_parts[-1] == "readme.md":
+            return True
+    return False
+
+
+def _repository_readme_normalized_candidates(
+    *,
+    source_chunk: SourceChunk,
+    query: str,
+    page_title: str | None,
+    content_quality_score: float | None,
+    source_quality_score: float | None,
+    source_intent: str,
+    source_role: str,
+    clean_result: GithubReadmeCleanResult | None = None,
+    document_target_slots: dict[UUID, frozenset[str]] | None = None,
+) -> list[DraftClaimCandidate]:
+    candidate_text = clean_result.text if clean_result is not None else source_chunk.text
+    groups = _repository_heading_bullet_groups(
+        candidate_text,
+        original_text=source_chunk.text,
+        original_line_spans=clean_result.line_spans if clean_result is not None else (),
+    )
+    if not groups:
+        return []
+    subject = _repository_subject_name(source_chunk=source_chunk, query=query)
+    candidates: list[DraftClaimCandidate] = []
+    seen_statements: set[str] = set()
+    for heading, items, start_offset, end_offset, excerpt in groups[
+        : _README_NORMALIZED_MAX_CANDIDATES_PER_CHUNK
+    ]:
+        statement = _repository_readme_statement(subject=subject, heading=heading, items=items)
+        if not statement:
+            continue
+        normalized_identity = normalize_claim_identity(statement)
+        if normalized_identity in seen_statements:
+            continue
+        seen_statements.add(normalized_identity)
+        supporting_span = SupportingSpan(
+            start_offset=start_offset,
+            end_offset=end_offset,
+            excerpt=excerpt,
+        )
+        lim_slot = _limitations_official_planner_target_slot_id(
+            technical_explanation=document_target_slots is not None,
+            document_target_slots=document_target_slots,
+            source_document_id=source_chunk.source_document_id,
+            source_role=source_role,
+        )
+        score = score_claim_statement(
+            statement=statement,
+            query=query,
+            content_quality_score=content_quality_score,
+            source_quality_score=source_quality_score,
+            domain=source_chunk.source_document.domain,
+            source_url=source_chunk.source_document.canonical_url,
+            page_title=page_title,
+            target_slot_id=lim_slot,
+        )
+        evidence_slot_ids = technical_slot_ids_for_text(
+            text=f"{statement}\n{excerpt}",
+            category=score.claim_category,
+            query=query,
+            source_intent=source_intent,
+        )
+        lexical_slots = evidence_slot_ids
+        planner_only: tuple[str, ...] = ()
+        if document_target_slots is not None:
+            evidence_slot_ids, planner_only = merge_technical_lexical_and_planner_slots(
+                lexical_slots=lexical_slots,
+                source_document_id=source_chunk.source_document_id,
+                source_role=source_role,
+                document_target_slots=document_target_slots,
+            )
+        rejected_rules = _strict_rejected_rules(source_chunk, statement, query, score)
+        if score.rejected_reason == "reference_or_citation":
+            rejected_rules = [rule for rule in rejected_rules if rule != "reference_or_citation"]
+        candidates.append(
+            DraftClaimCandidate(
+                source_chunk=source_chunk,
+                supporting_span=supporting_span,
+                statement=statement,
+                score=score,
+                retrieval_score=None,
+                paragraph_key=(source_chunk.id, _paragraph_index(source_chunk.text, start_offset)),
+                rejected_rules=tuple(rejected_rules),
+                original_rejected_reason=_first_rejection_reason(rejected_rules, score),
+                evidence_slot_ids=evidence_slot_ids,
+                lexical_evidence_slot_ids=lexical_slots,
+                candidate_target_slot_ids=planner_only,
+                normalized_from_readme=True,
+                cleaned_github_readme=clean_result.applied if clean_result is not None else False,
+            )
+        )
+    return candidates
+
+
+def _repository_heading_bullet_groups(
+    text: str,
+    *,
+    original_text: str | None = None,
+    original_line_spans: tuple[tuple[int, int], ...] = (),
+) -> list[tuple[str, list[str], int, int, str]]:
+    lines: list[tuple[str, int, int, int, int]] = []
+    cursor = 0
+    for line_index, raw_line in enumerate(text.splitlines(keepends=True)):
+        start = cursor
+        end = cursor + len(raw_line)
+        if original_line_spans and line_index < len(original_line_spans):
+            original_start, original_end = original_line_spans[line_index]
+        else:
+            original_start, original_end = start, end
+        lines.append((raw_line.rstrip("\r\n"), start, end, original_start, original_end))
+        cursor = end
+    groups: list[tuple[str, list[str], int, int, str]] = []
+    index = 0
+    while index < len(lines):
+        line, heading_start, _, original_heading_start, _ = lines[index]
+        heading = _readme_heading_text(line)
+        if heading is None:
+            index += 1
+            continue
+        heading_lower = heading.lower()
+        if any(
+            _readme_ignore_heading_marker_matches(marker, heading_lower)
+            for marker in _README_IGNORE_SECTION_MARKERS
+        ):
+            index += 1
+            continue
+        cursor_index = index + 1
+        while cursor_index < len(lines) and not lines[cursor_index][0].strip():
+            cursor_index += 1
+        bullet_items: list[str] = []
+        bullet_end = heading_start
+        original_bullet_end = original_heading_start
+        while cursor_index < len(lines):
+            bullet_line, _, bullet_line_end, _, original_bullet_line_end = lines[cursor_index]
+            if not bullet_line.strip():
+                if bullet_items:
+                    cursor_index += 1
+                    continue
+                break
+            bullet_value = _readme_bullet_text(bullet_line) or _readme_dash_item_text(bullet_line)
+            if bullet_value is None:
+                break
+            cleaned_bullet = _clean_markdown_text(bullet_value)
+            cleaned_lower = cleaned_bullet.lower()
+            if cleaned_bullet and not any(
+                marker in cleaned_lower for marker in _README_IGNORE_BULLET_MARKERS
+            ):
+                bullet_items.append(cleaned_bullet)
+                bullet_end = bullet_line_end
+                original_bullet_end = original_bullet_line_end
+            cursor_index += 1
+        if len(bullet_items) < 2:
+            index += 1
+            continue
+        if original_text is not None and original_line_spans:
+            excerpt = original_text[original_heading_start:original_bullet_end]
+            start_offset = original_heading_start
+            end_offset = original_bullet_end
+        else:
+            excerpt = text[heading_start:bullet_end]
+            start_offset = heading_start
+            end_offset = bullet_end
+        if excerpt.strip():
+            groups.append((heading, bullet_items[:4], start_offset, end_offset, excerpt))
+        index = cursor_index
+    return groups
+
+
+def _readme_ignore_heading_marker_matches(marker: str, heading_lower: str) -> bool:
+    if marker == "support":
+        return re.search(r"\bsupport\b", heading_lower) is not None
+    return marker in heading_lower
+
+
+def _readme_heading_text(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if _README_BULLET_RE.match(stripped):
+        return None
+    match = _README_HEADING_RE.match(line)
+    if match:
+        heading = match.group(1).strip()
+    elif stripped.endswith(":"):
+        heading = stripped[:-1].strip()
+    else:
+        heading = stripped
+    heading = _clean_markdown_text(heading)
+    if not heading:
+        return None
+    if len(heading.split()) > 10 and not stripped.endswith(":"):
+        return None
+    if len(heading.split()) > 24:
+        return None
+    if heading.endswith("."):
+        return None
+    return heading
+
+
+def _readme_bullet_text(line: str) -> str | None:
+    match = _README_BULLET_RE.match(line)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _readme_dash_item_text(line: str) -> str | None:
+    match = _README_DASH_ITEM_RE.match(line)
+    if match is None:
+        return None
+    left = _clean_markdown_text(match.group(1))
+    right = _clean_markdown_text(match.group(2))
+    if right and len(right.split()) <= 2:
+        return f"{left} {right}".strip()
+    return left
+
+
+def _clean_markdown_text(value: str) -> str:
+    cleaned = re.sub(r"`([^`]+)`", r"\1", value)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"[*_#>]", " ", cleaned)
+    return " ".join(cleaned.split()).strip("-: ")
+
+
+def _repository_subject_name(*, source_chunk: SourceChunk, query: str) -> str:
+    intent = classify_query_intent(query)
+    for subject in intent.subject_terms:
+        lowered = subject.strip().lower()
+        if not lowered:
+            continue
+        if lowered == "langgraph":
+            return "LangGraph"
+        return lowered.title()
+    title = source_chunk.source_document.title or ""
+    if "/" in title:
+        repo = title.split("/")[-1].strip()
+        if repo:
+            if repo.lower() == "langgraph":
+                return "LangGraph"
+            return repo.replace("-", " ").title()
+    return "The project"
+
+
+def _repository_readme_statement(*, subject: str, heading: str, items: list[str]) -> str:
+    heading_lower = heading.lower()
+    item_phrase = _english_list_phrase(items)
+    if not item_phrase:
+        return ""
+    if any(term in heading_lower for term in ("example", "use case", "tutorial", "quickstart")):
+        return f"{subject} examples include use cases such as {item_phrase}."
+    if any(term in heading_lower for term in ("workflow", "lifecycle", "how it works")):
+        return f"{subject} workflows include lifecycle elements such as {item_phrase}."
+    if any(term in heading_lower for term in ("core", "abstraction", "concept")):
+        return f"{subject} provides core abstractions such as {item_phrase}."
+    return f"{subject} provides key features such as {item_phrase} for agent workflows."
+
+
+def _english_list_phrase(items: list[str]) -> str:
+    normalized = [item.strip() for item in items if item.strip()]
+    if not normalized:
+        return ""
+    if len(normalized) == 1:
+        return normalized[0]
+    if len(normalized) == 2:
+        return f"{normalized[0]} and {normalized[1]}"
+    return f"{', '.join(normalized[:-1])}, and {normalized[-1]}"
+
+
 def _strict_rejected_rules(
     source_chunk: SourceChunk,
     statement: str,
@@ -1664,6 +3025,7 @@ def _strict_rejected_rules(
     score: ClaimCandidateScore,
 ) -> list[str]:
     from services.orchestrator.app.claims.drafting import CandidateTriageStatus
+
     rejected_rules: list[str] = []
     deployment_evidence_statement = is_deployment_evidence_statement(statement)
     if not _source_chunk_eligible_for_claims(source_chunk) and not deployment_evidence_statement:
@@ -1673,7 +3035,10 @@ def _strict_rejected_rules(
             rejected_rules.append(score.rejected_reason)
         else:
             rejected_rules.append("reject_fatal")
-    if not is_claimable_statement(statement, query=query) and score.triage_status != CandidateTriageStatus.REJECT_FATAL:
+    if (
+        not is_claimable_statement(statement, query=query)
+        and score.triage_status != CandidateTriageStatus.REJECT_FATAL
+    ):
         rejected_rules.append("not_claimable_statement")
     return list(dict.fromkeys(rejected_rules))
 
@@ -1711,6 +3076,34 @@ def _deployment_slot_order_for_query(query: str) -> dict[str, int]:
         for index, slot in enumerate(answer_slots_for_query(query))
         if slot.slot_id.startswith("deployment_")
     }
+
+
+def _technical_slot_order_for_query(query: str) -> dict[str, int]:
+    slots = {
+        slot.slot_id: index
+        for index, slot in enumerate(answer_slots_for_query(query))
+        if slot.slot_id
+        in {
+            "definition",
+            "motivation_problem",
+            "core_abstractions",
+            "architecture",
+            "execution_model",
+            "workflow_lifecycle",
+            "key_features",
+            "examples_use_cases",
+            "limitations",
+            "comparison_positioning",
+            "official_sources",
+        }
+    }
+    return slots if "core_abstractions" in slots and "execution_model" in slots else {}
+
+
+def _technical_source_role_order_for_query(query: str) -> tuple[str, ...]:
+    if not _technical_slot_order_for_query(query):
+        return ()
+    return ("official_docs", "official_reference", "official_repository")
 
 
 def _deployment_claim_limit_for_query(query: str) -> int:
@@ -1806,14 +3199,84 @@ def _deployment_slot_candidate_sort_key(
     return (-len(set(new_slots)), first_slot_order, candidate_position)
 
 
+def _technical_slot_candidate_sort_key(
+    candidate: DraftClaimCandidate,
+    *,
+    remaining_slots: set[str],
+    slot_order: dict[str, int],
+    candidate_position: int,
+) -> tuple[int, int, float, float, int]:
+    candidate_slots = [slot_id for slot_id in candidate.evidence_slot_ids if slot_id in slot_order]
+    new_slots = [slot_id for slot_id in candidate_slots if slot_id in remaining_slots]
+    if not new_slots:
+        first_slot_order = len(slot_order)
+    else:
+        first_slot_order = min(slot_order.get(slot_id, len(slot_order)) for slot_id in new_slots)
+    return (
+        -len(set(new_slots)),
+        first_slot_order,
+        -candidate.score.query_answer_score,
+        -candidate.score.final_score,
+        candidate_position,
+    )
+
+
+def _technical_source_role_candidate_sort_key(
+    candidate: DraftClaimCandidate,
+    *,
+    candidate_position: int,
+) -> tuple[int, float, float, int]:
+    return (
+        0 if candidate.score.answer_relevant else 1,
+        -candidate.score.query_answer_score,
+        -candidate.score.final_score,
+        candidate_position,
+    )
+
+
+def _repository_candidate_allowed_for_slot_backfill(candidate: DraftClaimCandidate) -> bool:
+    if candidate.score.rejected_reason and not (
+        candidate.normalized_from_readme
+        and candidate.score.rejected_reason == "reference_or_citation"
+    ):
+        return False
+    if candidate.normalized_from_readme and not candidate.rejected_rules:
+        return candidate.score.claim_quality_score >= 0.55 and (
+            candidate.score.query_relevance_score >= 0.3
+            or candidate.score.query_answer_score >= 0.35
+        )
+    allowed_slots = {
+        "examples_use_cases",
+        "workflow_lifecycle",
+        "core_abstractions",
+        "key_features",
+    }
+    if not any(slot_id in allowed_slots for slot_id in candidate.evidence_slot_ids):
+        return False
+    return candidate.score.query_relevance_score >= 0.45 and (
+        candidate.score.query_answer_score >= 0.5 or candidate.score.claim_quality_score >= 0.7
+    )
+
+
+def _candidate_source_role(candidate: DraftClaimCandidate, *, query: str) -> str:
+    classification = classify_source_intent(
+        canonical_url=candidate.source_chunk.source_document.canonical_url,
+        domain=candidate.source_chunk.source_document.domain,
+        title=candidate.source_chunk.source_document.title,
+        query=query,
+    )
+    return classification.source_role
+
+
 def _fallback_candidate_allowed(
     candidate: DraftClaimCandidate,
     *,
     query: str | None = None,
 ) -> bool:
     from services.orchestrator.app.claims.drafting import CandidateTriageStatus
+
     statement = " ".join(candidate.statement.split())
-    has_cjk = any('\u4e00' <= char <= '\u9fff' for char in statement)
+    has_cjk = any("\u4e00" <= char <= "\u9fff" for char in statement)
     if not has_cjk and len(statement) < 40:
         return False
     if len(statement) > 300:
@@ -1889,9 +3352,61 @@ def _first_rejection_reason(
     score: ClaimCandidateScore,
 ) -> str | None:
     from services.orchestrator.app.claims.drafting import CandidateTriageStatus
+
     if score.triage_status == CandidateTriageStatus.REJECT_FATAL:
         return score.rejected_reason
     return rejected_rules[0] if rejected_rules else None
+
+
+def _limitations_slot_draft_diagnostics(
+    candidates: list[DraftClaimCandidate],
+    *,
+    query: str,
+) -> dict[str, Any]:
+    lim_candidates = [
+        c
+        for c in candidates
+        if "limitations" in (c.evidence_slot_ids or ())
+        or "limitations" in (c.candidate_target_slot_ids or ())
+    ]
+    role_counts: Counter[str] = Counter()
+    rej_counts: Counter[str] = Counter()
+    tier_main = tier_supp = tier_recall = tier_rej = 0
+    target_slot_hits = 0
+    for c in lim_candidates:
+        if "limitations" in (c.candidate_target_slot_ids or ()):
+            target_slot_hits += 1
+        src = classify_source_intent(
+            canonical_url=c.source_chunk.source_document.canonical_url,
+            domain=c.source_chunk.source_document.domain,
+            title=c.source_chunk.source_document.title,
+            query=query,
+        )
+        role_counts[src.source_role or "unknown"] += 1
+        tier = c.score.candidate_tier
+        if tier == "main_candidate":
+            tier_main += 1
+        elif tier == "supporting_candidate":
+            tier_supp += 1
+        elif tier == "recall_candidate":
+            tier_recall += 1
+        else:
+            tier_rej += 1
+        for rule in c.rejected_rules:
+            rej_counts[rule] += 1
+        if not c.rejected_rules and c.score.rejected_reason:
+            rej_counts[str(c.score.rejected_reason)] += 1
+    return {
+        "limitations_candidate_count": len(lim_candidates),
+        "limitations_main_candidate_count": tier_main,
+        "limitations_supporting_candidate_count": tier_supp,
+        "limitations_recall_candidate_count": tier_recall,
+        "limitations_rejected_candidate_count": tier_rej,
+        "limitations_rejection_reason_distribution": dict(sorted(rej_counts.items())),
+        "limitations_candidate_source_role_distribution": dict(sorted(role_counts.items())),
+        "limitations_candidate_target_slot_count": target_slot_hits,
+        "limitations_supported_claim_count": 0,
+    }
 
 
 def _build_claim_drafting_diagnostics(
@@ -1901,10 +3416,46 @@ def _build_claim_drafting_diagnostics(
     query: str,
 ) -> dict[str, Any]:
     rejected_candidates = [candidate for candidate in candidates if candidate.rejected_rules]
+    normalized_candidates = [
+        candidate for candidate in candidates if candidate.normalized_from_readme
+    ]
     distribution: dict[str, int] = {}
     for candidate in rejected_candidates:
         for rule in candidate.rejected_rules:
             distribution[rule] = distribution.get(rule, 0) + 1
+    normalized_rejection_distribution: dict[str, int] = {}
+    for candidate in normalized_candidates:
+        for rule in candidate.rejected_rules:
+            normalized_rejection_distribution[rule] = (
+                normalized_rejection_distribution.get(rule, 0) + 1
+            )
+    official_repository_chunks_seen = 0
+    github_readme_cleaner_applied_count = 0
+    github_readme_cleaner_removed_line_count = 0
+    github_readme_cleaner_kept_line_count = 0
+    for source_chunk, _ in chunks_seen:
+        source_classification = classify_source_intent(
+            canonical_url=source_chunk.source_document.canonical_url,
+            domain=source_chunk.source_document.domain,
+            title=source_chunk.source_document.title,
+            query=query,
+        )
+        if source_classification.source_role == "official_repository":
+            official_repository_chunks_seen += 1
+        if _should_clean_github_readme_for_claims(
+            query=query,
+            source_chunk=source_chunk,
+            source_role=source_classification.source_role,
+        ):
+            clean_result = _github_readme_clean_result_for_claims(
+                query=query,
+                source_chunk=source_chunk,
+                source_role=source_classification.source_role,
+            )
+            if clean_result.applied:
+                github_readme_cleaner_applied_count += 1
+                github_readme_cleaner_removed_line_count += clean_result.removed_line_count
+                github_readme_cleaner_kept_line_count += clean_result.kept_line_count
     tier_counts: dict[str, int] = {
         "main_candidate": 0,
         "supporting_candidate": 0,
@@ -1981,8 +3532,26 @@ def _build_claim_drafting_diagnostics(
         ],
         "rejection_reason_distribution": dict(sorted(distribution.items())),
         "chunks": [_chunk_diagnostic(source_chunk) for source_chunk, _ in chunks_seen],
+        "repository_normalized_candidate_count": len(normalized_candidates),
+        "repository_normalized_claim_count": 0,
+        "repository_normalized_supported_claim_count": 0,
+        "repository_normalized_rejection_reason_distribution": dict(
+            sorted(normalized_rejection_distribution.items())
+        ),
+        "official_repository_chunks_seen": official_repository_chunks_seen,
+        "official_repository_chunks_cleaned": github_readme_cleaner_applied_count,
+        "github_readme_cleaner_applied_count": github_readme_cleaner_applied_count,
+        "github_readme_cleaner_removed_line_count": github_readme_cleaner_removed_line_count,
+        "github_readme_cleaner_kept_line_count": github_readme_cleaner_kept_line_count,
+        "github_readme_cleaner_candidate_count": sum(
+            1 for candidate in candidates if candidate.cleaned_github_readme
+        ),
+        "official_repository_chunks_with_normalized_candidates": len(
+            {candidate.source_chunk.id for candidate in normalized_candidates}
+        ),
         "fallback_attempted": False,
         "fallback_candidates_count": 0,
+        **_limitations_slot_draft_diagnostics(candidates, query=query),
     }
 
 
@@ -2033,15 +3602,22 @@ def _evidence_candidate_payload(
     source_chunk = candidate.source_chunk
     source_document = source_chunk.source_document
     metadata = source_chunk.metadata_json or {}
-    source_intent = classify_source_intent(
+    source_classification = classify_source_intent(
         canonical_url=source_document.canonical_url,
         domain=source_document.domain,
         title=source_document.title,
         query=query,
-    ).source_intent
+    )
+    source_intent = source_classification.source_intent
+    source_role = source_classification.source_role
     slot_ids = candidate.evidence_slot_ids
     if not slot_ids and classify_query_intent(query).intent_name != "deployment":
-        slot_ids = slot_ids_for_candidate_category(candidate.score.claim_category, query=query)
+        slot_ids = technical_slot_ids_for_text(
+            text=f"{candidate.statement}\n{candidate.supporting_span.excerpt}",
+            category=candidate.score.claim_category,
+            query=query,
+            source_intent=source_intent,
+        ) or slot_ids_for_candidate_category(candidate.score.claim_category, query=query)
     payload = EvidenceCandidate(
         evidence_candidate_id=_candidate_evidence_id(candidate),
         source_document_id=str(source_document.id),
@@ -2073,13 +3649,17 @@ def _evidence_candidate_payload(
             "retrieval_score": candidate.retrieval_score,
             "draft_mode": candidate.draft_mode,
             "evidence_kind": candidate.evidence_kind,
+            "normalized_from_readme": candidate.normalized_from_readme,
+            "cleaned_github_readme": candidate.cleaned_github_readme,
             "fallback_reason": candidate.fallback_reason,
             "original_rejected_reason": candidate.original_rejected_reason,
             "source_url": source_document.canonical_url,
             "source_domain": source_document.domain,
+            "source_role": source_role,
             "chunk_no": source_chunk.chunk_no,
         },
     ).to_payload()
+    payload["source_role"] = source_role
     return payload
 
 

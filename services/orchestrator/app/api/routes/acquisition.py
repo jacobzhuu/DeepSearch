@@ -6,7 +6,14 @@ from uuid import UUID
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from packages.db.repositories import ResearchTaskRepository, TaskEventRepository
 from services.orchestrator.app.acquisition import HttpAcquisitionClient, SmokeAcquisitionClient
+from services.orchestrator.app.acquisition.playwright_backend import (
+    build_playwright_browser_fetch_backend,
+)
+from services.orchestrator.app.acquisition.response_cap_policy import (
+    parse_trusted_docs_domain_allowlist,
+)
 from services.orchestrator.app.api.schemas.acquisition import (
     AcquisitionEntryResponse,
     ContentSnapshotListResponse,
@@ -25,6 +32,9 @@ from services.orchestrator.app.services.acquisition import (
     CandidateUrlNotFoundError,
     create_acquisition_service,
 )
+from services.orchestrator.app.services.acquisition_diagnostics import (
+    compute_acquisition_funnel_diagnostics,
+)
 from services.orchestrator.app.services.research_tasks import TaskNotFoundError
 from services.orchestrator.app.settings import get_settings
 from services.orchestrator.app.storage import SnapshotObjectStore, build_snapshot_object_store
@@ -37,12 +47,19 @@ def get_http_acquisition_client() -> HttpAcquisitionClient:
     settings = get_settings()
     if settings.search_provider.strip().lower() == "smoke":
         return SmokeAcquisitionClient()
+    trusted_domains = parse_trusted_docs_domain_allowlist(settings.acquisition_trusted_docs_domains)
+    trusted_max = settings.acquisition_trusted_docs_max_response_bytes
+    if trusted_max is not None and trusted_max <= settings.acquisition_max_response_bytes:
+        trusted_max = None
     return HttpAcquisitionClient(
         timeout_seconds=settings.acquisition_timeout_seconds,
         max_redirects=settings.acquisition_max_redirects,
         max_response_bytes=settings.acquisition_max_response_bytes,
         user_agent=settings.acquisition_user_agent,
+        accept_language=settings.acquisition_accept_language,
         trust_env_proxy=settings.acquisition_trust_env_proxy,
+        trusted_docs_domains=trusted_domains,
+        trusted_docs_max_response_bytes=trusted_max,
     )
 
 
@@ -66,16 +83,65 @@ def get_acquisition_service(
     snapshot_object_store: Annotated[SnapshotObjectStore, Depends(get_snapshot_object_store)],
 ) -> AcquisitionService:
     settings = get_settings()
+    browser_backend = build_playwright_browser_fetch_backend(settings, http_client)
     return create_acquisition_service(
         session,
         http_client=http_client,
         snapshot_object_store=snapshot_object_store,
         snapshot_bucket=settings.snapshot_storage_bucket,
         max_candidates_per_request=settings.acquisition_max_candidates_per_request,
+        max_must_fetch_per_round=settings.research_acquisition_max_must_fetch_per_round,
+        browser_fetch_backend_impl=browser_backend,
+        browser_fetch_backend_setting=settings.browser_fetch_backend,
+        task_event_repository=TaskEventRepository(session),
+        min_successful_authoritative_snapshots=(
+            settings.acquisition_min_successful_authoritative_snapshots
+        ),
+        defer_success_target_for_high_priority=(
+            settings.acquisition_defer_success_target_for_high_priority
+        ),
     )
 
 
 ServiceDep = Annotated[AcquisitionService, Depends(get_acquisition_service)]
+
+
+@router.get("/{task_id}/acquisition/funnel-metrics")
+def get_acquisition_funnel_metrics(task_id: UUID, session: SessionDep) -> dict[str, object]:
+    """Return ledger-derived funnel diagnostics for search → fetch → parse → chunk."""
+    task = ResearchTaskRepository(session).get(task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="research task not found")
+    settings = get_settings()
+    settings_snapshot = {
+        "acquisition_max_candidates_per_request": settings.acquisition_max_candidates_per_request,
+        "acquisition_target_successful_snapshots": settings.acquisition_target_successful_snapshots,
+        "acquisition_max_response_bytes": settings.acquisition_max_response_bytes,
+        "acquisition_trusted_docs_domains": settings.acquisition_trusted_docs_domains,
+        "acquisition_trusted_docs_max_response_bytes": (
+            settings.acquisition_trusted_docs_max_response_bytes
+        ),
+        "acquisition_min_successful_authoritative_snapshots": (
+            settings.acquisition_min_successful_authoritative_snapshots
+        ),
+        "acquisition_defer_success_target_for_high_priority": (
+            settings.acquisition_defer_success_target_for_high_priority
+        ),
+        "research_acquisition_max_must_fetch_per_round": (
+            settings.research_acquisition_max_must_fetch_per_round
+        ),
+        "research_parse_limit": settings.research_parse_limit,
+        "research_parse_drain_enabled": settings.research_parse_drain_enabled,
+        "research_parse_max_batches": settings.research_parse_max_batches,
+        "research_parse_target_documents": settings.research_parse_target_documents,
+        "research_parse_drain_max_seconds": settings.research_parse_drain_max_seconds,
+    }
+    return compute_acquisition_funnel_diagnostics(
+        session,
+        task_id,
+        task_query=task.query,
+        settings_snapshot=settings_snapshot,
+    )
 
 
 @router.post(

@@ -138,6 +138,7 @@ class SourceYieldSummary:
     source_document_id: str | None
     url: str
     source_intent: str
+    source_role: str
     attempted: bool
     fetched: bool
     parsed: bool
@@ -155,6 +156,7 @@ class SourceYieldSummary:
             "url": self.url,
             "canonical_url": self.url,
             "source_intent": self.source_intent,
+            "source_role": self.source_role,
             "attempted": self.attempted,
             "fetched": self.fetched,
             "parsed": self.parsed,

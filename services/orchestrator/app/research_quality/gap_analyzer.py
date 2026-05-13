@@ -14,6 +14,11 @@ class SupplementalSearchQuery:
     round_no: int
 
     def to_payload(self) -> dict[str, Any]:
+        metadata = {
+            "target_slots": list(self.slot_ids),
+            "source_role": _source_role_for_expected_source_type(self.expected_source_type),
+            "query_source": "gap_analyzer",
+        }
         return {
             "query_text": self.query_text,
             "rationale": self.rationale,
@@ -22,6 +27,7 @@ class SupplementalSearchQuery:
             "slot_ids": list(self.slot_ids),
             "round_no": self.round_no,
             "query_source": "gap_analyzer",
+            "metadata": metadata,
         }
 
 
@@ -226,12 +232,7 @@ def _targeted_project_queries(
         dict.fromkeys(_string_value(slot.get("slot_id"), default="unknown") for slot in gap_slots)
     )
     targeted_queries = {
-        "langgraph": (
-            ("LangGraph site:docs.langchain.com", "official_docs"),
-            ("LangGraph site:reference.langchain.com", "official_docs"),
-            ("LangGraph github langchain-ai langgraph", "official_repository"),
-            ("LangGraph docs langchain", "official_docs"),
-        ),
+        "langgraph": _langgraph_targeted_queries_for_slots(slot_ids),
         "claude": (
             ("Claude site:anthropic.com", "official_docs"),
             ("Claude site:docs.anthropic.com", "official_docs"),
@@ -267,6 +268,60 @@ def _targeted_project_queries(
             )
         )
     return supplemental
+
+
+def _langgraph_targeted_queries_for_slots(slot_ids: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    by_slot: dict[str, tuple[tuple[str, str], ...]] = {
+        "definition": (("LangGraph official documentation overview", "official_docs"),),
+        "motivation_problem": (
+            ("LangGraph why use LangGraph reliable agents official docs", "official_docs"),
+        ),
+        "core_abstractions": (
+            ("LangGraph site:docs.langchain.com concepts state graph nodes edges", "official_docs"),
+            (
+                "LangGraph site:reference.langchain.com StateGraph graph state reference",
+                "reference",
+            ),
+        ),
+        "architecture": (
+            ("LangGraph architecture runtime graph workflow official docs", "official_docs"),
+        ),
+        "execution_model": (
+            (
+                "LangGraph execution model durable execution checkpoints streaming official docs",
+                "official_docs",
+            ),
+        ),
+        "workflow_lifecycle": (
+            (
+                "LangGraph workflow lifecycle threads persistence human-in-the-loop docs",
+                "official_docs",
+            ),
+        ),
+        "official_sources": (
+            ("LangGraph site:docs.langchain.com", "official_docs"),
+            ("LangGraph site:reference.langchain.com", "reference"),
+            ("LangGraph github langchain-ai langgraph README", "official_repository"),
+        ),
+    }
+    queries: list[tuple[str, str]] = []
+    for slot_id in slot_ids:
+        queries.extend(by_slot.get(slot_id, ()))
+    queries.extend(
+        (
+            ("LangGraph official documentation overview", "official_docs"),
+            (
+                "LangGraph site:reference.langchain.com StateGraph graph state reference",
+                "reference",
+            ),
+            ("LangGraph github langchain-ai langgraph README", "official_repository"),
+            (
+                "LangGraph examples agents workflows human-in-the-loop official docs",
+                "official_docs",
+            ),
+        )
+    )
+    return tuple(dict.fromkeys(queries))
 
 
 def _targeted_project_for_query(query: str) -> str | None:
@@ -328,6 +383,63 @@ def _query_variants_for_slot(slot_id: str, slot: dict[str, Any]) -> tuple[tuple[
             ),
             ("privacy advantages limitations reference documentation", "official_or_reference"),
         )
+    if "motivation" in slot_id or "problem" in slot_id:
+        return (
+            ("motivation problem solved official documentation", "official_docs"),
+            ("why use architecture overview official docs", "official_docs"),
+            ("use cases positioning official documentation", "official_or_reference"),
+        )
+    if "core_abstractions" in slot_id:
+        return (
+            ("core concepts abstractions API reference official docs", "official_docs"),
+            ("state graph nodes edges reference documentation", "official_or_reference"),
+            ("github README core concepts examples", "official_repository"),
+        )
+    if "architecture" in slot_id:
+        return (
+            ("architecture runtime components official documentation", "official_docs"),
+            ("technical overview architecture reference documentation", "official_or_reference"),
+            ("system design graph workflow official docs", "official_docs"),
+        )
+    if "execution_model" in slot_id:
+        return (
+            ("execution model runtime scheduling checkpoints official docs", "official_docs"),
+            ("durable execution streaming resume reference documentation", "official_or_reference"),
+            ("how it executes workflow runtime official docs", "official_docs"),
+        )
+    if "workflow_lifecycle" in slot_id:
+        return (
+            ("workflow lifecycle threads persistence official docs", "official_docs"),
+            ("human in the loop workflow lifecycle official documentation", "official_docs"),
+            (
+                "state transitions workflow examples reference documentation",
+                "official_or_reference",
+            ),
+        )
+    if "key_features" in slot_id:
+        return (
+            ("key features capabilities official documentation", "official_docs"),
+            ("features integrations streaming checkpointing official docs", "official_docs"),
+            ("changelog release notes official blog", "official_docs"),
+        )
+    if "examples" in slot_id or "use_cases" in slot_id:
+        return (
+            ("examples use cases official documentation", "official_docs"),
+            ("github README examples tutorials official repository", "official_repository"),
+            ("applications agents workflows examples", "official_or_reference"),
+        )
+    if "limitations" in slot_id:
+        return (
+            ("limitations caveats tradeoffs official documentation", "official_or_reference"),
+            ("known limitations troubleshooting reference documentation", "official_or_reference"),
+            ("comparison alternatives limitations", "official_or_reference"),
+        )
+    if "official_sources" in slot_id:
+        return (
+            ("official documentation overview", "official_docs"),
+            ("API reference official documentation", "reference"),
+            ("GitHub README official repository", "official_repository"),
+        )
     if "mechanism" in slot_id or "mechanism" in categories:
         return (
             ("how it works architecture official documentation", "official_or_reference"),
@@ -352,6 +464,16 @@ def _query_variants_for_slot(slot_id: str, slot: dict[str, Any]) -> tuple[tuple[
         (f"{label} reference guide", "official_or_reference"),
         (f"{label} limitations details", "official_or_reference"),
     )
+
+
+def _source_role_for_expected_source_type(source_type: str) -> str:
+    if source_type in {"official_repository", "github_readme_or_repo"}:
+        return "official_repository"
+    if source_type == "reference":
+        return "official_reference"
+    if source_type.startswith("official"):
+        return "official_docs"
+    return "high_quality_secondary_reference"
 
 
 def _string_value(value: Any, *, default: str) -> str:

@@ -7,7 +7,17 @@ from sqlalchemy.orm import Session, sessionmaker
 
 
 def build_engine(database_url: str, *, echo: bool = False) -> Engine:
-    engine = create_engine(database_url, echo=echo, pool_pre_ping=True)
+    connect_args: dict[str, Any] | None = None
+    if database_url.startswith("sqlite:"):
+        # Reduce transient "database is locked" under concurrent API + worker access.
+        connect_args = {"timeout": 30.0}
+
+    engine = create_engine(
+        database_url,
+        echo=echo,
+        pool_pre_ping=True,
+        connect_args=connect_args or {},
+    )
 
     if engine.dialect.name == "sqlite":
 

@@ -196,7 +196,7 @@ if these JSON contracts become too large for operator review.
 ## Phase 4 acquisition usage
 
 - Phase 4 adds one migration, `20260423_0003`, which introduces `uq_fetch_job_candidate_url_id_mode`
-- `fetch_job.mode` is currently `HTTP` only
+- `fetch_job.mode` is `HTTP` for static acquisition and `BROWSER_RENDERED` for the optional Playwright fallback row (at most one job per mode per candidate, enforced by `uq_fetch_job_candidate_url_id_mode`)
 - `fetch_job(candidate_url_id, mode)` is the current idempotency boundary for synchronous acquisition
 - `fetch_attempt` currently records a single attempt per `fetch_job`; retries are deferred to a later phase
 - `fetch_attempt.trace_json` now carries the minimum acquisition trace, including final URL, redirect chain, resolved IPs, byte counts, and explicit policy or storage failure details when applicable

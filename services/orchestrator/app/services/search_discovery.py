@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from packages.db.models import CandidateUrl, ResearchRun, ResearchTask, SearchQuery
 from packages.db.repositories import (
@@ -29,9 +30,18 @@ from services.orchestrator.app.search.known_sources import (
     candidate_matches_query_subject,
     resolve_authoritative_source_candidates,
 )
+from services.orchestrator.app.services.acquisition import _query_asks_technical_explanation
 from services.orchestrator.app.services.research_tasks import (
     PHASE2_ACTIVE_STATUS,
     TaskNotFoundError,
+)
+
+_TECHNICAL_OFFICIAL_REPO_TARGET_SLOTS: tuple[str, ...] = (
+    "official_sources",
+    "examples_use_cases",
+    "workflow_lifecycle",
+    "core_abstractions",
+    "key_features",
 )
 
 
@@ -68,6 +78,71 @@ class _KnownPathAddResult:
     added: int
     duplicates_skipped: int
     filtered_out: int
+    metadata_merged: int = 0
+
+
+def _merge_official_repository_readme_derivative_known_path(
+    existing: CandidateUrl,
+    known_path: dict[str, object],
+) -> bool:
+    """
+    When a raw README URL already exists, merge derivative metadata without creating a row.
+
+    Returns True when ``existing`` was updated.
+    """
+    if known_path.get("official_repository_readme_derivative") is not True:
+        return False
+    base: dict[str, Any] = dict(existing.metadata_json or {})
+    changed = False
+
+    if base.get("official_repository_readme_derivative") is not True:
+        base["official_repository_readme_derivative"] = True
+        changed = True
+
+    si = known_path.get("source_intent")
+    if isinstance(si, str) and si.strip():
+        cur = str(base.get("source_intent") or "").strip()
+        if cur != si.strip():
+            base["source_intent"] = si.strip()
+            changed = True
+
+    sr = known_path.get("source_role")
+    if isinstance(sr, str) and sr.strip():
+        cur = str(base.get("source_role") or "").strip()
+        if cur != sr.strip():
+            base["source_role"] = sr.strip()
+            changed = True
+
+    derived_repo = known_path.get("derived_from_repository_url")
+    if isinstance(derived_repo, str) and derived_repo.strip():
+        cur = str(base.get("derived_from_repository_url") or "").strip()
+        if cur != derived_repo.strip():
+            base["derived_from_repository_url"] = derived_repo.strip()
+            changed = True
+
+    for key in ("target_slots", "technical_slot_targets"):
+        raw_list = known_path.get(key)
+        if not isinstance(raw_list, list):
+            continue
+        incoming = [str(x).strip() for x in raw_list if str(x).strip()]
+        if not incoming:
+            continue
+        cur_raw = base.get(key)
+        cur_list: list[str] = (
+            [str(x).strip() for x in cur_raw if str(x).strip()] if isinstance(cur_raw, list) else []
+        )
+        merged_slots: list[str] = list(dict.fromkeys([*cur_list, *incoming]))
+        if merged_slots != cur_list:
+            base[key] = merged_slots
+            changed = True
+
+    if changed:
+        existing.metadata_json = base
+        flag_modified(existing, "metadata_json")
+        new_rank = _coerce_candidate_rank(known_path.get("rank"))
+        if new_rank < existing.rank:
+            existing.rank = new_rank
+    return changed
 
 
 class SearchDiscoveryService:
@@ -390,17 +465,21 @@ class SearchDiscoveryService:
                 if remaining_slots is not None and remaining_slots <= 0:
                     break
 
-            known_path_candidates = [
-                *_raw_readme_candidates_for_provider_results(
-                    provider_response.results,
-                    constraints=constraints,
-                ),
-                *_known_path_candidates_for_query(
-                    query=task.query,
-                    provider_results=provider_response.results,
-                    constraints=constraints,
-                ),
-            ]
+            known_path_candidates = _merge_official_github_raw_readme_derivatives(
+                [
+                    *_raw_readme_candidates_for_provider_results(
+                        provider_response.results,
+                        constraints=constraints,
+                    ),
+                    *_known_path_candidates_for_query(
+                        query=task.query,
+                        provider_results=provider_response.results,
+                        constraints=constraints,
+                    ),
+                ],
+                query=task.query,
+                constraints=constraints,
+            )
             known_path_result = _add_known_path_candidates(
                 task=task,
                 search_query=search_query,
@@ -561,10 +640,14 @@ class SearchDiscoveryService:
         constraints: dict[str, Any],
         max_candidates: int | None,
     ) -> PersistedSearchQuery | None:
-        known_path_candidates = [
-            candidate.to_known_path()
-            for candidate in resolve_authoritative_source_candidates(task.query)
-        ]
+        known_path_candidates = _merge_official_github_raw_readme_derivatives(
+            [
+                _enrich_authoritative_known_path_candidate(candidate.to_known_path())
+                for candidate in resolve_authoritative_source_candidates(task.query)
+            ],
+            query=task.query,
+            constraints=constraints,
+        )
         if _query_requests_deployment_or_installation(task.query):
             return None
         if not known_path_candidates:
@@ -720,6 +803,26 @@ def _resolve_language(constraints: dict[str, Any]) -> str | None:
     return None
 
 
+def _enrich_authoritative_known_path_candidate(
+    candidate: dict[str, object],
+) -> dict[str, object]:
+    enriched = dict(candidate)
+    source_class = str(candidate.get("source_class") or "").strip().lower()
+    if source_class == "official_repository":
+        enriched.setdefault("source_role", "official_repository")
+        enriched.setdefault(
+            "target_slots",
+            [
+                "official_sources",
+                "examples_use_cases",
+                "workflow_lifecycle",
+                "core_abstractions",
+                "key_features",
+            ],
+        )
+    return enriched
+
+
 def _resolve_source_engines(constraints: dict[str, Any]) -> tuple[str, ...]:
     engines = constraints.get("source_engines")
     if engines is None:
@@ -766,6 +869,82 @@ def _resolve_explicit_candidate_limit(raw_limit: Any) -> int | None:
     if isinstance(raw_limit, int) and raw_limit > 0:
         return raw_limit
     return None
+
+
+def _merge_official_github_raw_readme_derivatives(
+    items: list[dict[str, object]],
+    *,
+    query: str,
+    constraints: dict[str, Any],
+) -> list[dict[str, object]]:
+    """
+    After known-path assembly, append bounded raw README URLs for GitHub repo roots marked
+    ``official_repository`` (technical_explanation tasks only).
+
+    Does not emit candidates for issues/PRs/discussions (repo root filter) or non-README raw paths.
+    """
+    if not _query_asks_technical_explanation(query):
+        return items
+    allow_domains = _resolve_domains(constraints.get("domains_allow"))
+    deny_domains = _resolve_domains(constraints.get("domains_deny"))
+    out: list[dict[str, object]] = []
+    seen_derivative_urls: set[str] = set()
+    for row in items:
+        out.append(row)
+        url = str(row.get("url") or "")
+        owner_repo = _github_repository_owner_repo(url)
+        if owner_repo is None:
+            continue
+        role = str(row.get("source_role") or "").strip()
+        source_class = str(row.get("source_class") or "").strip()
+        if "official_repository" not in {role, source_class}:
+            continue
+        slots_raw = row.get("target_slots")
+        slot_list: list[str]
+        if isinstance(slots_raw, list):
+            slot_list = [str(s).strip() for s in slots_raw if str(s).strip()]
+        else:
+            slot_list = list(_TECHNICAL_OFFICIAL_REPO_TARGET_SLOTS)
+        if not slot_list:
+            slot_list = list(_TECHNICAL_OFFICIAL_REPO_TARGET_SLOTS)
+        base_rank = row.get("rank")
+        br = int(base_rank) if isinstance(base_rank, int) else 100_000
+        owner, repo = owner_repo
+        for idx, branch in enumerate(("main", "master")):
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/README.md"
+            canonical = canonicalize_url(raw_url)
+            if canonical is None or not is_domain_allowed(
+                canonical.domain,
+                allow_domains=allow_domains,
+                deny_domains=deny_domains,
+            ):
+                continue
+            if canonical.canonical_url in seen_derivative_urls:
+                continue
+            seen_derivative_urls.add(canonical.canonical_url)
+            out.append(
+                {
+                    "url": raw_url,
+                    "title": f"{owner}/{repo} README ({branch})",
+                    "snippet": (
+                        "Raw GitHub README derivative for official repository "
+                        f"{owner}/{repo} ({branch})."
+                    ),
+                    "rank": max(0, br - 3 + idx),
+                    "reason": (
+                        "known_path_candidate: derived raw GitHub README ("
+                        f"{branch}) for official repository {url}"
+                    ),
+                    "source_class": "official_repository",
+                    "source_role": "official_repository",
+                    "target_slots": slot_list,
+                    "technical_slot_targets": list(slot_list),
+                    "derived_from_repository_url": url,
+                    "source_intent": "official_repository_readme",
+                    "official_repository_readme_derivative": True,
+                }
+            )
+    return out
 
 
 def _known_path_candidates_for_query(
@@ -846,6 +1025,14 @@ def _known_path_candidates_for_query(
                     "snippet": "Deterministic upstream LangGraph repository candidate.",
                     "rank": 10016,
                     "reason": "known_path_candidate: upstream LangGraph repository",
+                    "source_role": "official_repository",
+                    "target_slots": [
+                        "official_sources",
+                        "examples_use_cases",
+                        "workflow_lifecycle",
+                        "core_abstractions",
+                        "key_features",
+                    ],
                 },
             ]
         )
@@ -969,6 +1156,7 @@ def _add_known_path_candidates(
 ) -> _KnownPathAddResult:
     added_candidates: list[CandidateUrl] = []
     duplicates_skipped = 0
+    metadata_merged = 0
     filtered_out = 0
     for known_path in known_path_candidates:
         if max_added is not None and len(added_candidates) >= max(0, max_added):
@@ -978,7 +1166,15 @@ def _add_known_path_candidates(
             filtered_out += 1
             continue
         if canonical.canonical_url in existing_candidates:
-            duplicates_skipped += 1
+            existing_row = candidate_url_repository.get_for_task_canonical_url(
+                task.id, canonical.canonical_url
+            )
+            if existing_row is not None and _merge_official_repository_readme_derivative_known_path(
+                existing_row, known_path
+            ):
+                metadata_merged += 1
+            else:
+                duplicates_skipped += 1
             continue
 
         result_metadata: dict[str, object] = {
@@ -1016,6 +1212,35 @@ def _add_known_path_candidates(
             metadata_json["known_source_entity"] = str(source_entity)
         if fallback_reason is not None:
             metadata_json["fallback_reason"] = fallback_reason
+        target_slots = known_path.get("target_slots")
+        if isinstance(target_slots, list):
+            normalized_slots = [
+                str(slot_id).strip() for slot_id in target_slots if str(slot_id).strip()
+            ]
+            if normalized_slots:
+                metadata_json["target_slots"] = normalized_slots
+        source_role = known_path.get("source_role")
+        if isinstance(source_role, str) and source_role.strip():
+            metadata_json["source_role"] = source_role.strip()
+
+        technical_slot_targets = known_path.get("technical_slot_targets")
+        if isinstance(technical_slot_targets, list):
+            normalized_tst = [
+                str(slot_id).strip() for slot_id in technical_slot_targets if str(slot_id).strip()
+            ]
+            if normalized_tst:
+                metadata_json["technical_slot_targets"] = normalized_tst
+
+        derived_repo = known_path.get("derived_from_repository_url")
+        if isinstance(derived_repo, str) and derived_repo.strip():
+            metadata_json["derived_from_repository_url"] = derived_repo.strip()
+
+        source_intent = known_path.get("source_intent")
+        if isinstance(source_intent, str) and source_intent.strip():
+            metadata_json["source_intent"] = source_intent.strip()
+
+        if known_path.get("official_repository_readme_derivative") is True:
+            metadata_json["official_repository_readme_derivative"] = True
 
         candidate = candidate_url_repository.add(
             CandidateUrl(
@@ -1038,6 +1263,7 @@ def _add_known_path_candidates(
         added=len(added_candidates),
         duplicates_skipped=duplicates_skipped,
         filtered_out=filtered_out,
+        metadata_merged=metadata_merged,
     )
 
 

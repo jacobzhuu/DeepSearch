@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+
 class CandidateTriageStatus(str, Enum):
     REJECT_FATAL = "reject_fatal"
     ACCEPT_CANDIDATE = "accept_candidate"
@@ -187,6 +188,21 @@ _FEATURE_TERMS = (
     "debugging",
     "deployment",
     "durable execution",
+    "example",
+    "examples",
+    "use case",
+    "use cases",
+    "guide",
+    "guides",
+    "quickstart",
+    "quick start",
+    "sample",
+    "samples",
+    "snippet",
+    "snippets",
+    "tutorial",
+    "tutorials",
+    "cookbook",
     "human-in-the-loop",
     "human in the loop",
     "integration",
@@ -502,6 +518,20 @@ def is_claimable_statement(statement: str, query: str | None = None) -> bool:
     return True
 
 
+def _looks_like_news_query(lower: str, query_tokens: set[str]) -> bool:
+    if "news" in query_tokens:
+        return True
+    if "latest" in query_tokens and "updates" in query_tokens:
+        return True
+    if "recent" in query_tokens and "developments" in query_tokens:
+        return True
+    if "最新动态" in lower:
+        return True
+    if "近期讯息" in lower or "近期消息" in lower:
+        return True
+    return False
+
+
 def classify_query_intent(query: str | None) -> QueryIntent:
     if query is None or not query.strip():
         return QueryIntent(
@@ -541,6 +571,16 @@ def classify_query_intent(query: str | None) -> QueryIntent:
             avoid_claim_types=("community", "slogan", "reference", "navigation"),
             subject_terms=subject_terms,
             setup_allowed=True,
+            contribution_allowed=contribution_allowed,
+        )
+
+    if _looks_like_news_query(lower, query_tokens):
+        return QueryIntent(
+            intent_name="news",
+            expected_claim_types=("feature", "mechanism", "definition", "privacy", "other"),
+            avoid_claim_types=("community", "slogan", "reference", "navigation"),
+            subject_terms=subject_terms,
+            setup_allowed=setup_allowed,
             contribution_allowed=contribution_allowed,
         )
 
@@ -627,7 +667,9 @@ def score_claim_statement(
         category=category,
     )
 
-    answer_role = answer_role_for_claim_category(category, intent=intent)
+    answer_role = answer_role_for_claim_category(
+        category, intent=intent, target_slot_id=target_slot_id
+    )
     answer_relevant = _is_answer_relevant_components(
         category=category,
         answer_role=answer_role,
@@ -797,7 +839,20 @@ def is_answer_claim_category(category: str) -> bool:
     return category in ANSWER_CLAIM_CATEGORIES
 
 
-def answer_role_for_claim_category(category: str, *, intent: QueryIntent) -> str:
+def answer_role_for_claim_category(
+    category: str,
+    *,
+    intent: QueryIntent,
+    target_slot_id: str | None = None,
+) -> str:
+    if (
+        target_slot_id == "limitations"
+        and category == "other"
+        and is_overview_answer_intent(intent)
+    ):
+        # Limitations answer slot accepts ``other`` (see ``answer_slots``). Overview intents
+        # otherwise treat ``other`` as non-answer; official planner-aligned limitations override.
+        return "feature"
     if category in CORE_OVERVIEW_CLAIM_CATEGORIES:
         return category
     if category == "deployment/self_hosting":
@@ -807,6 +862,11 @@ def answer_role_for_claim_category(category: str, *, intent: QueryIntent) -> str
             return category
     if intent.intent_name == "generic" and category not in intent.avoid_claim_types:
         return category
+    if intent.intent_name == "news" and category in intent.expected_claim_types:
+        if category in CORE_OVERVIEW_CLAIM_CATEGORIES:
+            return category
+        return "feature"
+
     return "non_answer"
 
 
@@ -814,7 +874,9 @@ def is_answer_relevant_score(score: ClaimCandidateScore, *, query: str | None) -
     intent = classify_query_intent(query)
     answer_role = score.answer_role
     if not answer_role or answer_role == "non_answer":
-        answer_role = answer_role_for_claim_category(score.claim_category, intent=intent)
+        answer_role = answer_role_for_claim_category(
+            score.claim_category, intent=intent, target_slot_id=None
+        )
     return _is_answer_relevant_components(
         category=score.claim_category,
         answer_role=answer_role,
@@ -1590,6 +1652,20 @@ def _compute_query_answer_score(
         return 0.1
     if category == "deployment/self_hosting" and is_overview_answer_intent(intent):
         return _clamp_score(max(query_relevance * 0.55, 0.45))
+    if (
+        target_slot_id == "limitations"
+        and category == "other"
+        and is_overview_answer_intent(intent)
+    ):
+        # Default overview path crushes ``other`` to ~0.25; official planner ``limitations``
+        # slots need bounded answer credit so caveat sentences can reach main tiers without
+        # global ``other`` lift.
+        boosted = max(
+            score,
+            query_relevance * 0.65 + 0.2,
+            MIN_DRAFT_QUERY_ANSWER_SCORE + 0.02,
+        )
+        return _clamp_score(boosted)
     if category == "other" and is_overview_answer_intent(intent):
         return _clamp_score(min(query_relevance * 0.35, 0.25))
     return _clamp_score(query_relevance * 0.55)
@@ -1807,9 +1883,25 @@ def _compute_source_suitability(
         elif lower_domain.startswith("docs."):
             score += 0.10
     
-    # Penalize raw source code for factual claims unless it's a deployment task
+    # Penalize raw source code for factual claims unless it's a deployment task.
+    # README content from official repositories is useful for technical explanations,
+    # so avoid over-penalizing those URLs.
     if "raw.githubusercontent.com" in lower_domain:
-        if intent.intent_name != "deployment":
+        lower_url = (source_url or "").lower()
+        is_readme = lower_url.endswith("/readme.md")
+        if intent.intent_name != "deployment" and not is_readme:
             score -= 0.15
+        elif is_readme:
+            score += 0.05
+
+    if "github.com" in lower_domain:
+        lower_url = (source_url or "").lower()
+        if (
+            "/issues" not in lower_url
+            and "/pull" not in lower_url
+            and category in {"definition", "mechanism", "feature"}
+            and intent.intent_name in {"definition_mechanism", "generic"}
+        ):
+            score += 0.05
 
     return _clamp_score(score)

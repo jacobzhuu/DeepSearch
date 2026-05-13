@@ -52,6 +52,8 @@ class ReportEvidenceItem:
     start_offset: int
     end_offset: int
     excerpt: str
+    source_role: str | None = None
+    source_intent: str | None = None
     relation_detail: str | None = None
     support_level: str | None = None
     verifier_method: str | None = None
@@ -82,6 +84,7 @@ class ReportClaimItem:
     deployment_evidence_excerpt: str | None = None
     verifier_method: str | None = None
     support_level: str | None = None
+    normalized_from_readme: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,8 @@ class ReportSourceItem:
     canonical_url: str
     domain: str
     title: str | None
+    source_role: str | None = None
+    source_intent: str | None = None
 
 
 @dataclass(frozen=True)

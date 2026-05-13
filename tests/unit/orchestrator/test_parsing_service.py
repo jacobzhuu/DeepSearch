@@ -26,7 +26,14 @@ from packages.db.repositories import (
     SourceChunkRepository,
     SourceDocumentRepository,
 )
-from services.orchestrator.app.parsing import ParseResultReason
+from services.orchestrator.app.parsing import (
+    ParsedChunk,
+    ParseResultReason,
+)
+from services.orchestrator.app.parsing import (
+    chunk_text as real_chunk_text,
+)
+from services.orchestrator.app.parsing.chunk_text_validation import REJECT_BINARY_LIKE_CHUNK_TEXT
 from services.orchestrator.app.services import parsing as parsing_service_module
 from services.orchestrator.app.services.parsing import (
     ParsingConflictError,
@@ -54,6 +61,7 @@ def _seed_snapshot(
     fetch_status: str = "SUCCEEDED",
     fetch_error_code: str | None = None,
     store_content: bool = True,
+    fetch_trace_json: dict[str, object] | None = None,
 ) -> tuple[ContentSnapshot, SourceDocumentRepository, SourceChunkRepository]:
     task = create_research_task_service(db_session).create_task(query=query, constraints={})
     run = ResearchRunRepository(db_session).add(
@@ -105,7 +113,7 @@ def _seed_snapshot(
             error_code=fetch_error_code,
             started_at=datetime(2026, 4, 23, 12, 1, tzinfo=UTC),
             finished_at=datetime(2026, 4, 23, 12, 2, tzinfo=UTC),
-            trace_json={},
+            trace_json=dict(fetch_trace_json or {}),
         )
     )
     object_store = FilesystemSnapshotObjectStore(root_directory=str(snapshot_root))
@@ -173,6 +181,38 @@ def test_parsing_service_creates_source_document_and_chunks(
     assert chunks[0].metadata_json["fallback_used"] is False
     assert isinstance(chunks[0].metadata_json["removed_boilerplate_count"], int)
     assert chunks[0].metadata_json["extracted_text_length"] >= len("Alpha.")
+
+
+def test_parsing_service_skips_static_html_parse_hold_without_source_document(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    spa_html = b"""<!doctype html><html><head><script>console.log(1)</script></head>
+    <body><div id="app"></div><script src="/bundle.js"></script></body></html>"""
+    content_snapshot, source_document_repo, _ = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        content=spa_html,
+        fetch_trace_json={
+            "eligible_for_evidence_parse": False,
+            "static_html_quality_decision": "spa_shell",
+            "parse_hold_reason": "spa_shell",
+        },
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+    assert result.created == 0
+    assert result.skipped_static_html_hold == 1
+    assert result.entries[0].reason == ParseResultReason.ACQUISITION_STATIC_HTML_PARSE_HELD
+    assert result.entries[0].decision == "skipped_static_html_quality"
+    assert source_document_repo.get_for_content_snapshot(content_snapshot.id) is None
 
 
 def test_parsing_service_skips_unsupported_mime_type(
@@ -480,6 +520,106 @@ def test_parsing_service_default_selection_skips_failed_fetch_snapshots_before_l
     assert source_chunk_repo.list_for_document(success_document.id)[0].text == "Useful text."
 
 
+def test_parsing_service_default_selection_prefers_unparsed_snapshots(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    """Prefer snapshots without a source_document when selecting default parse batches."""
+    snap1, _, _ = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        canonical_url="https://example.com/parse-one",
+        content=b"<html><head><title>One</title></head><body><p>Alpha.</p></body></html>",
+    )
+    task_id = snap1.fetch_attempt.fetch_job.task_id
+    search_query_id = snap1.fetch_attempt.fetch_job.candidate_url.search_query_id
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path))
+
+    def _add_html_snapshot(
+        *,
+        canonical_url: str,
+        body: str,
+        fetched_at: datetime,
+    ) -> ContentSnapshot:
+        candidate_url = CandidateUrlRepository(db_session).add(
+            CandidateUrl(
+                task_id=task_id,
+                search_query_id=search_query_id,
+                original_url=canonical_url,
+                canonical_url=canonical_url,
+                domain="example.com",
+                title="t",
+                rank=2,
+                selected=False,
+                metadata_json={},
+            )
+        )
+        fetch_job = FetchJobRepository(db_session).add(
+            FetchJob(
+                task_id=task_id,
+                candidate_url_id=candidate_url.id,
+                mode="HTTP",
+                status="SUCCEEDED",
+                scheduled_at=fetched_at,
+            )
+        )
+        fetch_attempt = FetchAttemptRepository(db_session).add(
+            FetchAttempt(
+                fetch_job_id=fetch_job.id,
+                attempt_no=1,
+                http_status=200,
+                error_code=None,
+                started_at=fetched_at,
+                finished_at=fetched_at,
+                trace_json={},
+            )
+        )
+        html = f"<html><head><title>T</title></head><body><p>{body}</p></body></html>".encode()
+        stored = object_store.put_bytes(
+            bucket="snapshots",
+            key=f"task/{task_id}/{canonical_url.replace('/', '_')}.bin",
+            content=html,
+            content_type="text/html",
+        )
+        snap = ContentSnapshotRepository(db_session).add(
+            ContentSnapshot(
+                fetch_attempt_id=fetch_attempt.id,
+                storage_bucket=stored.bucket,
+                storage_key=stored.key,
+                content_hash="sha256:test",
+                mime_type="text/html",
+                bytes=len(html),
+                extracted_title=None,
+                fetched_at=fetched_at,
+            )
+        )
+        db_session.commit()
+        return snap
+
+    snap2 = _add_html_snapshot(
+        canonical_url="https://example.com/parse-two",
+        body="Beta.",
+        fetched_at=datetime(2026, 4, 23, 12, 10, tzinfo=UTC),
+    )
+    assert snap2.id
+    snap3 = _add_html_snapshot(
+        canonical_url="https://example.com/parse-three",
+        body="Gamma.",
+        fetched_at=datetime(2026, 4, 23, 12, 11, tzinfo=UTC),
+    )
+
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+    first = service.parse_snapshots(task_id, content_snapshot_ids=None, limit=2)
+    assert first.created == 2
+    second = service.parse_snapshots(task_id, content_snapshot_ids=None, limit=2)
+    assert second.created == 1
+    assert {snap3.id} == {e.content_snapshot.id for e in second.entries if e.status == "CREATED"}
+    assert SourceDocumentRepository(db_session).get_for_content_snapshot(snap3.id) is not None
+
+
 def test_parsing_service_short_html_with_title_creates_source_document(
     db_session: Session,
     tmp_path: Path,
@@ -604,6 +744,152 @@ def test_parsing_service_updates_existing_document_for_same_canonical_url(
     assert refreshed_document.title == "New Title"
     assert len(refreshed_chunks) == 1
     assert refreshed_chunks[0].text == "Updated body text."
+
+
+def test_parsing_service_filters_invalid_chunks_before_db_insert(
+    db_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+    )
+    task_id = content_snapshot.fetch_attempt.fetch_job.task_id
+
+    def chunk_text_with_invalid_prefix(text: str, **kwargs: object) -> list[ParsedChunk]:
+        real = real_chunk_text(text, **kwargs)  # type: ignore[arg-type]
+        return [
+            ParsedChunk(0, "\x00binary-prefix", 1, {}),
+            ParsedChunk(1, "   \n\t", 1, {}),
+        ] + list(real)
+
+    monkeypatch.setattr(parsing_service_module, "chunk_text", chunk_text_with_invalid_prefix)
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+    result = service.parse_snapshots(task_id, content_snapshot_ids=[content_snapshot.id], limit=1)
+
+    assert result.failed == 0
+    assert result.created == 1
+    entry = result.entries[0]
+    assert entry.decision == "parsed"
+    cv = entry.chunk_validation or {}
+    assert cv.get("invalid_chunk_rejection_count") == 2
+    dist = cv.get("invalid_chunk_rejection_reason_distribution") or {}
+    assert dist.get(REJECT_BINARY_LIKE_CHUNK_TEXT) == 1
+    assert dist.get("whitespace_only_chunk_text") == 1
+
+    source_document = source_document_repo.get_for_content_snapshot(content_snapshot.id)
+    assert source_document is not None
+    chunks = source_chunk_repo.list_for_document(source_document.id)
+    assert len(chunks) == 1
+    assert "Alpha." in chunks[0].text
+    assert "\x00" not in chunks[0].text
+
+
+def test_parsing_service_all_invalid_chunks_skips_one_snapshot_batch_continues(
+    db_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_html = b"<html><head><title>Bad</title></head><body><p>BADONLY_MARKER</p></body></html>"
+    bad_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        canonical_url="https://example.com/bad-only",
+        content=bad_html,
+    )
+    task_id = bad_snapshot.fetch_attempt.fetch_job.task_id
+    search_query_id = bad_snapshot.fetch_attempt.fetch_job.candidate_url.search_query_id
+
+    candidate_url = CandidateUrlRepository(db_session).add(
+        CandidateUrl(
+            task_id=task_id,
+            search_query_id=search_query_id,
+            original_url="https://example.com/good",
+            canonical_url="https://example.com/good",
+            domain="example.com",
+            title="Good source",
+            rank=2,
+            selected=False,
+            metadata_json={},
+        )
+    )
+    fetch_job = FetchJobRepository(db_session).add(
+        FetchJob(
+            task_id=task_id,
+            candidate_url_id=candidate_url.id,
+            mode="HTTP",
+            status="SUCCEEDED",
+            scheduled_at=datetime(2026, 4, 23, 12, 5, tzinfo=UTC),
+        )
+    )
+    fetch_attempt = FetchAttemptRepository(db_session).add(
+        FetchAttempt(
+            fetch_job_id=fetch_job.id,
+            attempt_no=1,
+            http_status=200,
+            error_code=None,
+            started_at=datetime(2026, 4, 23, 12, 5, tzinfo=UTC),
+            finished_at=datetime(2026, 4, 23, 12, 5, tzinfo=UTC),
+            trace_json={},
+        )
+    )
+    object_store = FilesystemSnapshotObjectStore(root_directory=str(tmp_path))
+    good_content = (
+        b"<html><head><title>Good</title></head><body><p>Useful follow-up text.</p></body></html>"
+    )
+    stored_object = object_store.put_bytes(
+        bucket="snapshots",
+        key=f"task/{task_id}/good-snapshot.bin",
+        content=good_content,
+        content_type="text/html",
+    )
+    good_snapshot = ContentSnapshotRepository(db_session).add(
+        ContentSnapshot(
+            fetch_attempt_id=fetch_attempt.id,
+            storage_bucket=stored_object.bucket,
+            storage_key=stored_object.key,
+            content_hash="sha256:good",
+            mime_type="text/html",
+            bytes=len(good_content),
+            extracted_title=None,
+            fetched_at=datetime(2026, 4, 23, 12, 6, tzinfo=UTC),
+        )
+    )
+    db_session.commit()
+
+    def selective_chunk_text(text: str, **kwargs: object) -> list[ParsedChunk]:
+        if "BADONLY_MARKER" in text:
+            return [ParsedChunk(0, "\x00only-invalid", 1, {})]
+        return real_chunk_text(text, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(parsing_service_module, "chunk_text", selective_chunk_text)
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+    result = service.parse_snapshots(
+        task_id,
+        content_snapshot_ids=[bad_snapshot.id, good_snapshot.id],
+        limit=2,
+    )
+
+    assert result.failed == 0
+    assert result.skipped_no_valid_chunks == 1
+    assert result.created == 1
+    assert result.invalid_chunk_rejection_count >= 1
+    assert source_document_repo.get_for_content_snapshot(bad_snapshot.id) is None
+    good_doc = source_document_repo.get_for_content_snapshot(good_snapshot.id)
+    assert good_doc is not None
+    assert source_chunk_repo.list_for_document(good_doc.id)[0].text == "Useful follow-up text."
+
+    bad_entry = next(e for e in result.entries if e.content_snapshot.id == bad_snapshot.id)
+    assert bad_entry.reason == ParseResultReason.NO_VALID_CHUNKS
+    assert bad_entry.chunk_validation is not None
+    assert bad_entry.chunk_validation.get("parser_invalid_output") is True
 
 
 def test_parsing_service_rejects_paused_task(db_session: Session, tmp_path: Path) -> None:

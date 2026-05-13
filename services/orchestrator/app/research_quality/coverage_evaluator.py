@@ -182,7 +182,7 @@ def _is_slot_blocked(slot_id: str, source_yield_summary: list[dict[str, Any]]) -
 
 
 def _is_slot_underprocessed(slot_id: str, source_yield_summary: list[dict[str, Any]]) -> bool:
-    # A slot is underprocessed if snapshots exist for it but weren't parsed or didn't yield claims due to limits
+    # A slot is underprocessed if snapshots exist but parsing or claim limits blocked use.
     for source in source_yield_summary:
         if slot_id not in _get_source_slots(source):
             continue
@@ -201,7 +201,12 @@ def _get_source_slots(source: dict[str, Any]) -> list[str]:
 
 def _source_role_diversity_count(source_yield_summary: list[dict[str, Any]]) -> int:
     roles = {
-        str(item.get("source_intent") or item.get("source_category") or "").strip()
+        str(
+            item.get("source_role")
+            or item.get("source_intent")
+            or item.get("source_category")
+            or ""
+        ).strip()
         for item in source_yield_summary
         if (
             item.get("fetched") is True
@@ -281,12 +286,15 @@ def _authoritative_source_count(source_yield_summary: list[dict[str, Any]]) -> i
             or item.get("contribution_level") in {"high", "medium"}
         ):
             continue
+        source_role = str(item.get("source_role") or "").strip()
         source_intent = str(item.get("source_intent") or item.get("source_category") or "").strip()
-        if source_intent.startswith("official") or source_intent in {
+        authoritative_label = source_role or source_intent
+        if authoritative_label.startswith("official") or authoritative_label in {
             "primary_reference",
             "reference",
             "wikipedia_reference",
             "github_readme_or_repo",
+            "high_quality_secondary_reference",
         }:
             count += 1
     return count

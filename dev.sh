@@ -591,6 +591,12 @@ print_status() {
     print_process_status "worker" "$WORKER_PID_FILE" "research_worker\.py"
     print_process_status "frontend" "$FRONTEND_PID_FILE" "vite|node|npm"
     print_process_status "mock-searxng" "$MOCK_SEARCH_PID_FILE" "mock_searxng\.py"
+    local _worker_pid
+    if _worker_pid="$(pid_from_file "$WORKER_PID_FILE" 2>/dev/null)"; then
+        if ! kill -0 "$_worker_pid" >/dev/null 2>&1; then
+            warn "worker is not running (stale pid in $WORKER_PID_FILE). QUEUED tasks will not drain; see $WORKER_LOG"
+        fi
+    fi
     echo ""
     echo "URLs:"
     echo "  backend:  $BACKEND_URL"

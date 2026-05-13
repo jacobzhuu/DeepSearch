@@ -18,6 +18,20 @@ Comparison source selection keeps all extracted entities in the deterministic ow
 
 For technical library or framework concept queries, source-intent classification is query-subject aware: generic tutorial pages with titles such as "What is X" are no longer treated as official/about sources unless the domain/path context is owned by or strongly tied to the queried project. LangGraph currently treats `docs.langchain.com`, `reference.langchain.com`, `langchain.com`, and `github.com/langchain-ai/langgraph` as owned high-value sources; localized mirrors such as `github.langchain.ac.cn`, `langgraph.com.cn`, and `langchain-doc.cn` remain secondary references. GitHub repository candidates are official only when the owner/repo matches the known upstream project, so third-party tutorial repositories do not get upstream README priority. The LangGraph product page remains a valid owned source, but it is ranked behind docs/reference/upstream GitHub for how-it-works overview acquisition so it does not crowd out implementation evidence. Job boards, freelance listings, SEO repost pages, and obvious listing URLs are treated as low quality for overview queries. The no-LLM planner and claim scorer now use generic framework mechanism terms such as state, graph, nodes, edges, workflow, orchestration, routing, durable execution, streaming, memory, checkpointing, human-in-the-loop, integrations, APIs, and limitations instead of SearXNG-specific metasearch terms for non-SearXNG subjects. Gap rounds ignore newly discovered low-value candidates before falling back to already discovered unattempted high-value candidates, and LangGraph gap searches add bounded owned-source queries for LangChain docs, reference docs, and the `langchain-ai/langgraph` repository.
 
+Technical explanation planning now has an explicit `technical_explanation` template for queries
+such as `What is X and how does it work?`. The template expands the old broad
+definition/mechanism/features slots into definition, motivation/problem, core abstractions,
+architecture, execution model, workflow lifecycle, key features, examples/use cases, limitations,
+comparison/positioning, and official-source coverage. Planned queries carry JSON metadata for
+`target_slots`, `query_matrix_slot`, `query_template`, and expected `source_role`; the default
+LangGraph matrix targets official docs, reference pages, upstream repository README, architecture,
+execution model, examples, limitations/comparison, and official blog/changelog sources while
+remaining capped by `RESEARCH_PLANNER_MAX_SEARCH_QUERIES`. Acquisition uses deterministic
+source-role quotas for technical explanations so official docs/reference/repository candidates are
+attempted before low-quality SEO or broad generic pages. Claim selection and grounded report input
+preserve slot ids and source roles so the report writer receives slot coverage, claims grouped by
+slot, and source-role diversity without adding a schema table or bypassing the evidence ledger.
+
 The LLM-assisted quality layer is documented in `plans/llm-assisted-source-judge-and-planner.md`.
 It preserves the current deterministic pipeline as the authority of record. DeepSeek is used only
 through the existing OpenAI-compatible provider path; it is not a search provider and cannot bypass

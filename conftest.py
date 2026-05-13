@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Generator
 from pathlib import Path
 
@@ -32,13 +33,20 @@ def alembic_config(database_url: str) -> Config:
 
 @pytest.fixture()
 def upgraded_engine(alembic_config: Config, database_url: str) -> Generator[Engine, None, None]:
-    command.upgrade(alembic_config, "head")
-    engine = build_engine(database_url)
+    # ``migrations/env.py`` overwrites ``sqlalchemy.url`` from ``DATABASE_URL`` when set,
+    # which would migrate a different database than ``database_url`` used by tests.
+    prior_database_url = os.environ.pop("DATABASE_URL", None)
     try:
-        yield engine
+        command.upgrade(alembic_config, "head")
+        engine = build_engine(database_url)
+        try:
+            yield engine
+        finally:
+            engine.dispose()
+            command.downgrade(alembic_config, "base")
     finally:
-        engine.dispose()
-        command.downgrade(alembic_config, "base")
+        if prior_database_url is not None:
+            os.environ["DATABASE_URL"] = prior_database_url
 
 
 @pytest.fixture()

@@ -97,13 +97,28 @@ class ResearchPipelineWorker:
         return processed
 
     def run_forever(self) -> None:
-        recovered = self.recover_interrupted_tasks()
+        try:
+            recovered = self.recover_interrupted_tasks()
+        except Exception:
+            logger.exception(
+                "pipeline.worker.recovery_failed",
+                extra={"hint": "check DATABASE_URL and run ./scripts/migrate.sh upgrade head"},
+            )
+            recovered = 0
         if recovered:
             logger.info("pipeline.worker.recovered", extra={"task_count": recovered})
+        poll_interval = max(0.1, self.settings.research_worker_poll_interval_seconds)
         while True:
-            processed = self.run_once()
+            try:
+                processed = self.run_once()
+            except Exception:
+                logger.exception(
+                    "pipeline.worker.poll_failed",
+                    extra={"hint": "check DATABASE_URL matches API and schema is migrated"},
+                )
+                processed = 0
             if processed <= 0:
-                time.sleep(max(0.1, self.settings.research_worker_poll_interval_seconds))
+                time.sleep(poll_interval)
 
     def _run_task(self, task_id: UUID) -> int:
         with self.session_factory() as session:

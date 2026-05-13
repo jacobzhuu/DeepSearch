@@ -22,6 +22,61 @@ _FETCH_RESULTS_TOTAL = Counter(
     "Fetch pipeline batch result counters.",
     labelnames=("result",),
 )
+_FETCH_FAILURE_CLASS_TOTAL = Counter(
+    "deepresearch_fetch_failure_class_total",
+    "Fetch attempts by normalized failure class (ok when error_code is null).",
+    labelnames=("code",),
+)
+_BROWSER_FALLBACK_CONSIDERED_TOTAL = Counter(
+    "deepresearch_browser_fallback_considered_total",
+    "Browser fallback decision evaluated after static fetch (requires non-none backend setting).",
+    labelnames=("reason",),
+)
+_BROWSER_FALLBACK_ATTEMPTED_TOTAL = Counter(
+    "deepresearch_browser_fallback_attempted_total",
+    "Browser fallback render attempts started.",
+    labelnames=("backend",),
+)
+_BROWSER_FALLBACK_SUCCEEDED_TOTAL = Counter(
+    "deepresearch_browser_fallback_succeeded_total",
+    "Browser fallback attempts that ended without fetch_attempt.error_code.",
+    labelnames=("backend",),
+)
+_BROWSER_FALLBACK_FAILED_TOTAL = Counter(
+    "deepresearch_browser_fallback_failed_total",
+    "Browser fallback attempts that ended with an error_code.",
+    labelnames=("backend", "code"),
+)
+_BROWSER_FALLBACK_SKIPPED_TOTAL = Counter(
+    "deepresearch_browser_fallback_skipped_total",
+    "Browser fallback not attempted after evaluation.",
+    labelnames=("reason",),
+)
+
+
+def record_browser_fallback_considered(*, reason: str) -> None:
+    _BROWSER_FALLBACK_CONSIDERED_TOTAL.labels(reason=reason or "unknown").inc()
+
+
+def record_browser_fallback_attempted(*, backend: str) -> None:
+    _BROWSER_FALLBACK_ATTEMPTED_TOTAL.labels(backend=backend or "unknown").inc()
+
+
+def record_browser_fallback_succeeded(*, backend: str) -> None:
+    _BROWSER_FALLBACK_SUCCEEDED_TOTAL.labels(backend=backend or "unknown").inc()
+
+
+def record_browser_fallback_failed(*, backend: str, code: str) -> None:
+    _BROWSER_FALLBACK_FAILED_TOTAL.labels(
+        backend=backend or "unknown",
+        code=code or "unknown",
+    ).inc()
+
+
+def record_browser_fallback_skipped(*, reason: str) -> None:
+    _BROWSER_FALLBACK_SKIPPED_TOTAL.labels(reason=reason or "unknown").inc()
+
+
 _PARSE_RESULTS_TOTAL = Counter(
     "deepresearch_parse_results_total",
     "Parse pipeline entry results by status and reason.",
@@ -76,12 +131,18 @@ def record_fetch_results(
     _FETCH_RESULTS_TOTAL.labels(result="failed").inc(failed)
 
 
+def record_fetch_failure_class(*, code: str | None) -> None:
+    label = "ok" if code is None or not str(code).strip() else str(code).strip()
+    _FETCH_FAILURE_CLASS_TOTAL.labels(code=label).inc()
+
+
 def record_parse_results(
     *,
     created: int,
     updated: int,
     skipped_existing: int,
     skipped_unsupported: int,
+    skipped_static_html_hold: int = 0,
     failed: int,
 ) -> None:
     _PARSE_RESULTS_TOTAL.labels(status="CREATED", reason="none").inc(created)
@@ -89,6 +150,9 @@ def record_parse_results(
     _PARSE_RESULTS_TOTAL.labels(status="SKIPPED", reason="already_parsed").inc(skipped_existing)
     _PARSE_RESULTS_TOTAL.labels(status="SKIPPED", reason="unsupported_mime_type").inc(
         skipped_unsupported
+    )
+    _PARSE_RESULTS_TOTAL.labels(status="SKIPPED", reason="static_html_acquire_hold").inc(
+        skipped_static_html_hold
     )
     _PARSE_RESULTS_TOTAL.labels(status="FAILED", reason="other").inc(failed)
 

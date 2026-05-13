@@ -4,9 +4,11 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
-from packages.db.models import ResearchTask, TaskEvent
+from packages.db.models import Claim, ResearchTask, TaskEvent
 from services.orchestrator.app.api.routes.research_tasks import _derive_observability
+from services.orchestrator.app.research_quality import build_slot_coverage_summary
 from services.orchestrator.app.services.debug_pipeline import (
+    _claim_slot_summary_row,
     _target_slot_ids_from_candidate_or_search_query,
 )
 from services.orchestrator.app.services.research_tasks import TaskSnapshot
@@ -170,3 +172,32 @@ def test_source_yield_target_slots_prefer_candidate_metadata() -> None:
         {"target_slots": ["official_news"]},
         search_query,
     ) == ["official_news"]
+
+
+def test_claim_slot_summary_uses_nested_evidence_candidate_slot_ids() -> None:
+    query = "What is LangGraph and how does it work?"
+    claim = Claim(
+        task_id=uuid4(),
+        statement="StateGraph is a builder class and cannot be used directly for execution.",
+        claim_type="fact",
+        confidence=0.9,
+        verification_status="supported",
+        notes_json={
+            "report_eligible": True,
+            "claim_category": "definition",
+            "evidence_candidate": {
+                "source_document_id": "source-stategraph",
+                "slot_ids": ["limitations"],
+            },
+        },
+    )
+
+    row = _claim_slot_summary_row(claim, query=query)
+    summary = build_slot_coverage_summary(query, claim_rows=[row] if row else [])
+    limitations = next(item for item in summary if item["slot_id"] == "limitations")
+
+    assert row is not None
+    assert row["slot_ids"] == ["limitations"]
+    assert row["source_document_id"] == "source-stategraph"
+    assert limitations["supported_claim_count"] == 1
+    assert limitations["status"] == "covered"

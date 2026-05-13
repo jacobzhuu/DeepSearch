@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from packages.db.models import ContentSnapshot, ResearchTask, SourceChunk, SourceDocument
@@ -22,6 +25,7 @@ from services.orchestrator.app.parsing import (
     chunk_text,
     extract_parsed_content,
 )
+from services.orchestrator.app.parsing.chunk_text_validation import partition_valid_parsed_chunks
 from services.orchestrator.app.research_quality import classify_source_intent
 from services.orchestrator.app.services.acquisition import FETCH_STATUS_SUCCEEDED
 from services.orchestrator.app.services.research_tasks import (
@@ -34,13 +38,27 @@ MAX_SNAPSHOTS_PER_REQUEST = 10
 
 logger = get_logger(__name__)
 
+
+def _trace_dict(trace: object | None) -> dict[str, object]:
+    return trace if isinstance(trace, dict) else {}
+
+
+def _snapshot_eligible_for_evidence_parse(content_snapshot: ContentSnapshot) -> bool:
+    trace = _trace_dict(content_snapshot.fetch_attempt.trace_json)
+    if trace.get("eligible_for_evidence_parse") is False:
+        return False
+    return True
+
+
 PARSE_DECISION_PARSED = "parsed"
 PARSE_DECISION_SKIPPED_EMPTY = "skipped_empty"
+PARSE_DECISION_NO_VALID_CHUNKS = "skipped_no_valid_chunks"
 PARSE_DECISION_SKIPPED_UNSUPPORTED_MIME = "skipped_unsupported_mime"
 PARSE_DECISION_MISSING_BLOB = "missing_blob"
 PARSE_DECISION_PARSE_ERROR = "parse_error"
 PARSE_DECISION_ALREADY_PARSED = "already_parsed"
 PARSE_DECISION_FETCH_NOT_SUCCEEDED = "fetch_not_succeeded"
+PARSE_DECISION_SKIPPED_STATIC_HTML_QUALITY = "skipped_static_html_quality"
 
 
 class ParsingConflictError(Exception):
@@ -54,8 +72,7 @@ class ParsingConflictError(Exception):
         if allowed_statuses:
             allowed_text = f"; allowed statuses: {', '.join(allowed_statuses)}"
         super().__init__(
-            f"cannot parse snapshots for task {task_id} from status {current_status}"
-            f"{allowed_text}"
+            f"cannot parse snapshots for task {task_id} from status {current_status}{allowed_text}"
         )
         self.task_id = task_id
         self.current_status = current_status
@@ -80,6 +97,7 @@ class ParseLedgerEntry:
     decision: str
     body_length: int | None = None
     parser_error: str | None = None
+    chunk_validation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -89,8 +107,13 @@ class ParseBatchResult:
     updated: int
     skipped_existing: int
     skipped_unsupported: int
+    skipped_static_html_hold: int
+    skipped_no_valid_chunks: int
     failed: int
     entries: list[ParseLedgerEntry]
+    invalid_chunk_rejection_count: int = 0
+    invalid_chunk_rejection_reason_distribution: dict[str, int] | None = None
+    snapshots_with_no_valid_chunks: int = 0
 
 
 class ParsingService:
@@ -112,6 +135,34 @@ class ParsingService:
         self.source_chunk_repository = source_chunk_repository
         self.snapshot_object_store = snapshot_object_store
         self.allowed_statuses = allowed_statuses
+
+    def count_source_documents_for_task(self, task_id: UUID) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(SourceDocument)
+                .where(SourceDocument.task_id == task_id)
+            )
+            or 0
+        )
+
+    def count_eligible_snapshots_without_source_document(self, task_id: UUID) -> int:
+        """Eligible for evidence parse, fetch succeeded, no ``source_document`` row yet."""
+        n = 0
+        for content_snapshot in self.content_snapshot_repository.list_for_task(task_id):
+            fetch_attempt = content_snapshot.fetch_attempt
+            fetch_job = fetch_attempt.fetch_job
+            if fetch_job.status != FETCH_STATUS_SUCCEEDED or fetch_attempt.error_code:
+                continue
+            if not _snapshot_eligible_for_evidence_parse(content_snapshot):
+                continue
+            if (
+                self.source_document_repository.get_for_content_snapshot(content_snapshot.id)
+                is not None
+            ):
+                continue
+            n += 1
+        return n
 
     def parse_snapshots(
         self,
@@ -138,7 +189,11 @@ class ParsingService:
         updated = 0
         skipped_existing = 0
         skipped_unsupported = 0
+        skipped_static_html_hold = 0
+        skipped_no_valid_chunks = 0
         failed = 0
+        invalid_chunk_total = 0
+        invalid_reasons: Counter[str] = Counter()
 
         for content_snapshot in selected_snapshots:
             entry = self._parse_one_snapshot(task, content_snapshot)
@@ -154,14 +209,29 @@ class ParsingService:
                 and entry.reason == ParseResultReason.UNSUPPORTED_MIME_TYPE
             ):
                 skipped_unsupported += 1
+            elif (
+                entry.status == "SKIPPED"
+                and entry.reason == ParseResultReason.ACQUISITION_STATIC_HTML_PARSE_HELD
+            ):
+                skipped_static_html_hold += 1
+            elif entry.status == "SKIPPED" and entry.reason == ParseResultReason.NO_VALID_CHUNKS:
+                skipped_no_valid_chunks += 1
             elif entry.status == "FAILED":
                 failed += 1
+            cv = entry.chunk_validation or {}
+            invalid_chunk_total += int(cv.get("invalid_chunk_rejection_count") or 0)
+            dist = cv.get("invalid_chunk_rejection_reason_distribution") or {}
+            if isinstance(dist, dict):
+                for k, v in dist.items():
+                    if isinstance(v, int):
+                        invalid_reasons[str(k)] += v
 
         record_parse_results(
             created=created,
             updated=updated,
             skipped_existing=skipped_existing,
             skipped_unsupported=skipped_unsupported,
+            skipped_static_html_hold=skipped_static_html_hold,
             failed=failed,
         )
         logger.info(
@@ -172,7 +242,14 @@ class ParsingService:
                 "updated_count": updated,
                 "skipped_existing": skipped_existing,
                 "skipped_unsupported": skipped_unsupported,
+                "skipped_static_html_hold": skipped_static_html_hold,
+                "skipped_no_valid_chunks": skipped_no_valid_chunks,
                 "failed": failed,
+                "invalid_chunk_rejection_count": invalid_chunk_total,
+                "invalid_chunk_rejection_reason_distribution": dict(
+                    sorted(invalid_reasons.items())
+                ),
+                "snapshots_with_no_valid_chunks": skipped_no_valid_chunks,
                 "parse_decisions": [parse_entry_diagnostic(entry) for entry in entries],
             },
         )
@@ -182,8 +259,13 @@ class ParsingService:
             updated=updated,
             skipped_existing=skipped_existing,
             skipped_unsupported=skipped_unsupported,
+            skipped_static_html_hold=skipped_static_html_hold,
+            skipped_no_valid_chunks=skipped_no_valid_chunks,
             failed=failed,
             entries=entries,
+            invalid_chunk_rejection_count=invalid_chunk_total,
+            invalid_chunk_rejection_reason_distribution=dict(sorted(invalid_reasons.items())),
+            snapshots_with_no_valid_chunks=skipped_no_valid_chunks,
         )
 
     def list_source_documents(
@@ -217,16 +299,26 @@ class ParsingService:
         limit: int,
     ) -> list[ContentSnapshot]:
         if content_snapshot_ids is None:
-            successful_snapshots: list[ContentSnapshot] = []
+            unparsed: list[ContentSnapshot] = []
+            parsed: list[ContentSnapshot] = []
             for content_snapshot in self.content_snapshot_repository.list_for_task(task_id):
                 fetch_attempt = content_snapshot.fetch_attempt
                 fetch_job = fetch_attempt.fetch_job
                 if fetch_job.status != FETCH_STATUS_SUCCEEDED or fetch_attempt.error_code:
                     continue
-                successful_snapshots.append(content_snapshot)
-                if len(successful_snapshots) >= limit:
-                    break
-            return successful_snapshots
+                if not _snapshot_eligible_for_evidence_parse(content_snapshot):
+                    continue
+                if (
+                    self.source_document_repository.get_for_content_snapshot(content_snapshot.id)
+                    is not None
+                ):
+                    parsed.append(content_snapshot)
+                else:
+                    unparsed.append(content_snapshot)
+            # Prefer snapshots without a source_document so repeated parse batches drain the queue
+            # instead of re-selecting the same chronological prefix forever (capped at ``limit``).
+            ordered = unparsed + parsed
+            return ordered[:limit]
 
         selected = self.content_snapshot_repository.list_by_ids_for_task(
             task_id,
@@ -265,6 +357,21 @@ class ParsingService:
                 reason=ParseResultReason.FETCH_NOT_SUCCEEDED,
                 updated_existing=False,
                 decision=PARSE_DECISION_FETCH_NOT_SUCCEEDED,
+            )
+
+        if not _snapshot_eligible_for_evidence_parse(content_snapshot):
+            trace = _trace_dict(fetch_attempt.trace_json)
+            hold = trace.get("parse_hold_reason") or trace.get("static_html_quality_decision")
+            return ParseLedgerEntry(
+                content_snapshot=content_snapshot,
+                source_document=None,
+                chunks_created=0,
+                status="SKIPPED",
+                reason=ParseResultReason.ACQUISITION_STATIC_HTML_PARSE_HELD,
+                updated_existing=False,
+                decision=PARSE_DECISION_SKIPPED_STATIC_HTML_QUALITY,
+                body_length=content_snapshot.bytes,
+                parser_error=str(hold) if hold is not None else None,
             )
 
         existing_for_snapshot = self.source_document_repository.get_for_content_snapshot(
@@ -367,6 +474,32 @@ class ParsingService:
                 "source_intent": source_intent.source_intent,
             },
         )
+        parsed_chunks = chunk_text(parsed_content.text)
+        valid_chunks, chunk_val_diag = partition_valid_parsed_chunks(
+            parsed_chunks,
+            content_snapshot_id=content_snapshot.id,
+            canonical_url=document_url,
+            domain=document_domain,
+        )
+        if not valid_chunks:
+            merged_diag = {
+                **chunk_val_diag,
+                "parser_invalid_output": True,
+                "snapshots_with_no_valid_chunks": 1,
+            }
+            return ParseLedgerEntry(
+                content_snapshot=content_snapshot,
+                source_document=None,
+                chunks_created=0,
+                status="SKIPPED",
+                reason=ParseResultReason.NO_VALID_CHUNKS,
+                updated_existing=False,
+                decision=PARSE_DECISION_NO_VALID_CHUNKS,
+                body_length=len(raw_content),
+                parser_error="no_valid_chunks_after_text_validation",
+                chunk_validation=merged_diag,
+            )
+
         source_document = self.source_document_repository.get_for_task_url(
             task_id,
             document_url,
@@ -407,8 +540,11 @@ class ParsingService:
             source_document.safety_score = source_quality.safety_score
             source_document.final_source_score = source_quality.score
 
-        parsed_chunks = chunk_text(parsed_content.text)
-        for parsed_chunk in parsed_chunks:
+        success_chunk_diag = {
+            **chunk_val_diag,
+            "parser_invalid_output": False,
+        }
+        for parsed_chunk in valid_chunks:
             metadata = dict(parsed_chunk.metadata)
             locator_metadata = _structure_locator_metadata(
                 parsed_content.metadata,
@@ -506,12 +642,13 @@ class ParsingService:
         return ParseLedgerEntry(
             content_snapshot=content_snapshot,
             source_document=source_document,
-            chunks_created=len(parsed_chunks),
+            chunks_created=len(valid_chunks),
             status="UPDATED" if updated_existing else "CREATED",
             reason=None,
             updated_existing=updated_existing,
             decision=PARSE_DECISION_PARSED,
             body_length=len(raw_content),
+            chunk_validation=success_chunk_diag,
         )
 
     def _get_task_or_raise(self, task_id: UUID) -> None:
@@ -575,6 +712,12 @@ def parse_entry_diagnostic(entry: ParseLedgerEntry) -> dict[str, object]:
         "status": entry.status,
         "reason": entry.reason.value if entry.reason is not None else None,
         "parser_error": entry.parser_error,
+        "eligible_for_evidence_parse": _trace_dict(content_snapshot.fetch_attempt.trace_json).get(
+            "eligible_for_evidence_parse"
+        ),
+        "static_html_quality_decision": _trace_dict(content_snapshot.fetch_attempt.trace_json).get(
+            "static_html_quality_decision"
+        ),
         "source_document_id": (
             str(entry.source_document.id) if entry.source_document is not None else None
         ),
@@ -641,6 +784,7 @@ def parse_entry_diagnostic(entry: ParseLedgerEntry) -> dict[str, object]:
             entry.source_document,
             "discovered_followup_url",
         ),
+        "chunk_validation": entry.chunk_validation,
         "chunks_created": entry.chunks_created,
     }
 

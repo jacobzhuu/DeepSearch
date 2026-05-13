@@ -11,6 +11,12 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from services.orchestrator.app.acquisition.failure_classification import (
+    classify_http_response,
+    classify_httpx_request_error,
+)
+from services.orchestrator.app.acquisition.response_cap_policy import effective_response_byte_cap
+
 BLOCKED_HOSTNAMES = {
     "localhost",
     "metadata",
@@ -97,15 +103,28 @@ class HttpAcquisitionClient:
         resolver: HostResolver | None = None,
         client: httpx.Client | None = None,
         trust_env_proxy: bool = False,
+        trusted_docs_domains: frozenset[str] | None = None,
+        trusted_docs_max_response_bytes: int | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.max_redirects = max_redirects
-        self.max_response_bytes = max_response_bytes
+        self.max_response_bytes = max(1, int(max_response_bytes))
         self.user_agent = user_agent
         self.accept_language = accept_language
         self.resolver = resolver or SocketHostResolver()
         self.client = client
         self.trust_env_proxy = trust_env_proxy
+        self._trusted_docs_domains = trusted_docs_domains or frozenset()
+        self._trusted_docs_max_response_bytes = trusted_docs_max_response_bytes
+
+    def validate_fetch_target(self, url: str) -> dict[str, Any]:
+        """
+        SSRF / scheme guard for a single URL (initial navigation target).
+
+        Used by browser acquisition to mirror static ``HttpAcquisitionClient`` policy before
+        ``page.goto``. Redirect targets inside the page are not re-validated here.
+        """
+        return self._validate_target_url(url).to_trace()
 
     def fetch(self, url: str) -> HttpFetchResult:
         try:
@@ -122,18 +141,22 @@ class HttpAcquisitionClient:
                 trace=_merge_trace(_proxy_trace_for_url(url, self.trust_env_proxy), error.trace),
             )
         except httpx.RequestError as error:
+            classified = classify_httpx_request_error(error)
             return HttpFetchResult(
                 requested_url=url,
                 final_url=None,
                 http_status=None,
-                error_code="network_error",
+                error_code=classified,
                 mime_type=None,
                 content=None,
                 content_hash=None,
-                trace=_request_error_trace(
-                    url=url,
-                    error=error,
-                    trust_env_proxy=self.trust_env_proxy,
+                trace=_merge_trace(
+                    _request_error_trace(
+                        url=url,
+                        error=error,
+                        trust_env_proxy=self.trust_env_proxy,
+                    ),
+                    {"transport_error_class": classified},
                 ),
             )
 
@@ -160,14 +183,16 @@ class HttpAcquisitionClient:
                     ),
                 ) from error
             except httpx.RequestError as error:
+                classified = classify_httpx_request_error(error)
                 raise AcquisitionPolicyError(
-                    error_code="network_error",
+                    error_code=classified,
                     trace=_merge_trace(
                         {
                             "requested_url": url,
                             "final_url": current_url,
                             **_proxy_trace_for_url(current_url, self.trust_env_proxy),
                             **target_validation.to_trace(),
+                            "transport_error_class": classified,
                         },
                         _request_error_trace(
                             url=current_url,
@@ -180,7 +205,7 @@ class HttpAcquisitionClient:
             if location is not None and response_data.http_status in {301, 302, 303, 307, 308}:
                 if redirect_count >= self.max_redirects:
                     raise AcquisitionPolicyError(
-                        error_code="too_many_redirects",
+                        error_code="redirect_loop",
                         http_status=response_data.http_status,
                         trace={
                             "requested_url": url,
@@ -205,7 +230,7 @@ class HttpAcquisitionClient:
             if stub_redirect_target is not None:
                 if redirect_count >= self.max_redirects:
                     raise AcquisitionPolicyError(
-                        error_code="too_many_redirects",
+                        error_code="redirect_loop",
                         http_status=response_data.http_status,
                         trace={
                             "requested_url": url,
@@ -228,16 +253,34 @@ class HttpAcquisitionClient:
                 current_url = next_url
                 continue
 
-            error_code = None if 200 <= response_data.http_status < 300 else "http_error_status"
-            content_hash = f"sha256:{hashlib.sha256(response_data.content).hexdigest()}"
+            error_code, strip_body = classify_http_response(
+                http_status=response_data.http_status,
+                mime_type=response_data.mime_type,
+                body_len=len(response_data.content),
+            )
+            if error_code is not None and strip_body:
+                content_out: bytes | None = None
+                content_hash_out: str | None = None
+                trace_extra: dict[str, Any] = {
+                    "post_fetch_gate": error_code,
+                    "gated_bytes": len(response_data.content),
+                }
+            elif error_code is not None:
+                content_out = response_data.content
+                content_hash_out = f"sha256:{hashlib.sha256(response_data.content).hexdigest()}"
+                trace_extra = {}
+            else:
+                content_out = response_data.content
+                content_hash_out = f"sha256:{hashlib.sha256(response_data.content).hexdigest()}"
+                trace_extra = {}
             return HttpFetchResult(
                 requested_url=url,
                 final_url=response_data.final_url,
                 http_status=response_data.http_status,
                 error_code=error_code,
                 mime_type=response_data.mime_type,
-                content=response_data.content,
-                content_hash=content_hash,
+                content=content_out,
+                content_hash=content_hash_out,
                 trace={
                     "requested_url": url,
                     "final_url": response_data.final_url,
@@ -245,15 +288,25 @@ class HttpAcquisitionClient:
                     **_proxy_trace_for_url(current_url, self.trust_env_proxy),
                     **target_validation.to_trace(),
                     "response_bytes": len(response_data.content),
+                    **(response_data.response_cap_policy or {}),
+                    **trace_extra,
                 },
             )
 
         raise AcquisitionPolicyError(
-            error_code="too_many_redirects",
+            error_code="redirect_loop",
             trace={"requested_url": url, "redirect_chain": redirect_chain},
         )
 
     def _perform_request(self, url: str) -> _HttpResponseData:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        effective_max, cap_fragment = effective_response_byte_cap(
+            host=host,
+            global_max_response_bytes=self.max_response_bytes,
+            trusted_domains=self._trusted_docs_domains,
+            trusted_max_response_bytes=self._trusted_docs_max_response_bytes,
+        )
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Accept-Language": self.accept_language,
@@ -270,20 +323,35 @@ class HttpAcquisitionClient:
             "User-Agent": self.user_agent,
         }
         if self.client is not None:
-            return self._perform_request_with_client(self.client, url, headers)
+            return self._perform_request_with_client(
+                self.client,
+                url,
+                headers,
+                max_response_bytes=effective_max,
+                response_cap_policy=cap_fragment,
+            )
 
         with httpx.Client(
             follow_redirects=False,
             timeout=self.timeout_seconds,
             trust_env=self.trust_env_proxy,
         ) as client:
-            return self._perform_request_with_client(client, url, headers)
+            return self._perform_request_with_client(
+                client,
+                url,
+                headers,
+                max_response_bytes=effective_max,
+                response_cap_policy=cap_fragment,
+            )
 
     def _perform_request_with_client(
         self,
         client: httpx.Client,
         url: str,
         headers: dict[str, str],
+        *,
+        max_response_bytes: int,
+        response_cap_policy: dict[str, Any],
     ) -> _HttpResponseData:
         with client.stream("GET", url, headers=headers, follow_redirects=False) as response:
             if response.headers.get("location") is not None and response.status_code in {
@@ -299,20 +367,24 @@ class HttpAcquisitionClient:
                     headers=dict(response.headers),
                     mime_type=_normalize_mime_type(response.headers.get("content-type")),
                     content=b"",
+                    response_cap_policy=response_cap_policy,
                 )
 
             content = bytearray()
             for chunk in response.iter_bytes():
                 content.extend(chunk)
-                if len(content) > self.max_response_bytes:
+                if len(content) > max_response_bytes:
                     raise AcquisitionPolicyError(
                         error_code="body_too_large",
                         http_status=response.status_code,
-                        trace={
-                            "final_url": str(response.url),
-                            "response_bytes": len(content),
-                            "max_response_bytes": self.max_response_bytes,
-                        },
+                        trace=_merge_trace(
+                            {
+                                "final_url": str(response.url),
+                                "response_bytes": len(content),
+                                "max_response_bytes": max_response_bytes,
+                            },
+                            response_cap_policy,
+                        ),
                     )
 
             return _HttpResponseData(
@@ -321,6 +393,7 @@ class HttpAcquisitionClient:
                 headers=dict(response.headers),
                 mime_type=_normalize_mime_type(response.headers.get("content-type")),
                 content=bytes(content),
+                response_cap_policy=response_cap_policy,
             )
 
     def _validate_target_url(self, url: str) -> _TargetValidationResult:
@@ -576,3 +649,4 @@ class _HttpResponseData:
     headers: dict[str, str]
     mime_type: str
     content: bytes
+    response_cap_policy: dict[str, Any] | None = None

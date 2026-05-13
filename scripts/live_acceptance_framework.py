@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -18,7 +19,9 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 EXPECTED_RUNNING_MODE = "real-search+opensearch+planner+report-LLM"
 # ``+``-delimited segments that must all be present (case-insensitive) for real-pipeline acceptance.
 REQUIRED_RUNNING_MODE_SEGMENTS = frozenset({"real-search", "opensearch", "planner", "report-llm"})
-REQUEST_TIMEOUT_SECONDS = 30
+REQUEST_TIMEOUT_SECONDS = float(
+    os.environ.get("DEEPSEARCH_LIVE_ACCEPTANCE_HTTP_TIMEOUT", "30")
+)
 ACTIVE_STATUSES = {
     "QUEUED",
     "RUNNING",
@@ -362,6 +365,7 @@ def evaluate_langgraph_acceptance(
     official_sources = langgraph_official_sources(payloads)
     report_sections = technical_report_section_summary(report_markdown)
     evidence_chain = evidence_chain_summary(payloads)
+    benchmark = benchmark_metrics(payloads, report_markdown=report_markdown)
     checks = {
         "task_completed": detail.get("status") == "COMPLETED",
         "running_mode_real_pipeline": running_mode_has_required_capabilities(running_mode),
@@ -390,6 +394,7 @@ def evaluate_langgraph_acceptance(
         "evidence_chain": evidence_chain,
         "technical_report_sections": report_sections,
         "official_or_high_authority_sources": official_sources,
+        "benchmark": benchmark,
     }
 
 
@@ -403,6 +408,116 @@ def artifact_counts(payloads: dict[str, dict[str, Any]]) -> dict[str, int]:
         "claim_evidence": len(as_list(payloads.get("claim_evidence", {}).get("claim_evidence"))),
         "events": len(as_list(payloads.get("events", {}).get("events"))),
     }
+
+
+def benchmark_metrics(
+    payloads: dict[str, dict[str, Any]],
+    *,
+    report_markdown: object,
+) -> dict[str, Any]:
+    search_queries = as_list(payloads.get("search_queries", {}).get("search_queries"))
+    observability = observability_from_detail(payloads.get("detail", {}))
+    planned_search_queries = as_list(
+        observability.get("final_search_queries")
+        or (observability.get("research_plan") or {}).get("search_queries")
+    )
+    candidate_urls = as_list(payloads.get("candidate_urls", {}).get("candidate_urls"))
+    source_documents = as_list(payloads.get("source_documents", {}).get("source_documents"))
+    source_chunks = as_list(payloads.get("source_chunks", {}).get("source_chunks"))
+    claims = as_list(payloads.get("claims", {}).get("claims"))
+    claim_evidence = as_list(payloads.get("claim_evidence", {}).get("claim_evidence"))
+    report_text = report_markdown if isinstance(report_markdown, str) else ""
+    report_word_count = len(re.findall(r"\b\w+\b", report_text))
+    source_yield_summary = _first_list_by_key(payloads, "source_yield_summary")
+    slot_coverage_summary = _first_list_by_key(payloads, "slot_coverage_summary")
+    source_rows = source_yield_summary or candidate_urls or source_documents
+    source_domains = sorted(
+        {
+            str(item.get("domain") or "").strip().lower()
+            for item in source_documents
+            if isinstance(item, dict) and str(item.get("domain") or "").strip()
+        }
+    )
+    source_roles = Counter(
+        str(item.get("source_role") or item.get("source_intent") or "").strip()
+        for item in source_rows
+        if isinstance(item, dict)
+    )
+    source_categories = Counter(
+        str(item.get("source_category") or item.get("source_intent") or "").strip()
+        for item in source_rows
+        if isinstance(item, dict)
+    )
+    supported_claims = [
+        item
+        for item in claims
+        if isinstance(item, dict) and item.get("verification_status") == "supported"
+    ]
+    report_citation_density = (
+        round(len(claim_evidence) / max(report_word_count / 1000.0, 1.0), 3)
+        if report_word_count
+        else 0.0
+    )
+    return {
+        "search_queries": max(len(search_queries), len(planned_search_queries)),
+        "search_queries_persisted": len(search_queries),
+        "search_queries_planned": len(planned_search_queries),
+        "candidate_urls": len(candidate_urls),
+        "source_documents": len(source_documents),
+        "source_domains": source_domains,
+        "source_domain_count": len(source_domains),
+        "source_categories": {
+            key: count for key, count in sorted(source_categories.items()) if key
+        },
+        "source_roles": {key: count for key, count in sorted(source_roles.items()) if key},
+        "source_chunks": len(source_chunks),
+        "claims": len(claims),
+        "supported_claims": len(supported_claims),
+        "claim_evidence": len(claim_evidence),
+        "report_length": {
+            "characters": len(report_text),
+            "words": report_word_count,
+        },
+        "citation_density_per_1000_words": report_citation_density,
+        "answer_slot_coverage": _answer_slot_coverage_metrics(slot_coverage_summary),
+        "gap_summary": summarize_gap_loop_from_payloads(payloads),
+    }
+
+
+def _answer_slot_coverage_metrics(rows: list[Any]) -> dict[str, Any]:
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    status_counts = Counter(str(row.get("status") or "unknown") for row in normalized_rows)
+    covered = [
+        str(row.get("slot_id"))
+        for row in normalized_rows
+        if row.get("status") in {"covered", "strong", "moderate"}
+    ]
+    weak = [str(row.get("slot_id")) for row in normalized_rows if row.get("status") == "weak"]
+    missing = [str(row.get("slot_id")) for row in normalized_rows if row.get("status") == "missing"]
+    return {
+        "total": len(normalized_rows),
+        "status_counts": {key: count for key, count in sorted(status_counts.items())},
+        "covered_slots": [slot for slot in covered if slot and slot != "None"],
+        "weak_slots": [slot for slot in weak if slot and slot != "None"],
+        "missing_slots": [slot for slot in missing if slot and slot != "None"],
+    }
+
+
+def _first_list_by_key(value: Any, key: str) -> list[Any]:
+    if isinstance(value, dict):
+        direct = value.get(key)
+        if isinstance(direct, list):
+            return direct
+        for nested in value.values():
+            found = _first_list_by_key(nested, key)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _first_list_by_key(item, key)
+            if found:
+                return found
+    return []
 
 
 def evidence_chain_summary(payloads: dict[str, dict[str, Any]]) -> dict[str, int]:
@@ -829,6 +944,12 @@ def write_artifacts(output_dir: Path, result: dict[str, Any]) -> None:
         json.dumps(result["acceptance"], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    benchmark = result.get("acceptance", {}).get("benchmark")
+    if isinstance(benchmark, dict):
+        (output_dir / "benchmark.json").write_text(
+            json.dumps(benchmark, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     gap_summary = result.get("gap_summary")
     if gap_summary is None and isinstance(result.get("payloads"), dict):
         gap_summary = summarize_gap_loop_from_payloads(result["payloads"])

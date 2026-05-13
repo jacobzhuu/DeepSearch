@@ -99,6 +99,81 @@ def answer_slots_for_query(query: str | None) -> list[AnswerSlot]:
             ),
             AnswerSlot("mechanism", "How the privacy model works", ("mechanism", "privacy")),
         ]
+    if _asks_technical_explanation(lower):
+        return [
+            AnswerSlot(
+                "definition",
+                "Definition",
+                ("definition",),
+                description="What the system is and its core purpose.",
+            ),
+            AnswerSlot(
+                "motivation_problem",
+                "Motivation / problem solved",
+                ("definition", "feature", "mechanism"),
+                description="Why it exists and what problem it is meant to solve.",
+            ),
+            AnswerSlot(
+                "core_abstractions",
+                "Core abstractions",
+                ("mechanism", "feature"),
+                description="Primary concepts such as state, nodes, edges, graphs, tools, or APIs.",
+            ),
+            AnswerSlot(
+                "architecture",
+                "Architecture",
+                ("mechanism",),
+                description="How the main pieces fit together.",
+            ),
+            AnswerSlot(
+                "execution_model",
+                "Execution model",
+                ("mechanism",),
+                description="How work is scheduled, routed, resumed, or executed.",
+            ),
+            AnswerSlot(
+                "workflow_lifecycle",
+                "Workflow / lifecycle",
+                ("mechanism", "feature"),
+                description="How a task, graph, workflow, or run moves through its lifecycle.",
+            ),
+            AnswerSlot(
+                "key_features",
+                "Key features",
+                ("feature", "mechanism"),
+                required=False,
+                description="Notable capabilities and integrations.",
+            ),
+            AnswerSlot(
+                "examples_use_cases",
+                "Examples / use cases",
+                ("feature", "other"),
+                required=False,
+                description="Representative applications or examples.",
+            ),
+            AnswerSlot(
+                "limitations",
+                "Limitations",
+                ("feature", "privacy", "other"),
+                required=False,
+                description="Caveats, tradeoffs, or constraints.",
+            ),
+            AnswerSlot(
+                "comparison_positioning",
+                "Comparison / positioning",
+                ("definition", "feature", "other"),
+                required=False,
+                description="How it is positioned relative to adjacent tools or frameworks.",
+            ),
+            AnswerSlot(
+                "official_sources",
+                "Official sources",
+                ("definition", "mechanism", "feature", "privacy"),
+                description=(
+                    "Evidence from official documentation, reference pages, or repositories."
+                ),
+            ),
+        ]
     if _asks_definition_mechanism(lower):
         return [
             AnswerSlot("definition", "What it is", ("definition",)),
@@ -146,11 +221,277 @@ def slot_ids_for_claim_category(category: str, *, query: str | None) -> list[str
         "deployment/self_hosting"
     ):
         return []
+    if _asks_technical_explanation((query or "").strip().lower()):
+        return _technical_slot_ids_for_claim_category(normalized_category)
     return [
         slot.slot_id
         for slot in answer_slots_for_query(query)
         if normalized_category in slot.expected_claim_categories
     ]
+
+
+def technical_slot_ids_for_text(
+    *,
+    text: str,
+    category: str,
+    query: str | None,
+    source_intent: str | None = None,
+) -> tuple[str, ...]:
+    """Classify a technical-explanation evidence line into answer slots.
+
+    This stays deterministic and deliberately lexical. It only refines slot ids;
+    it does not create claims or evidence.
+    """
+    if not _asks_technical_explanation((query or "").strip().lower()):
+        return ()
+
+    normalized_category = category.strip()
+    lower = text.lower()
+    slots: list[str] = []
+
+    def add(slot_id: str) -> None:
+        if slot_id not in slots:
+            slots.append(slot_id)
+
+    if normalized_category == "definition" or _contains_any(
+        lower,
+        (
+            " is a ",
+            " is an ",
+            " is the ",
+            " are a ",
+            " are an ",
+            "framework",
+            "library",
+            "platform",
+        ),
+    ):
+        add("definition")
+
+    if _contains_any(
+        lower,
+        (
+            "designed",
+            "helps",
+            "allows",
+            "enables",
+            "problem",
+            "solve",
+            "reliable",
+            "complex",
+            "long-running",
+            "production",
+            "agent",
+            "agents",
+            "orchestrat",
+        ),
+    ):
+        add("motivation_problem")
+
+    if normalized_category == "mechanism" or _contains_any(
+        lower,
+        (
+            "abstraction",
+            "state",
+            "stategraph",
+            "state graph",
+            "graph",
+            "node",
+            "nodes",
+            "edge",
+            "edges",
+            "tool",
+            "tools",
+            "api",
+            "apis",
+            "message",
+            "messages",
+        ),
+    ):
+        add("core_abstractions")
+
+    if _contains_any(
+        lower,
+        (
+            "architecture",
+            "architectural",
+            "component",
+            "components",
+            "graph-based",
+            "graph based",
+            "directed graph",
+            "subgraph",
+            "runtime",
+            "low-level",
+            "low level",
+        ),
+    ):
+        add("architecture")
+
+    if _contains_any(
+        lower,
+        (
+            "execution",
+            "execute",
+            "executes",
+            "runtime",
+            "routing",
+            "route",
+            "conditional",
+            "transition",
+            "durable",
+            "checkpoint",
+            "checkpointing",
+            "resume",
+            "resum",
+            "interrupt",
+            "streaming",
+        ),
+    ):
+        add("execution_model")
+
+    if _contains_any(
+        lower,
+        (
+            "workflow",
+            "workflows",
+            "lifecycle",
+            "quickstart",
+            "quick start",
+            "getting started",
+            "getting-started",
+            "usage",
+            "how to",
+            "start",
+            "end",
+            "thread",
+            "threads",
+            "persistence",
+            "persistent",
+            "memory",
+            "human-in-the-loop",
+            "human in the loop",
+            "review",
+        ),
+    ):
+        add("workflow_lifecycle")
+
+    if normalized_category == "feature" or _contains_any(
+        lower,
+        (
+            "supports",
+            "features",
+            "capabilities",
+            "integrations",
+            "integration",
+            "memory",
+            "checkpoint",
+            "streaming",
+            "debug",
+            "observability",
+            "human-in-the-loop",
+            "human in the loop",
+            "sdk",
+            "cli",
+            "api",
+            "apis",
+        ),
+    ):
+        add("key_features")
+
+    if _contains_any(
+        lower,
+        (
+            "example",
+            "examples",
+            "use case",
+            "use cases",
+            "sample",
+            "samples",
+            "snippet",
+            "snippets",
+            "tutorial",
+            "tutorials",
+            "walkthrough",
+            "walk-through",
+            "guide",
+            "guides",
+            "reference app",
+            "reference apps",
+            "starter app",
+            "starter apps",
+            "boilerplate",
+            "cookbook",
+            "chatbot",
+            "chatbots",
+            "multi-agent",
+            "multi agent",
+            "customer support",
+            "research assistant",
+            "application",
+            "applications",
+        ),
+    ):
+        add("examples_use_cases")
+
+    if _contains_any(
+        lower,
+        (
+            "limitation",
+            "limitations",
+            "caveat",
+            "caveats",
+            "tradeoff",
+            "trade-off",
+            "constraint",
+            "constraints",
+            "requires",
+            "not ",
+            "unable",
+            "unsupported",
+            "known issue",
+            "known issues",
+            "experimental",
+            "deprecated",
+            "deprecation",
+            "preview",
+            "breaking change",
+            "stability",
+            "caution",
+            "rough edge",
+            "edge case",
+            "security consideration",
+            "not supported",
+            "does not support",
+        ),
+    ):
+        add("limitations")
+
+    if _contains_any(
+        lower,
+        (
+            "compare",
+            "comparison",
+            "alternative",
+            "position",
+            "positioning",
+            "differs",
+            "versus",
+            " vs ",
+            "langchain",
+            "framework",
+            "library",
+            "platform",
+        ),
+    ):
+        add("comparison_positioning")
+
+    if _is_official_source_intent(source_intent):
+        add("official_sources")
+
+    if not slots:
+        slots.extend(_technical_slot_ids_for_claim_category(normalized_category))
+    return tuple(dict.fromkeys(slots))
 
 
 def answer_slot_coverage(
@@ -192,6 +533,28 @@ def _asks_definition_mechanism(lower_query: str) -> bool:
     )
 
 
+def _asks_technical_explanation(lower_query: str) -> bool:
+    if not _asks_definition_mechanism(lower_query):
+        return False
+    if any(term in lower_query for term in ("deploy", "deployment", "docker", "install")):
+        return False
+    if "how does" in lower_query or "how do" in lower_query or "how it works" in lower_query:
+        return True
+    return any(
+        term in lower_query
+        for term in (
+            "technical explanation",
+            "architecture",
+            "execution model",
+            "workflow",
+            "framework",
+            "library",
+            "agent",
+            "orchestration",
+        )
+    )
+
+
 def _asks_privacy(lower_query: str) -> bool:
     return any(
         term in lower_query
@@ -215,3 +578,34 @@ def _asks_deployment(lower_query: str) -> bool:
 
 def _asks_comparison(lower_query: str) -> bool:
     return any(term in lower_query for term in ("compare", "comparison", "differences between"))
+
+
+def _technical_slot_ids_for_claim_category(category: str) -> list[str]:
+    return {
+        "definition": ["definition", "motivation_problem", "comparison_positioning"],
+        "mechanism": [
+            "core_abstractions",
+            "architecture",
+            "execution_model",
+            "workflow_lifecycle",
+        ],
+        "feature": ["key_features", "examples_use_cases", "limitations"],
+        "privacy": ["limitations"],
+        "deployment/self_hosting": ["key_features", "limitations"],
+        "other": ["examples_use_cases", "comparison_positioning", "limitations"],
+    }.get(category, [])
+
+
+def _contains_any(value: str, needles: tuple[str, ...]) -> bool:
+    padded = f" {value} "
+    return any(needle in padded for needle in needles)
+
+
+def _is_official_source_intent(source_intent: str | None) -> bool:
+    if not isinstance(source_intent, str):
+        return False
+    normalized = source_intent.strip().lower()
+    return normalized.startswith("official") or normalized in {
+        "github_readme_or_repo",
+        "reference",
+    }

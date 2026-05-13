@@ -59,6 +59,10 @@ from services.orchestrator.app.research_quality import (
     source_intent_priority,
     summarize_evidence_yield,
 )
+from services.orchestrator.app.research_quality.readme_normalized_signals import (
+    normalized_from_readme_from_claim,
+    readme_composite_support_relation_count_for_claims,
+)
 from services.orchestrator.app.search import SearchProviderError
 from services.orchestrator.app.services.acquisition import (
     AcquisitionService,
@@ -1037,9 +1041,7 @@ class DebugRealPipelineRunner:
         if not source_chunk_ids:
             round_warnings.append("Gap round parsed no source chunks.")
             has_any_doc = any(e.source_document is not None for e in parse_result.entries)
-            chunk_skip = (
-                SKIP_NO_SOURCE_DOCUMENTS if not has_any_doc else SKIP_NO_SOURCE_CHUNKS
-            )
+            chunk_skip = SKIP_NO_SOURCE_DOCUMENTS if not has_any_doc else SKIP_NO_SOURCE_CHUNKS
             cov_after = self._current_slot_coverage_summary(task_id)
             base = {
                 "gap_analysis": gap_analysis,
@@ -1826,6 +1828,40 @@ class DebugRealPipelineRunner:
             "source_yield_summary": source_yield_summary,
             "dropped_sources": _dropped_sources_from_yield(source_yield_summary),
             "accepted_claims_by_category": _accepted_claims_by_category(result.entries),
+            "repository_normalized_candidate_count": diagnostics.get(
+                "repository_normalized_candidate_count", 0
+            ),
+            "repository_normalized_claim_count": diagnostics.get(
+                "repository_normalized_claim_count", 0
+            ),
+            "repository_normalized_supported_claim_count": diagnostics.get(
+                "repository_normalized_supported_claim_count", 0
+            ),
+            "repository_normalized_rejection_reason_distribution": diagnostics.get(
+                "repository_normalized_rejection_reason_distribution", {}
+            ),
+            "official_repository_chunks_seen": diagnostics.get(
+                "official_repository_chunks_seen",
+                0,
+            ),
+            "official_repository_chunks_with_normalized_candidates": diagnostics.get(
+                "official_repository_chunks_with_normalized_candidates", 0
+            ),
+            "official_repository_chunks_cleaned": diagnostics.get(
+                "official_repository_chunks_cleaned", 0
+            ),
+            "github_readme_cleaner_applied_count": diagnostics.get(
+                "github_readme_cleaner_applied_count", 0
+            ),
+            "github_readme_cleaner_removed_line_count": diagnostics.get(
+                "github_readme_cleaner_removed_line_count", 0
+            ),
+            "github_readme_cleaner_kept_line_count": diagnostics.get(
+                "github_readme_cleaner_kept_line_count", 0
+            ),
+            "github_readme_cleaner_candidate_count": diagnostics.get(
+                "github_readme_cleaner_candidate_count", 0
+            ),
             "category_coverage_missing": _missing_expected_categories(
                 task.query,
                 category_coverage,
@@ -1949,6 +1985,23 @@ class DebugRealPipelineRunner:
         if not result.entries:
             raise DebugPipelinePreconditionError("claim verification found no draft claims")
         verification_summary = _build_verification_summary(result.entries)
+        all_claims = ClaimRepository(self.session).list_for_task(task_id)
+        normalized_claims = [
+            claim for claim in all_claims if normalized_from_readme_from_claim(claim)
+        ]
+        readme_composite_relations = readme_composite_support_relation_count_for_claims(
+            all_claims
+        )
+        verification_summary = {
+            **verification_summary,
+            **result.readme_normalized_verification,
+            "normalized_from_readme_claim_count": len(normalized_claims),
+            "repository_normalized_claim_count": len(normalized_claims),
+            "repository_normalized_supported_claim_count": sum(
+                1 for claim in normalized_claims if claim.verification_status == "supported"
+            ),
+            "readme_composite_support_relation_count": readme_composite_relations,
+        }
         slot_coverage_summary = build_slot_coverage_summary(
             task.query,
             evidence_candidates=_evidence_candidates_from_claims(self.session, task_id),
@@ -2037,6 +2090,7 @@ class DebugRealPipelineRunner:
             "evidence_yield_summary": manifest.get("evidence_yield_summary", {}),
             "verification_summary": manifest.get("verification_summary", {}),
             "dropped_sources": manifest.get("dropped_sources", []),
+            "report_diagnostics": manifest.get("report_diagnostics", {}),
             "report_writer": manifest.get("report_writer", {}),
             "llm_assistance": dict(self.llm_assistance),
             "warnings": source_quality_summary["warnings"],
@@ -2999,6 +3053,11 @@ def _chunk_metadata_eligible_for_claims(metadata: dict[str, Any]) -> bool:
 
 
 def _merge_draft_results(first: Any, second: Any) -> _MergedDraftResult:
+    first_d = dict(first.diagnostics)
+    second_d = dict(second.diagnostics)
+    for key, value in first_d.items():
+        if key.startswith("limitations_") and key not in second_d:
+            second_d[key] = value
     return _MergedDraftResult(
         created_claims=int(first.created_claims) + int(second.created_claims),
         reused_claims=int(first.reused_claims) + int(second.reused_claims),
@@ -3010,8 +3069,8 @@ def _merge_draft_results(first: Any, second: Any) -> _MergedDraftResult:
         reused_claim_evidence=int(first.reused_claim_evidence) + int(second.reused_claim_evidence),
         entries=[*first.entries, *second.entries],
         diagnostics={
-            **dict(second.diagnostics),
-            "initial_diagnostics": dict(first.diagnostics),
+            **second_d,
+            "initial_diagnostics": first_d,
             "post_supplemental_diagnostics": dict(second.diagnostics),
         },
     )
@@ -3546,6 +3605,15 @@ def _source_document_category(source_document: SourceDocument, *, query: str | N
     ).source_category
 
 
+def _source_document_role(source_document: SourceDocument, *, query: str | None = None) -> str:
+    return classify_source_intent(
+        canonical_url=source_document.canonical_url,
+        domain=source_document.domain,
+        title=source_document.title,
+        query=query,
+    ).source_role
+
+
 def _numeric_metadata_score(metadata: dict[str, Any], key: str) -> float:
     value = metadata.get(key)
     return float(value) if isinstance(value, int | float) else 0.0
@@ -3940,7 +4008,9 @@ def _build_source_yield_summary(
         )
         parsed = source_document is not None
         indexed = bool(chunks)
-        source_intent = str(fetch_priority_metadata(candidate, query=query).get("source_intent"))
+        priority_metadata = fetch_priority_metadata(candidate, query=query)
+        source_intent = str(priority_metadata.get("source_intent"))
+        source_role = str(priority_metadata.get("source_role") or source_intent)
         dropped_reasons = _source_yield_dropped_reasons(
             attempted=attempted,
             fetched=fetched,
@@ -3969,6 +4039,7 @@ def _build_source_yield_summary(
                 source_document_id=str(source_document.id) if source_document is not None else None,
                 url=candidate.canonical_url,
                 source_intent=source_intent,
+                source_role=source_role,
                 attempted=attempted,
                 fetched=fetched,
                 parsed=parsed,
@@ -4011,11 +4082,13 @@ def _build_source_yield_summary(
         rejected_count = sum(1 for item in source_candidates if item.get("rejection_reasons"))
         chunks = chunks_by_source_document_id.get(source_document.id, [])
         source_intent = _source_document_category(source_document, query=query)
+        source_role = _source_document_role(source_document, query=query)
         rows.append(
             SourceYieldSummary(
                 source_document_id=str(source_document.id),
                 url=source_document.canonical_url,
                 source_intent=source_intent,
+                source_role=source_role,
                 attempted=True,
                 fetched=True,
                 parsed=True,
@@ -4131,20 +4204,39 @@ def _normalize_slot_id_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+_FETCH_ATTEMPT_POLICY_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "unsupported_scheme",
+        "invalid_target",
+        "target_blocked",
+        "dns_resolution_failed",
+        "body_too_large",
+        "redirect_loop",
+        "too_many_redirects",
+    }
+)
+
+
 def _fetch_job_blocked_by_policy(
     session: Session,
     task_id: UUID,
     fetch_job: Any,
 ) -> bool:
-    for attempt in FetchAttemptRepository(session).list_for_task(
-        task_id,
-        fetch_job_id=fetch_job.id,
-        limit=1,
-    ):
-        error_code = attempt.error_code or ""
-        trace = attempt.trace_json or {}
-        if "policy" in error_code or trace.get("decision_reason") is not None:
-            return True
+    attempt = FetchAttemptRepository(session).get_latest_for_job(fetch_job.id)
+    if attempt is None:
+        return False
+    error_code = str(attempt.error_code or "")
+    if "policy" in error_code:
+        return True
+    if error_code in _FETCH_ATTEMPT_POLICY_ERROR_CODES:
+        return True
+    trace = attempt.trace_json or {}
+    decision = trace.get("decision_reason")
+    if isinstance(decision, str) and decision in {
+        "blocked_hostname",
+        "all_resolved_ips_non_global",
+    }:
+        return True
     return False
 
 
@@ -4289,6 +4381,13 @@ def _evidence_candidates_from_claims(
 def _claim_slot_summary_row(claim: Any, *, query: str | None = None) -> dict[str, Any] | None:
     notes = claim.notes_json if isinstance(claim.notes_json, dict) else {}
     slot_ids = [item for item in notes.get("slot_ids", []) if isinstance(item, str) and item]
+    evidence_candidate = notes.get("evidence_candidate")
+    if not slot_ids and isinstance(evidence_candidate, dict):
+        slot_ids = [
+            item
+            for item in evidence_candidate.get("slot_ids", [])
+            if isinstance(item, str) and item
+        ]
     if query is not None and not _claim_counts_toward_gap_slot_coverage(
         claim,
         query=query,
@@ -4308,7 +4407,12 @@ def _claim_slot_summary_row(claim: Any, *, query: str | None = None) -> dict[str
         "source_document_id": (
             notes.get("source_document_id")
             if isinstance(notes.get("source_document_id"), str)
-            else None
+            else (
+                evidence_candidate.get("source_document_id")
+                if isinstance(evidence_candidate, dict)
+                and isinstance(evidence_candidate.get("source_document_id"), str)
+                else None
+            )
         ),
         "support_level": support_level,
     }

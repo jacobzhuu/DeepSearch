@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from sqlalchemy.orm import Session
 
-from packages.db.models import SearchQuery
+from packages.db.models import CandidateUrl, ResearchRun, SearchQuery
 from packages.db.repositories import (
     CandidateUrlRepository,
     ResearchRunRepository,
@@ -25,6 +25,8 @@ from services.orchestrator.app.services.research_tasks import create_research_ta
 from services.orchestrator.app.services.search_discovery import (
     SearchDiscoveryConflictError,
     SearchDiscoveryService,
+    _add_known_path_candidates,
+    _merge_official_github_raw_readme_derivatives,
     create_search_discovery_service,
 )
 
@@ -427,9 +429,9 @@ def test_discover_candidates_applies_max_urls_across_authoritative_and_provider_
     ]
 
     assert len(persisted_candidates) == 8
-    assert len(authoritative_candidates) == 7
-    assert len(provider_candidates) == 1
-    assert [request.limit for request in provider.requests] == [1]
+    assert len(authoritative_candidates) == 8
+    assert len(provider_candidates) == 0
+    assert provider.requests == []
 
 
 def test_discover_candidates_does_not_call_provider_when_authoritative_candidates_fill_budget(
@@ -522,6 +524,16 @@ def test_discover_candidates_injects_langgraph_known_path_fallback_on_unresponsi
         candidate.metadata_json["original_search_provider"] == "searxng"
         for candidate in fallback_candidates
     )
+    repo_candidate = next(
+        candidate
+        for candidate in persisted_candidates
+        if candidate.canonical_url == "https://github.com/langchain-ai/langgraph"
+    )
+    assert repo_candidate.metadata_json["source_role"] == "official_repository"
+    target_slots = repo_candidate.metadata_json.get("target_slots")
+    assert isinstance(target_slots, list)
+    assert "examples_use_cases" in target_slots
+    assert "official_sources" in target_slots
 
     fallback_payload = _raw_response(persisted_queries[1])["known_path_fallback"]
     assert fallback_payload["known_path_fallback_applied"] is True
@@ -738,7 +750,13 @@ def test_discover_candidates_dedupes_langgraph_known_path_guardrails_from_provid
 
     assert canonical_urls.count("https://docs.langchain.com/oss/python/langgraph/overview") == 1
     assert "https://github.com/langchain-ai/langgraph" in canonical_urls
-    assert len(canonical_urls) == 8
+    assert "https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md" in (
+        canonical_urls
+    )
+    assert "https://raw.githubusercontent.com/langchain-ai/langgraph/master/README.md" in (
+        canonical_urls
+    )
+    assert len(canonical_urls) == 10
     assert result.search_queries[1].duplicates_skipped >= 1
     fallback_candidates = [
         candidate
@@ -959,3 +977,164 @@ def test_discover_candidates_adds_raw_readme_for_github_repository_result(
 
     assert set(canonical_urls[:2]) == {raw_main, raw_master}
     assert canonical_urls[2] == repository_html
+
+
+def test_merge_official_github_raw_readme_derivatives_technical_explanation() -> None:
+    base = [
+        {
+            "url": "https://github.com/langchain-ai/langgraph",
+            "title": "langgraph",
+            "snippet": "repo",
+            "rank": 10016,
+            "reason": "known_path",
+            "source_role": "official_repository",
+            "target_slots": ["official_sources", "key_features"],
+        }
+    ]
+    merged = _merge_official_github_raw_readme_derivatives(
+        list(base),
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    urls = [row["url"] for row in merged]
+    assert "https://github.com/langchain-ai/langgraph" in urls
+    assert "https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md" in urls
+    assert "https://raw.githubusercontent.com/langchain-ai/langgraph/master/README.md" in urls
+    assert not any("src/" in str(u) for u in urls)
+    deriv = [
+        row
+        for row in merged
+        if row.get("official_repository_readme_derivative") is True
+    ]
+    assert len(deriv) == 2
+    assert deriv[0]["derived_from_repository_url"] == "https://github.com/langchain-ai/langgraph"
+    assert deriv[0]["source_intent"] == "official_repository_readme"
+    assert deriv[0]["technical_slot_targets"] == ["official_sources", "key_features"]
+
+
+def test_merge_official_github_raw_readme_skips_non_technical_query() -> None:
+    base = [
+        {
+            "url": "https://github.com/langchain-ai/langgraph",
+            "title": "langgraph",
+            "snippet": "repo",
+            "rank": 10,
+            "reason": "known_path",
+            "source_role": "official_repository",
+        }
+    ]
+    merged = _merge_official_github_raw_readme_derivatives(
+        list(base),
+        query="How to deploy LangGraph with Docker?",
+        constraints={},
+    )
+    assert len(merged) == 1
+
+
+def test_merge_official_github_raw_readme_skips_issues_and_non_official() -> None:
+    base = [
+        {
+            "url": "https://github.com/langchain-ai/langgraph/issues/1",
+            "title": "issue",
+            "snippet": "x",
+            "rank": 1,
+            "reason": "x",
+            "source_role": "official_repository",
+        },
+        {
+            "url": "https://github.com/random/unrelated",
+            "title": "other",
+            "snippet": "x",
+            "rank": 2,
+            "reason": "x",
+            "source_role": "secondary_reference",
+        },
+    ]
+    merged = _merge_official_github_raw_readme_derivatives(
+        list(base),
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    assert len(merged) == 2
+
+
+def test_add_known_path_merges_readme_into_existing_duplicate(db_session: Session) -> None:
+    from datetime import UTC, datetime
+
+    task_service = create_research_task_service(db_session)
+    task = task_service.create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={"domains_allow": ["raw.githubusercontent.com", "github.com"]},
+    )
+    run = ResearchRunRepository(db_session).add(
+        ResearchRun(
+            task_id=task.id,
+            round_no=1,
+            current_state="PLANNED",
+            checkpoint_json={},
+        )
+    )
+    sq = SearchQueryRepository(db_session).add(
+        SearchQuery(
+            task_id=task.id,
+            run_id=run.id,
+            query_text=task.query,
+            provider="searxng",
+            round_no=1,
+            issued_at=datetime.now(UTC),
+            raw_response_json={},
+        )
+    )
+    raw_main = "https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md"
+    cand_repo = CandidateUrlRepository(db_session)
+    existing = cand_repo.add(
+        CandidateUrl(
+            task_id=task.id,
+            search_query_id=sq.id,
+            original_url=raw_main,
+            canonical_url=raw_main,
+            domain="raw.githubusercontent.com",
+            title="README",
+            rank=50,
+            selected=False,
+            metadata_json={"provider": "searxng", "snippet": "Plain provider hit"},
+        )
+    )
+    db_session.commit()
+    existing_set = {raw_main}
+    known_path: dict[str, object] = {
+        "url": raw_main,
+        "title": "README merged",
+        "snippet": "derived",
+        "rank": 2,
+        "reason": "derivative",
+        "source_role": "official_repository",
+        "source_intent": "official_repository_readme",
+        "technical_slot_targets": ["key_features"],
+        "target_slots": ["key_features"],
+        "derived_from_repository_url": "https://github.com/langchain-ai/langgraph",
+        "official_repository_readme_derivative": True,
+    }
+    result = _add_known_path_candidates(
+        task=task,
+        search_query=sq,
+        known_path_candidates=[known_path],
+        existing_candidates=existing_set,
+        candidate_url_repository=cand_repo,
+        provider="searxng",
+        query_text=task.query,
+        expansion_kind="test",
+        expansion_metadata={},
+        candidate_source="test",
+        fallback_reason=None,
+    )
+    db_session.commit()
+    db_session.refresh(existing)
+    assert result.added == 0
+    assert result.duplicates_skipped == 0
+    assert result.metadata_merged == 1
+    md = existing.metadata_json or {}
+    assert md.get("official_repository_readme_derivative") is True
+    assert md.get("source_intent") == "official_repository_readme"
+    assert md.get("technical_slot_targets") == ["key_features"]
+    assert existing.rank == 2

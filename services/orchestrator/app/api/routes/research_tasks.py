@@ -584,6 +584,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
     answer_yield: list[dict[str, Any]] = []
     evidence_yield_summary: dict[str, Any] | None = None
     verification_summary: dict[str, Any] | None = None
+    report_diagnostics: dict[str, Any] | None = None
     supplemental_acquisition: dict[str, Any] | None = None
     research_strategy: dict[str, Any] | None = None
     gap_analysis: dict[str, Any] | None = None
@@ -869,6 +870,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             verification = result.get("verification_summary")
             if isinstance(verification, dict):
                 verification_summary = verification
+            diagnostics = result.get("report_diagnostics")
+            if isinstance(diagnostics, dict):
+                report_diagnostics = diagnostics
 
         details = payload.get("details")
         if isinstance(details, dict):
@@ -895,6 +899,9 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
             verification = details.get("verification_summary")
             if isinstance(verification, dict):
                 verification_summary = verification
+            diagnostics = details.get("report_diagnostics")
+            if isinstance(diagnostics, dict):
+                report_diagnostics = diagnostics
             answer_slots = _object_list(details.get("answer_slots")) or answer_slots
             report_slot_coverage = (
                 _object_list(details.get("report_slot_coverage")) or report_slot_coverage
@@ -973,6 +980,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and not answer_yield
         and evidence_yield_summary is None
         and verification_summary is None
+        and report_diagnostics is None
         and supplemental_acquisition is None
         and research_strategy is None
         and failure_diagnostics is None
@@ -1023,6 +1031,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         answer_yield=answer_yield,
         evidence_yield_summary=evidence_yield_summary or {},
         verification_summary=verification_summary or {},
+        report_diagnostics=report_diagnostics or {},
         supplemental_acquisition=supplemental_acquisition,
         research_strategy=research_strategy,
         gap_analysis=gap_analysis,

@@ -51,6 +51,22 @@ class Settings(BaseSettings):
         default=1_048_576,
         validation_alias="ACQUISITION_MAX_RESPONSE_BYTES",
     )
+    acquisition_trusted_docs_domains: str = Field(
+        default="",
+        validation_alias="ACQUISITION_TRUSTED_DOCS_DOMAINS",
+    )
+    acquisition_trusted_docs_max_response_bytes: int | None = Field(
+        default=None,
+        validation_alias="ACQUISITION_TRUSTED_DOCS_MAX_RESPONSE_BYTES",
+    )
+    acquisition_min_successful_authoritative_snapshots: int = Field(
+        default=0,
+        validation_alias="ACQUISITION_MIN_SUCCESSFUL_AUTHORITATIVE_SNAPSHOTS",
+    )
+    acquisition_defer_success_target_for_high_priority: bool = Field(
+        default=False,
+        validation_alias="ACQUISITION_DEFER_SUCCESS_TARGET_FOR_HIGH_PRIORITY",
+    )
     acquisition_max_candidates_per_request: int = Field(
         default=15,
         validation_alias="ACQUISITION_MAX_CANDIDATES_PER_REQUEST",
@@ -151,6 +167,22 @@ class Settings(BaseSettings):
         default=8,
         validation_alias="RESEARCH_PARSE_LIMIT",
     )
+    research_parse_drain_enabled: bool = Field(
+        default=False,
+        validation_alias="RESEARCH_PARSE_DRAIN_ENABLED",
+    )
+    research_parse_max_batches: int = Field(
+        default=3,
+        validation_alias="RESEARCH_PARSE_MAX_BATCHES",
+    )
+    research_parse_target_documents: int = Field(
+        default=20,
+        validation_alias="RESEARCH_PARSE_TARGET_DOCUMENTS",
+    )
+    research_parse_drain_max_seconds: float = Field(
+        default=0.0,
+        validation_alias="RESEARCH_PARSE_MAX_SECONDS",
+    )
     research_claim_limit: int = Field(
         default=20,
         validation_alias="RESEARCH_CLAIM_LIMIT",
@@ -158,6 +190,26 @@ class Settings(BaseSettings):
     acquisition_trust_env_proxy: bool = Field(
         default=False,
         validation_alias="ACQUISITION_TRUST_ENV_PROXY",
+    )
+    browser_fetch_backend: str = Field(
+        default="none",
+        validation_alias="BROWSER_FETCH_BACKEND",
+    )
+    browser_fetch_timeout_seconds: float = Field(
+        default=45.0,
+        validation_alias="BROWSER_FETCH_TIMEOUT_SECONDS",
+    )
+    browser_fetch_max_scrolls: int = Field(
+        default=3,
+        validation_alias="BROWSER_FETCH_MAX_SCROLLS",
+    )
+    browser_fetch_wait_until: str = Field(
+        default="domcontentloaded",
+        validation_alias="BROWSER_FETCH_WAIT_UNTIL",
+    )
+    browser_fetch_capture_screenshot: bool = Field(
+        default=False,
+        validation_alias="BROWSER_FETCH_CAPTURE_SCREENSHOT",
     )
     snapshot_storage_backend: str = Field(
         default="filesystem",

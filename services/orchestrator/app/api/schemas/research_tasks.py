@@ -147,6 +147,7 @@ class ResearchTaskObservabilityResponse(BaseModel):
     answer_yield: list[dict[str, Any]] = Field(default_factory=list)
     evidence_yield_summary: dict[str, Any] = Field(default_factory=dict)
     verification_summary: dict[str, Any] = Field(default_factory=dict)
+    report_diagnostics: dict[str, Any] = Field(default_factory=dict)
     supplemental_acquisition: dict[str, Any] | None = None
     research_strategy: dict[str, Any] | None = None
     gap_analysis: dict[str, Any] | None = None

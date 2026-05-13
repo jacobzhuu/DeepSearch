@@ -15,14 +15,17 @@ from packages.db.repositories import (
     FetchJobRepository,
     ResearchRunRepository,
     SearchQueryRepository,
+    TaskEventRepository,
 )
 from services.orchestrator.app.acquisition import HttpAcquisitionClient, SmokeAcquisitionClient
 from services.orchestrator.app.services.acquisition import (
+    ACQUISITION_FETCH_BATCH_SUMMARY_EVENT,
     FETCH_MODE_HTTP,
     FETCH_STATUS_FAILED,
     FETCH_STATUS_SUCCEEDED,
     AcquisitionConflictError,
     AcquisitionService,
+    _sort_candidates_for_fetch,
     create_acquisition_service,
     fetch_priority_metadata,
 )
@@ -49,6 +52,106 @@ def test_smoke_acquisition_client_returns_synthetic_html_without_network() -> No
     assert b"Synthetic development smoke source" in result.content
     assert b"OpenSearch is an open-source distributed search and analytics engine" in result.content
     assert result.trace["synthetic_fixture"] is True
+
+
+def test_acquisition_defers_success_target_for_min_authoritative_snapshots(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    from hashlib import sha256
+    from unittest.mock import MagicMock
+
+    from services.orchestrator.app.acquisition.http_client import HttpFetchResult
+
+    task, first = _seed_candidate(
+        db_session,
+        canonical_url="https://example.com/noise",
+        query="authoritative defer task",
+    )
+    docs_candidate = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://docs.langchain.com/langgraph",
+        domain="docs.langchain.com",
+        rank=2,
+        title="Docs",
+    )
+    html_small = b"<html><body>ok</body></html>"
+    digest = f"sha256:{sha256(html_small).hexdigest()}"
+
+    def _fetch(url: str) -> HttpFetchResult:
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=html_small,
+            content_hash=digest,
+            trace={"final_url": url},
+        )
+
+    mock_client = MagicMock()
+    mock_client.fetch.side_effect = _fetch
+
+    service = create_acquisition_service(
+        db_session,
+        http_client=mock_client,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+        snapshot_bucket="snapshots",
+        max_candidates_per_request=10,
+        min_successful_authoritative_snapshots=1,
+    )
+    result = service.acquire_candidates(
+        task.id,
+        candidate_url_ids=[first.id, docs_candidate.id],
+        limit=10,
+        target_successful_snapshots=1,
+    )
+    assert result.created == 2
+    assert mock_client.fetch.call_count == 2
+
+
+def test_acquisition_persists_snapshot_when_static_html_quality_hold(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    """Weak static HTML keeps bytes in object storage; trace blocks evidence parse."""
+    from hashlib import sha256
+    from unittest.mock import MagicMock
+
+    from services.orchestrator.app.acquisition.http_client import HttpFetchResult
+
+    task, candidate = _seed_candidate(db_session, canonical_url="https://spa.example/page")
+    html = b"""<!doctype html><html><head><script>console.log(1)</script></head>
+    <body><div id="app"></div><script src="/bundle.js"></script></body></html>"""
+    mock_client = MagicMock()
+    mock_client.fetch.return_value = HttpFetchResult(
+        requested_url=candidate.canonical_url,
+        final_url=candidate.canonical_url,
+        http_status=200,
+        error_code=None,
+        mime_type="text/html",
+        content=html,
+        content_hash=f"sha256:{sha256(html).hexdigest()}",
+        trace={"final_url": candidate.canonical_url},
+    )
+    service = create_acquisition_service(
+        db_session,
+        http_client=mock_client,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+        snapshot_bucket="snapshots",
+        max_candidates_per_request=5,
+    )
+    result = service.acquire_candidates(task.id, candidate_url_ids=[candidate.id], limit=1)
+    assert result.succeeded == 1
+    assert result.failed == 0
+    entry = result.entries[0]
+    assert entry.content_snapshot is not None
+    assert entry.fetch_job.status == FETCH_STATUS_SUCCEEDED
+    assert entry.fetch_attempt.error_code is None
+    assert entry.fetch_attempt.trace_json.get("eligible_for_evidence_parse") is False
+    assert entry.fetch_attempt.trace_json.get("static_html_quality_decision") == "spa_shell"
 
 
 def _create_acquisition_service(
@@ -517,13 +620,11 @@ def test_acquisition_service_prioritizes_stable_html_sources_for_fetch(
     assert result.selected_candidates_from_search[0].canonical_url == (
         "https://github.com/searxng/searxng"
     )
-    assert requested_urls[:2] == [
-        "https://en.wikipedia.org/wiki/SearXNG",
+    assert requested_urls[:3] == [
         "https://searxng.org/",
+        "https://github.com/searxng/searxng",
+        "https://en.wikipedia.org/wiki/SearXNG",
     ]
-    assert requested_urls.index("https://github.com/searxng/searxng") > requested_urls.index(
-        "https://en.wikipedia.org/wiki/SearXNG"
-    )
     assert requested_urls[-2:] == [
         "https://www.reddit.com/r/degoogle/comments/example",
         "https://www.youtube.com/watch?v=SlqGDoXPazY",
@@ -761,16 +862,18 @@ def test_acquisition_service_prioritizes_searxng_about_and_wikipedia_over_admin_
 
     assert requested_urls[:5] == [
         about_candidate.canonical_url,
-        wikipedia_candidate.canonical_url,
         home_candidate.canonical_url,
         architecture_candidate.canonical_url,
+        wikipedia_candidate.canonical_url,
         installation_candidate.canonical_url,
     ]
     about_metadata = fetch_priority_metadata(about_candidate, query=task.query)
     wikipedia_metadata = fetch_priority_metadata(wikipedia_candidate, query=task.query)
     architecture_metadata = fetch_priority_metadata(architecture_candidate, query=task.query)
     assert about_metadata["source_intent"] == "official_about"
+    assert about_metadata["source_role"] == "official_docs"
     assert wikipedia_metadata["source_intent"] == "wikipedia_reference"
+    assert wikipedia_metadata["source_role"] == "high_quality_secondary_reference"
     assert architecture_metadata["source_intent"] == "official_architecture_admin"
     assert architecture_metadata["downrank_reason"] == (
         "architecture_page_downranked_for_overview_query"
@@ -811,6 +914,69 @@ def test_acquisition_service_records_failed_attempt_without_snapshot_for_blocked
     assert ContentSnapshotRepository(db_session).list_for_task(task.id) == []
 
 
+def test_acquire_candidates_emits_fetch_batch_summary_task_event(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    from hashlib import sha256
+    from unittest.mock import MagicMock
+
+    from sqlalchemy import select
+
+    from packages.db.models import TaskEvent
+    from services.orchestrator.app.acquisition.http_client import HttpFetchResult
+
+    task, c1 = _seed_candidate(db_session)
+    c2 = _add_candidate(
+        db_session,
+        c1,
+        canonical_url="https://other.example/doc",
+        domain="other.example",
+        rank=2,
+    )
+    html = b"<html>ok</html>"
+    digest = f"sha256:{sha256(html).hexdigest()}"
+    mock_client = MagicMock()
+
+    def fetch_side_effect(url: str, **_kwargs: object) -> HttpFetchResult:
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=html,
+            content_hash=digest,
+            trace={"final_url": url},
+        )
+
+    mock_client.fetch.side_effect = fetch_side_effect
+    service = create_acquisition_service(
+        db_session,
+        http_client=mock_client,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+        snapshot_bucket="snapshots",
+        max_candidates_per_request=5,
+        task_event_repository=TaskEventRepository(db_session),
+    )
+    service.acquire_candidates(task.id, candidate_url_ids=[c1.id, c2.id], limit=1)
+    db_session.commit()
+    rows = list(
+        db_session.scalars(
+            select(TaskEvent).where(
+                TaskEvent.task_id == task.id,
+                TaskEvent.event_type == ACQUISITION_FETCH_BATCH_SUMMARY_EVENT,
+            )
+        ).all()
+    )
+    assert len(rows) == 1
+    payload = rows[0].payload_json or {}
+    assert payload.get("stop_reason") == "fetch_budget_exhausted"
+    assert str(c2.id) in (payload.get("unattempted_candidate_ids") or [])
+    jobs = FetchJobRepository(db_session).list_for_task(task.id)
+    assert len([j for j in jobs if j.mode == FETCH_MODE_HTTP]) == 1
+
+
 def test_acquisition_service_rejects_paused_task(
     db_session: Session,
     tmp_path: Path,
@@ -830,3 +996,381 @@ def test_acquisition_service_rejects_paused_task(
 
     with pytest.raises(AcquisitionConflictError):
         service.acquire_candidates(task.id, candidate_url_ids=[candidate_url.id], limit=1)
+
+
+def test_raw_github_readme_url_in_success_hold_lane() -> None:
+    from uuid import uuid4
+
+    from services.orchestrator.app.acquisition.acquisition_priority import (
+        candidate_high_priority_for_success_hold,
+    )
+
+    cand = CandidateUrl(
+        id=uuid4(),
+        task_id=uuid4(),
+        search_query_id=uuid4(),
+        original_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+        domain="raw.githubusercontent.com",
+        title="README",
+        rank=1,
+        selected=False,
+        metadata_json={},
+    )
+    assert candidate_high_priority_for_success_hold(cand) is True
+
+
+def test_sort_technical_explanation_elevates_readme(db_session: Session) -> None:
+    q = "What is LangGraph and how does it work?"
+    task, first = _seed_candidate(
+        db_session,
+        query=q,
+        canonical_url="https://example.com/seed",
+    )
+    md_doc: dict[str, object] = {"source_role": "official_docs", "fetch_priority_score": 0}
+    docs = [
+        _add_candidate(
+            db_session,
+            first,
+            canonical_url=f"https://docs.langchain.com/page{i}",
+            domain="docs.langchain.com",
+            rank=i,
+            metadata_json=md_doc,
+        )
+        for i in range(1, 6)
+    ]
+    readme_meta: dict[str, object] = {
+        "official_repository_readme_derivative": True,
+        "source_intent": "official_repository_readme",
+        "source_role": "official_repository",
+        "fetch_priority_score": 99,
+    }
+    readme_main = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+        domain="raw.githubusercontent.com",
+        rank=9999,
+        metadata_json=readme_meta,
+    )
+    readme_master = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/master/README.md",
+        domain="raw.githubusercontent.com",
+        rank=10000,
+        metadata_json=readme_meta,
+    )
+    license_cand = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/LICENSE",
+        domain="raw.githubusercontent.com",
+        rank=3,
+        metadata_json={"source_role": "official_repository"},
+    )
+    combined = docs + [readme_main, readme_master, license_cand]
+    ordered, _skipped = _sort_candidates_for_fetch(combined, query=q, max_must_fetch_per_round=3)
+    ids = [c.id for c in ordered]
+    assert ids.index(readme_main.id) < ids.index(docs[0].id)
+    assert ids.index(readme_master.id) < ids.index(docs[0].id)
+    assert ids.index(license_cand.id) > ids.index(readme_main.id)
+
+
+def _triage_must_fetch_metadata(*, fetch_priority: int = 80) -> dict[str, object]:
+    return {
+        "source_role": "official_docs",
+        "fetch_priority_score": 0,
+        "llm_source_triage_active": True,
+        "llm_source_judge": {
+            "output_judgment": {
+                "triage_decision": "must_fetch",
+                "fetch_priority": fetch_priority,
+            },
+        },
+    }
+
+
+def test_sort_technical_explanation_readme_before_must_fetch_tail(db_session: Session) -> None:
+    """Long must_fetch tails must not push raw README derivatives past the fetch budget."""
+    q = "What is LangGraph and how does it work?"
+    _task, first = _seed_candidate(
+        db_session,
+        query=q,
+        canonical_url="https://example.com/seed",
+    )
+    triage = _triage_must_fetch_metadata()
+    docs = [
+        _add_candidate(
+            db_session,
+            first,
+            canonical_url=f"https://docs.langchain.com/page{i}",
+            domain="docs.langchain.com",
+            rank=i,
+            metadata_json=triage,
+        )
+        for i in range(1, 6)
+    ]
+    readme_meta: dict[str, object] = {
+        "official_repository_readme_derivative": True,
+        "source_intent": "official_repository_readme",
+        "source_role": "official_repository",
+        "fetch_priority_score": 99,
+    }
+    readme_main = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+        domain="raw.githubusercontent.com",
+        rank=9999,
+        metadata_json=readme_meta,
+    )
+    readme_master = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/master/README.md",
+        domain="raw.githubusercontent.com",
+        rank=10000,
+        metadata_json=readme_meta,
+    )
+    combined = docs + [readme_main, readme_master]
+    ordered, _skipped = _sort_candidates_for_fetch(combined, query=q, max_must_fetch_per_round=3)
+    ids = [c.id for c in ordered]
+    fourth_doc = docs[3]
+    assert ids.index(readme_main.id) < ids.index(fourth_doc.id)
+    assert ids.index(readme_master.id) < ids.index(fourth_doc.id)
+
+
+def test_elevate_readme_noop_for_deployment_query(db_session: Session) -> None:
+    from services.orchestrator.app.services.acquisition import (
+        _elevate_official_repository_readme_candidates_for_technical_explanation,
+    )
+
+    q = "How to deploy LangGraph with Docker?"
+    _task, first = _seed_candidate(
+        db_session,
+        query=q,
+        canonical_url="https://example.com/seed",
+    )
+    readme_meta: dict[str, object] = {
+        "official_repository_readme_derivative": True,
+        "source_intent": "official_repository_readme",
+        "source_role": "official_repository",
+    }
+    readme = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+        domain="raw.githubusercontent.com",
+        rank=1,
+        metadata_json=readme_meta,
+    )
+    doc = _add_candidate(
+        db_session,
+        first,
+        canonical_url="https://docs.langchain.com/oss/python/langgraph/overview",
+        domain="docs.langchain.com",
+        rank=2,
+        metadata_json={"source_role": "official_docs"},
+    )
+    candidates = [readme, doc]
+    out = _elevate_official_repository_readme_candidates_for_technical_explanation(
+        candidates,
+        query=q,
+        max_must_fetch_per_round=3,
+    )
+    assert out is candidates
+
+
+def test_acquire_attempts_raw_readme_under_success_target_without_high_priority_defer(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    from hashlib import sha256
+    from unittest.mock import MagicMock
+
+    from services.orchestrator.app.acquisition.http_client import HttpFetchResult
+
+    q = "What is LangGraph and how does it work?"
+    task, seed = _seed_candidate(db_session, query=q, canonical_url="https://example.com/seed")
+    triage = _triage_must_fetch_metadata()
+    for i in range(1, 4):
+        _add_candidate(
+            db_session,
+            seed,
+            canonical_url=f"https://docs.langchain.com/x{i}",
+            domain="docs.langchain.com",
+            rank=i,
+            metadata_json=triage,
+        )
+    readme_md: dict[str, object] = {
+        "official_repository_readme_derivative": True,
+        "source_intent": "official_repository_readme",
+        "source_role": "official_repository",
+    }
+    _add_candidate(
+        db_session,
+        seed,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+        domain="raw.githubusercontent.com",
+        rank=9999,
+        metadata_json=readme_md,
+    )
+    md_small = b"# LangGraph\n\nbody " + b"x" * 50
+    md_hash = f"sha256:{sha256(md_small).hexdigest()}"
+
+    def _fetch(url: str) -> HttpFetchResult:
+        if "raw.githubusercontent.com" in url:
+            return HttpFetchResult(
+                requested_url=url,
+                final_url=url,
+                http_status=200,
+                error_code=None,
+                mime_type="text/markdown",
+                content=md_small,
+                content_hash=md_hash,
+                trace={"eligible_for_evidence_parse": True},
+            )
+        html = b"<html><body>ok</body></html>"
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=html,
+            content_hash=f"sha256:{sha256(html).hexdigest()}",
+            trace={"eligible_for_evidence_parse": True},
+        )
+
+    mock_client = MagicMock()
+    mock_client.fetch.side_effect = _fetch
+
+    service = create_acquisition_service(
+        db_session,
+        http_client=mock_client,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+        snapshot_bucket="snapshots",
+        max_candidates_per_request=12,
+        defer_success_target_for_high_priority=False,
+    )
+    service.acquire_candidates(
+        task.id,
+        candidate_url_ids=None,
+        limit=12,
+        target_successful_snapshots=1,
+    )
+    fetched_urls = [str(c.args[0]) for c in mock_client.fetch.call_args_list]
+    assert any("raw.githubusercontent.com" in u for u in fetched_urls)
+
+
+def test_official_repository_readme_acquire_hold_requires_raw_domain() -> None:
+    from uuid import uuid4
+
+    from services.orchestrator.app.acquisition.acquisition_priority import (
+        candidate_high_priority_for_success_hold,
+        official_repository_readme_acquire_hold,
+    )
+
+    cand = CandidateUrl(
+        id=uuid4(),
+        task_id=uuid4(),
+        search_query_id=uuid4(),
+        original_url="https://github.com/langchain-ai/langgraph/issues/1",
+        canonical_url="https://github.com/langchain-ai/langgraph/issues/1",
+        domain="github.com",
+        rank=1,
+        selected=False,
+        metadata_json={
+            "official_repository_readme_derivative": True,
+            "source_intent": "official_repository_readme",
+        },
+    )
+    assert official_repository_readme_acquire_hold(cand) is False
+    assert candidate_high_priority_for_success_hold(cand) is True
+
+
+def test_acquire_attempts_raw_readme_under_success_target_with_deferral(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    from hashlib import sha256
+    from unittest.mock import MagicMock
+
+    from services.orchestrator.app.acquisition.http_client import HttpFetchResult
+
+    q = "What is LangGraph and how does it work?"
+    task, seed = _seed_candidate(db_session, query=q, canonical_url="https://example.com/seed")
+    md_doc: dict[str, object] = {
+        "source_role": "official_docs",
+        "known_path_candidate": True,
+        "fetch_priority_score": 0,
+    }
+    for i in range(1, 4):
+        _add_candidate(
+            db_session,
+            seed,
+            canonical_url=f"https://docs.langchain.com/x{i}",
+            domain="docs.langchain.com",
+            rank=i,
+            metadata_json=md_doc,
+        )
+    readme_md: dict[str, object] = {
+        "official_repository_readme_derivative": True,
+        "source_intent": "official_repository_readme",
+        "source_role": "official_repository",
+    }
+    _add_candidate(
+        db_session,
+        seed,
+        canonical_url="https://raw.githubusercontent.com/langchain-ai/langgraph/main/README.md",
+        domain="raw.githubusercontent.com",
+        rank=9999,
+        metadata_json=readme_md,
+    )
+    md_small = b"# LangGraph\n\nbody " + b"x" * 50
+    md_hash = f"sha256:{sha256(md_small).hexdigest()}"
+
+    def _fetch(url: str) -> HttpFetchResult:
+        if "raw.githubusercontent.com" in url:
+            return HttpFetchResult(
+                requested_url=url,
+                final_url=url,
+                http_status=200,
+                error_code=None,
+                mime_type="text/markdown",
+                content=md_small,
+                content_hash=md_hash,
+                trace={"eligible_for_evidence_parse": True},
+            )
+        html = b"<html><body>ok</body></html>"
+        return HttpFetchResult(
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            error_code=None,
+            mime_type="text/html",
+            content=html,
+            content_hash=f"sha256:{sha256(html).hexdigest()}",
+            trace={"eligible_for_evidence_parse": True},
+        )
+
+    mock_client = MagicMock()
+    mock_client.fetch.side_effect = _fetch
+
+    service = create_acquisition_service(
+        db_session,
+        http_client=mock_client,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+        snapshot_bucket="snapshots",
+        max_candidates_per_request=12,
+        defer_success_target_for_high_priority=True,
+    )
+    service.acquire_candidates(
+        task.id,
+        candidate_url_ids=None,
+        limit=12,
+        target_successful_snapshots=1,
+    )
+    fetched_urls = [str(c.args[0]) for c in mock_client.fetch.call_args_list]
+    assert any("raw.githubusercontent.com" in u for u in fetched_urls)

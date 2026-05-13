@@ -136,10 +136,10 @@ def test_gap_analyzer_targets_owned_langgraph_sources_for_missing_overview_slots
     )
 
     assert [query.query_text for query in result.supplemental_queries] == [
-        "LangGraph site:docs.langchain.com",
-        "LangGraph site:reference.langchain.com",
-        "LangGraph github langchain-ai langgraph",
-        "LangGraph docs langchain",
+        "LangGraph official documentation overview",
+        "LangGraph site:reference.langchain.com StateGraph graph state reference",
+        "LangGraph github langchain-ai langgraph README",
+        "LangGraph examples agents workflows human-in-the-loop official docs",
     ]
     assert all(
         set(query.slot_ids) == {"definition", "mechanism"} for query in result.supplemental_queries

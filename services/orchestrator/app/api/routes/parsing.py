@@ -88,7 +88,15 @@ def parse_task_snapshots(
         updated=result.updated,
         skipped_existing=result.skipped_existing,
         skipped_unsupported=result.skipped_unsupported,
+        skipped_static_html_hold=result.skipped_static_html_hold,
+        skipped_no_valid_chunks=result.skipped_no_valid_chunks,
         failed=result.failed,
+        invalid_chunk_rejection_count=result.invalid_chunk_rejection_count,
+        invalid_chunk_rejection_reason_distribution=(
+            result.invalid_chunk_rejection_reason_distribution or {}
+        ),
+        snapshots_with_no_valid_chunks=result.snapshots_with_no_valid_chunks,
+        parser_invalid_output_count=result.snapshots_with_no_valid_chunks,
         entries=[
             ParseEntryResponse(
                 content_snapshot_id=entry.content_snapshot.id,
@@ -129,6 +137,7 @@ def parse_task_snapshots(
                 sheet_names=_str_list_metadata(entry.source_document, "sheet_names"),
                 cell_ranges=_str_list_metadata(entry.source_document, "cell_ranges"),
                 updated_existing=entry.updated_existing,
+                chunk_validation=entry.chunk_validation,
             )
             for entry in result.entries
         ],

@@ -140,6 +140,21 @@ def test_report_synthesis_service_generates_and_reuses_markdown_artifact(
     assert "source_yield_summary" in first_result.artifact.manifest_json
     assert "evidence_yield_summary" in first_result.artifact.manifest_json
     assert "verification_summary" in first_result.artifact.manifest_json
+    assert (
+        "readme_composite_support_relation_count"
+        in first_result.artifact.manifest_json["verification_summary"]
+    )
+    rd = first_result.artifact.manifest_json.get("report_diagnostics") or {}
+    for key in (
+        "normalized_from_readme_claim_count",
+        "repository_normalized_claim_count",
+        "repository_normalized_supported_claim_count",
+        "readme_composite_support_relation_count",
+        "official_repository_report_input_count",
+        "raw_readme_sources_in_report_count",
+    ):
+        assert key in rd
+    assert rd["normalized_from_readme_claim_count"] == rd["repository_normalized_claim_count"]
     assert "## Executive Summary" in first_result.markdown
     assert "## Answer" in first_result.markdown
     assert "## Answer Slot Coverage" in first_result.markdown
@@ -1196,6 +1211,381 @@ def test_report_safety_excludes_example_context_and_weak_support_from_core_answe
     assert (
         manifest["report_writer"]["report_filter_summary"]["excluded_from_report_weak_support"] == 1
     )
+
+
+def test_report_allows_keep_example_when_examples_slot_is_explicit(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    statement = "LangGraph examples include a customer support assistant workflow."
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://github.com/langchain-ai/langgraph",
+        domain="github.com",
+        notes={
+            "verification": {"rationale": "Found strong support."},
+            "claim_category": "feature",
+            "answer_role": "feature",
+            "answer_relevant": True,
+            "claim_quality_score": 0.91,
+            "query_answer_score": 0.84,
+            "slot_ids": ["examples_use_cases"],
+            "llm_claim_review": {
+                "decision": "keep_example",
+                "relevance": "partial",
+                "source_role": "primary_reference",
+                "claim_role": "example",
+                "centrality": "example",
+                "confidence": 0.86,
+                "reasons": ["Grounded official example for use-case coverage."],
+                "related_answer_slot": "examples_use_cases",
+            },
+        },
+    )
+    db_session.commit()
+
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    db_session.refresh(claim)
+    manifest = _manifest(result.artifact)
+
+    assert claim.notes_json["report_eligible"] is True
+    assert statement in result.markdown
+    assert (
+        manifest["report_diagnostics"]["claims_by_answer_slot"]["examples_use_cases"] >= 1
+    )
+    assert (
+        manifest["report_diagnostics"]["claims_by_source_role"].get("official_repository", 0) >= 1
+    )
+
+
+def test_report_rescues_official_stategraph_limitations_claim_for_langgraph_mechanism_query(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    statement = (
+        "StateGraph is a builder class and cannot be used directly for execution."
+    )
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://reference.langchain.com/python/langgraph/graph/state",
+        domain="reference.langchain.com",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "mechanism",
+            "answer_role": "mechanism",
+            "answer_relevant": True,
+            "claim_quality_score": 0.93,
+            "query_answer_score": 0.91,
+            "slot_ids": [
+                "definition",
+                "core_abstractions",
+                "execution_model",
+                "limitations",
+                "official_sources",
+            ],
+        },
+    )
+    db_session.commit()
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    db_session.refresh(claim)
+    manifest = _manifest(result.artifact)
+    diag = manifest["report_diagnostics"]
+
+    assert claim.notes_json["report_eligible"] is True
+    assert "query_focus_mismatch" not in claim.notes_json["report_eligibility"]["reasons"]
+    assert statement in result.markdown
+    assert int(diag.get("report_query_focus_rescued_by_component_count") or 0) >= 1
+    assert int(diag.get("report_focus_component_match_count") or 0) >= 1
+    assert "stategraph" in (diag.get("report_focus_component_match_terms") or [])
+    limitations_row = next(
+        row for row in manifest["slot_coverage_summary"] if row["slot_id"] == "limitations"
+    )
+    assert int(limitations_row.get("supported_claim_count") or 0) >= 1
+
+
+def test_report_rescues_live_shaped_component_claim_with_nested_slot_ids(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    statement = "StateGraph is a builder class and cannot be used directly for execution."
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://reference.langchain.com/python/langgraph/graph/state",
+        domain="reference.langchain.com",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "mechanism",
+            "answer_role": "mechanism",
+            "answer_relevant": True,
+            "claim_quality_score": 0.93,
+            "query_answer_score": 0.91,
+            "evidence_candidate": {
+                "slot_ids": ["limitations", "core_abstractions"],
+                "source_intent": "official_docs_reference",
+                "metadata": {
+                    "source_url": "https://reference.langchain.com/python/langgraph/graph/state",
+                    "source_domain": "reference.langchain.com",
+                    "source_role": "official_reference",
+                },
+            },
+        },
+    )
+    db_session.commit()
+
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    db_session.refresh(claim)
+
+    assert claim.notes_json["report_eligible"] is True
+    assert "query_focus_mismatch" not in claim.notes_json["report_eligibility"]["reasons"]
+    assert claim.notes_json["report_eligibility"]["slot_ids"] == [
+        "limitations",
+        "core_abstractions",
+    ]
+    assert statement in result.markdown
+
+
+def test_report_rescues_component_claim_from_nested_official_source_metadata(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    statement = "StateGraph is a builder class and cannot be used directly for execution."
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://example.org/copied-stategraph-reference",
+        domain="example.org",
+        notes={
+            "verification": {
+                "rationale": "Found 1 support evidence.",
+                "evidence_relations": [
+                    {
+                        "source_url": "https://reference.langchain.com/python/langgraph/graph/state",
+                        "source_domain": "reference.langchain.com",
+                        "source_role": "official_reference",
+                    }
+                ],
+            },
+            "claim_category": "mechanism",
+            "answer_role": "mechanism",
+            "answer_relevant": True,
+            "claim_quality_score": 0.93,
+            "query_answer_score": 0.91,
+            "slot_ids": ["limitations", "core_abstractions"],
+            "evidence_candidate": {
+                "slot_ids": ["limitations", "core_abstractions"],
+                "source_intent": "official_docs_reference",
+                "metadata": {
+                    "source_url": "https://reference.langchain.com/python/langgraph/graph/state",
+                    "source_domain": "reference.langchain.com",
+                },
+            },
+        },
+    )
+    db_session.commit()
+
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    db_session.refresh(claim)
+
+    assert claim.notes_json["report_eligible"] is True
+    assert "query_focus_mismatch" not in claim.notes_json["report_eligibility"]["reasons"]
+    assert statement in result.markdown
+
+
+def test_report_does_not_rescue_component_claim_on_non_official_domain_sources(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    statement = (
+        "StateGraph is a builder class and cannot be used directly for execution."
+    )
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://example.org/unofficial-stategraph-article",
+        domain="example.org",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "mechanism",
+            "answer_role": "mechanism",
+            "answer_relevant": True,
+            "claim_quality_score": 0.93,
+            "query_answer_score": 0.92,
+            "slot_ids": ["limitations", "core_abstractions", "official_sources"],
+        },
+    )
+    db_session.commit()
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    db_session.refresh(claim)
+    manifest = _manifest(result.artifact)
+
+    assert claim.notes_json["report_eligible"] is False
+    assert "query_focus_mismatch" in claim.notes_json["report_eligibility"]["reasons"]
+    assert (
+        claim.notes_json["report_eligibility"]["component_focus"]["failed_reason"]
+        == "official_source_role_missing"
+    )
+    assert (
+        manifest["report_diagnostics"]["report_component_focus_failed_reason_distribution"][
+            "official_source_role_missing"
+        ]
+        >= 1
+    )
+    assert statement not in result.markdown
+
+
+def test_report_does_not_rescue_component_claim_without_technical_slot_intersection(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    statement = (
+        "StateGraph is a builder class and cannot be used directly for execution."
+    )
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://reference.langchain.com/python/langgraph/graph/state",
+        domain="reference.langchain.com",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "mechanism",
+            "answer_role": "mechanism",
+            "answer_relevant": True,
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.89,
+            "slot_ids": ["examples_use_cases"],
+        },
+    )
+    db_session.commit()
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    db_session.refresh(claim)
+    manifest = _manifest(result.artifact)
+
+    assert claim.notes_json["report_eligible"] is False
+    assert "query_focus_mismatch" in claim.notes_json["report_eligibility"]["reasons"]
+    assert (
+        claim.notes_json["report_eligibility"]["component_focus"]["failed_reason"]
+        == "slot_mismatch"
+    )
+    assert (
+        manifest["report_diagnostics"]["report_component_focus_failed_reason_distribution"][
+            "slot_mismatch"
+        ]
+        >= 1
+    )
+    assert statement not in result.markdown
+
+
+def test_report_does_not_rescue_unrelated_statement_on_official_langgraph_reference(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is LangGraph and how does it work?",
+        constraints={},
+    )
+    statement = "The Kubernetes control plane reconciles desired workload configuration."
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement=statement,
+        canonical_url="https://reference.langchain.com/python/langgraph/graph/state",
+        domain="reference.langchain.com",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "mechanism",
+            "answer_role": "mechanism",
+            "answer_relevant": True,
+            "claim_quality_score": 0.9,
+            "query_answer_score": 0.88,
+            "slot_ids": ["limitations", "core_abstractions"],
+        },
+    )
+    db_session.commit()
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    db_session.refresh(claim)
+    manifest = _manifest(result.artifact)
+
+    assert claim.notes_json["report_eligible"] is False
+    assert "query_focus_mismatch" in claim.notes_json["report_eligibility"]["reasons"]
+    assert (
+        claim.notes_json["report_eligibility"]["component_focus"]["failed_reason"]
+        == "component_term_mismatch"
+    )
+    assert (
+        manifest["report_diagnostics"]["report_component_focus_failed_reason_distribution"][
+            "component_term_mismatch"
+        ]
+        >= 1
+    )
+    assert statement not in result.markdown
+
+
+def test_report_definition_mechanism_tensorflow_query_still_applies_focus_mismatch(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    task = create_research_task_service(db_session).create_task(
+        query="What is TensorFlow and how does automatic differentiation work?",
+        constraints={},
+    )
+    claim = _add_supported_report_claim(
+        db_session,
+        task,
+        statement="FastAPI uses Python type hints to validate request data.",
+        canonical_url="https://fastapi.tiangolo.com/tutorial/",
+        domain="fastapi.tiangolo.com",
+        notes={
+            "verification": {"rationale": "Found 1 support evidence."},
+            "claim_category": "definition",
+            "answer_role": "definition",
+            "answer_relevant": True,
+            "claim_quality_score": 0.92,
+            "query_answer_score": 0.9,
+            "slot_ids": ["definition", "core_abstractions"],
+        },
+    )
+    db_session.commit()
+    result = _report_service(db_session, tmp_path).generate_markdown_report(task.id)
+    manifest = _manifest(result.artifact)
+    db_session.refresh(claim)
+
+    assert claim.notes_json["report_eligible"] is False
+    assert "query_focus_mismatch" in claim.notes_json["report_eligibility"]["reasons"]
+    diag = manifest["report_diagnostics"]
+    assert int(diag.get("report_query_focus_rescued_by_component_count") or 0) == 0
 
 
 def test_claim_drafting_chunk_selection_preserves_source_diversity_for_mechanism_questions(

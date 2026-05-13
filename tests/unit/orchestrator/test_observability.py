@@ -19,6 +19,7 @@ def test_render_metrics_includes_phase10_counters() -> None:
         updated=0,
         skipped_existing=0,
         skipped_unsupported=0,
+        skipped_static_html_hold=0,
         failed=0,
     )
     record_verify_results(verification_statuses=["supported", "mixed"])

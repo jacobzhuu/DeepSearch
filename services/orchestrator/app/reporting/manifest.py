@@ -34,6 +34,7 @@ def build_report_manifest(
     source_yield_summary: list[dict[str, Any]] | None = None,
     verification_summary: dict[str, Any] | None = None,
     dropped_sources: list[dict[str, Any]] | None = None,
+    report_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ordered_claims = sorted(claims, key=lambda item: (item.verification_status, str(item.claim_id)))
     ordered_sources = sorted(sources, key=lambda item: (item.domain, item.canonical_url))
@@ -59,6 +60,7 @@ def build_report_manifest(
         "source_yield_summary": source_yield_summary or [],
         "dropped_sources": dropped_sources or [],
         "verification_summary": verification_summary or {},
+        "report_diagnostics": report_diagnostics or {},
         "claim_counts": {
             "supported": sum(
                 1 for item in ordered_claims if item.verification_status == "supported"
@@ -98,6 +100,8 @@ def build_report_manifest(
                 "canonical_url": source.canonical_url,
                 "domain": source.domain,
                 "title": source.title,
+                "source_role": source.source_role,
+                "source_intent": source.source_intent,
             }
             for source in ordered_sources
         ],
@@ -114,6 +118,8 @@ def _serialize_evidence(evidence: ReportEvidenceItem) -> dict[str, object]:
         "score": evidence.score,
         "canonical_url": evidence.canonical_url,
         "domain": evidence.domain,
+        "source_role": evidence.source_role,
+        "source_intent": evidence.source_intent,
         "chunk_no": evidence.chunk_no,
         "start_offset": evidence.start_offset,
         "end_offset": evidence.end_offset,

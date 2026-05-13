@@ -65,6 +65,14 @@ LANGGRAPH_WEAK_SECONDARY_DOMAINS = (
 )
 LANGGRAPH_BROAD_GITHUB_PREFERENCE = "github.com/langchain-ai"
 LANGGRAPH_UPSTREAM_GITHUB_PREFERENCE = "github.com/langchain-ai/langgraph"
+TECHNICAL_EXPLANATION_SOURCE_ROLES = (
+    "official_docs",
+    "official_reference",
+    "official_repository",
+    "official_blog_or_changelog",
+    "high_quality_secondary_reference",
+    "academic_or_standard",
+)
 ExpectedSourceType = Literal[
     "general_web",
     "official_docs",
@@ -393,6 +401,41 @@ def build_basic_research_plan(
             answer_slots=[slot.to_payload() for slot in answer_slots_for_query(query)],
         )
 
+    if _is_technical_explanation_query(query):
+        technical_queries = _technical_explanation_query_matrix(
+            subject=subject,
+            original_query=query,
+        )[:max_search_queries]
+        return ResearchPlan(
+            intent="technical_explanation",
+            normalized_question=query,
+            subquestions=[
+                f"What is {subject}?",
+                f"What problem does {subject} solve?",
+                f"What are the core abstractions in {subject}?",
+                f"How does {subject} execute and route workflows?",
+                f"What examples, limitations, and positioning matter for {subject}?",
+            ][:max_subquestions],
+            search_queries=technical_queries,
+            source_preferences=_technical_explanation_source_preferences(),
+            answer_outline=[
+                "Definition and motivation",
+                "Core abstractions",
+                "Architecture and execution model",
+                "Workflow lifecycle",
+                "Features, examples, limitations, and positioning",
+                "Official source coverage",
+            ],
+            risk_notes=[
+                "Prefer official documentation, reference pages, and upstream repositories.",
+                "Use secondary explainers only as bounded context after official sources.",
+                "Treat planner text as structure only; claims still require persisted evidence.",
+            ],
+            planner_mode=planner_mode,
+            warnings=[],
+            answer_slots=[slot.to_payload() for slot in answer_slots_for_query(query)],
+        )
+
     subquestions = [
         f"What is {subject}?",
         f"How does {subject} work?",
@@ -475,6 +518,7 @@ def build_default_research_plan(
     return _apply_research_plan_guardrails(
         plan,
         query=query,
+        max_subquestions=max_subquestions,
         max_search_queries=max_search_queries,
     )
 
@@ -1014,6 +1058,7 @@ def _plan_from_payload(
     guarded_plan = _apply_research_plan_guardrails(
         plan,
         query=query,
+        max_subquestions=max_subquestions,
         max_search_queries=max_search_queries,
     )
     planner_diagnostics = payload.get("planner_diagnostics")
@@ -1026,13 +1071,13 @@ def _apply_research_plan_guardrails(
     plan: ResearchPlan,
     *,
     query: str,
+    max_subquestions: int,
     max_search_queries: int,
 ) -> ResearchPlan:
     intent_classification = _classify_research_intent(query=query, intent=plan.intent)
     recent_nvidia_open_model_query = _is_recent_nvidia_open_model_query(query)
     overview_query = (
-        intent_classification == "overview_definition_intent"
-        and not recent_nvidia_open_model_query
+        intent_classification == "overview_definition_intent" and not recent_nvidia_open_model_query
     )
     deployment_query = intent_classification == "deployment_intent"
     extracted_entity = _extract_entity_from_overview_query(query) if overview_query else None
@@ -1094,56 +1139,87 @@ def _apply_research_plan_guardrails(
         warnings.append(warning)
 
     search_queries = plan.search_queries
+    subquestions = list(plan.subquestions)
     answer_outline = list(plan.answer_outline)
     risk_notes = list(plan.risk_notes)
-    guarded_intent = "deployment" if deployment_query else plan.intent
+    technical_explanation_query = bool(
+        overview_query and extracted_entity and _is_technical_explanation_query(query)
+    )
+    guarded_intent = (
+        "deployment"
+        if deployment_query
+        else "technical_explanation" if technical_explanation_query else plan.intent
+    )
     if deployment_query and plan.intent != "deployment":
         override_warning = "planner_intent_overridden_for_deployment_query"
         guardrail_warnings.append(override_warning)
         warnings.append(override_warning)
 
     if overview_query and extracted_entity:
-        guardrail_queries = [
-            PlannedSearchQuery(
-                query_text=query,
-                rationale="Preserve the user's original overview question.",
-                expected_source_type="general_web",
-                priority=1,
-                query_source="original_user_query",
-            ),
-            PlannedSearchQuery(
-                query_text=f"{extracted_entity} official documentation",
-                rationale="Prioritize official documentation for the overview definition.",
-                expected_source_type="official_docs",
-                priority=2,
-                query_source="guardrail_query",
-            ),
-            PlannedSearchQuery(
-                query_text=f"{extracted_entity} about how does it work",
-                rationale="Prioritize official about or mechanism-oriented explanations.",
-                expected_source_type="official_about",
-                priority=3,
-                query_source="guardrail_query",
-            ),
-            PlannedSearchQuery(
-                query_text=f"{extracted_entity} Wikipedia",
-                rationale="Prioritize a stable reference source for the definition.",
-                expected_source_type="reference",
-                priority=4,
-                query_source="guardrail_query",
-            ),
-        ]
-        if _looks_like_software_project_query(query=query, entity=extracted_entity):
-            guardrail_queries.append(
-                PlannedSearchQuery(
-                    query_text=f"{extracted_entity} GitHub README",
-                    rationale="Find an upstream repository README for project-level context.",
-                    expected_source_type="github_readme_or_repo",
-                    priority=5,
-                    query_source="guardrail_query",
-                )
+        if _is_technical_explanation_query(query):
+            guardrail_queries = _technical_explanation_query_matrix(
+                subject=extracted_entity,
+                original_query=query,
             )
-        if _is_langgraph_entity(extracted_entity):
+            source_preferences = _source_preferences_with_defaults(
+                _technical_explanation_source_preferences(),
+                source_preferences,
+            )
+            subquestions = _technical_explanation_subquestions(extracted_entity)[:max_subquestions]
+            answer_outline = _technical_explanation_answer_outline()
+            risk_notes = _prepend_unique_strings(
+                [
+                    "Prefer official documentation, reference pages, and upstream repositories.",
+                    "Use secondary explainers only as bounded context after official sources.",
+                    (
+                        "Treat planner text as structure only; claims still require persisted "
+                        "evidence."
+                    ),
+                ],
+                risk_notes,
+            )
+        else:
+            guardrail_queries = [
+                PlannedSearchQuery(
+                    query_text=query,
+                    rationale="Preserve the user's original overview question.",
+                    expected_source_type="general_web",
+                    priority=1,
+                    query_source="original_user_query",
+                ),
+                PlannedSearchQuery(
+                    query_text=f"{extracted_entity} official documentation",
+                    rationale="Prioritize official documentation for the overview definition.",
+                    expected_source_type="official_docs",
+                    priority=2,
+                    query_source="guardrail_query",
+                ),
+                PlannedSearchQuery(
+                    query_text=f"{extracted_entity} about how does it work",
+                    rationale="Prioritize official about or mechanism-oriented explanations.",
+                    expected_source_type="official_about",
+                    priority=3,
+                    query_source="guardrail_query",
+                ),
+                PlannedSearchQuery(
+                    query_text=f"{extracted_entity} Wikipedia",
+                    rationale="Prioritize a stable reference source for the definition.",
+                    expected_source_type="reference",
+                    priority=4,
+                    query_source="guardrail_query",
+                ),
+            ]
+            if _looks_like_software_project_query(query=query, entity=extracted_entity):
+                guardrail_queries.append(
+                    PlannedSearchQuery(
+                        query_text=f"{extracted_entity} GitHub README",
+                        rationale="Find an upstream repository README for project-level context.",
+                        expected_source_type="github_readme_or_repo",
+                        priority=5,
+                        query_source="guardrail_query",
+                    )
+                )
+        if _is_langgraph_entity(extracted_entity) and not _is_technical_explanation_query(query):
             guardrail_queries = _inject_langgraph_guardrail_queries(
                 extracted_entity,
                 query,
@@ -1154,7 +1230,8 @@ def _apply_research_plan_guardrails(
             guardrail_queries,
             plan.search_queries,
             max_search_queries=max_search_queries,
-            demote_architecture_or_setup=not _query_explicitly_asks_admin_or_setup(query),
+            demote_architecture_or_setup=not _is_technical_explanation_query(query)
+            and not _query_explicitly_asks_admin_or_setup(query),
         )
     elif deployment_query:
         subject = _subject_from_query(query)
@@ -1246,27 +1323,21 @@ def _apply_research_plan_guardrails(
                 query_source="guardrail_query",
             ),
             PlannedSearchQuery(
-                query_text=(
-                    f"NVIDIA open weights model {current_year} site:blogs.nvidia.com"
-                ),
+                query_text=(f"NVIDIA open weights model {current_year} site:blogs.nvidia.com"),
                 rationale="Prioritize NVIDIA official blog posts about open model releases.",
                 expected_source_type="official_about",
                 priority=3,
                 query_source="guardrail_query",
             ),
             PlannedSearchQuery(
-                query_text=(
-                    f"NVIDIA Nemotron open model {current_year} site:developer.nvidia.com"
-                ),
+                query_text=(f"NVIDIA Nemotron open model {current_year} site:developer.nvidia.com"),
                 rationale="Prioritize NVIDIA developer material for model details and impact.",
                 expected_source_type="official_or_reference",
                 priority=4,
                 query_source="guardrail_query",
             ),
             PlannedSearchQuery(
-                query_text=(
-                    f"NVIDIA open AI model {current_year} site:nvidianews.nvidia.com"
-                ),
+                query_text=(f"NVIDIA open AI model {current_year} site:nvidianews.nvidia.com"),
                 rationale="Prioritize NVIDIA newsroom announcements for release dates.",
                 expected_source_type="official_docs",
                 priority=5,
@@ -1274,13 +1345,18 @@ def _apply_research_plan_guardrails(
             ),
             PlannedSearchQuery(
                 query_text=f"NVIDIA open models {current_year} site:huggingface.co/nvidia",
-                rationale="Check NVIDIA's model hub for released open weights and adoption context.",
+                rationale=(
+                    "Check NVIDIA's model hub for released open weights and adoption context."
+                ),
                 expected_source_type="reference",
                 priority=6,
                 query_source="guardrail_query",
             ),
             PlannedSearchQuery(
-                query_text=f"NVIDIA open source model GitHub release {current_year} site:github.com/NVIDIA",
+                query_text=(
+                    f"NVIDIA open source model GitHub release {current_year} "
+                    "site:github.com/NVIDIA"
+                ),
                 rationale="Check NVIDIA-owned GitHub repositories for recent release evidence.",
                 expected_source_type="official_repository",
                 priority=7,
@@ -1312,7 +1388,7 @@ def _apply_research_plan_guardrails(
     return ResearchPlan(
         intent=guarded_intent,
         normalized_question=plan.normalized_question,
-        subquestions=plan.subquestions,
+        subquestions=subquestions,
         search_queries=search_queries,
         source_preferences=source_preferences,
         answer_outline=answer_outline,
@@ -1336,7 +1412,7 @@ def _source_preferences_with_defaults(
     preferred_domains = _string_list(value.get("preferred_domains"))
     avoid_domains = _string_list(value.get("avoid_domains"))
     freshness_required = value.get("freshness_required")
-    return {
+    merged: dict[str, Any] = {
         "preferred_domains": preferred_domains or _string_list(defaults.get("preferred_domains")),
         "avoid_domains": avoid_domains or _string_list(defaults.get("avoid_domains")),
         "freshness_required": (
@@ -1345,6 +1421,20 @@ def _source_preferences_with_defaults(
             else bool(defaults.get("freshness_required", False))
         ),
     }
+    for key in (
+        "preferred_source_roles",
+        "avoid_source_roles",
+        "source_role_quotas",
+        "max_secondary_sources",
+        "secondary_preferred_domains",
+        "planner_domain_corrections",
+        "overridden_avoid_domains",
+    ):
+        if key in defaults:
+            merged[key] = defaults[key]
+        if key in value:
+            merged[key] = value[key]
+    return merged
 
 
 def _is_langgraph_entity(entity: str | None) -> bool:
@@ -1486,6 +1576,7 @@ def _inject_langgraph_guardrail_queries(
                 expected_source_type=item.expected_source_type,
                 priority=index,
                 query_source=item.query_source,
+                metadata=dict(item.metadata),
             )
             for index, item in enumerate(guardrail_queries[2:], start=9)
             if item.query_text.strip().lower() != original_query.strip().lower()
@@ -1508,6 +1599,280 @@ def _default_source_preferences() -> dict[str, Any]:
     }
 
 
+def _technical_explanation_source_preferences() -> dict[str, Any]:
+    defaults = _default_source_preferences()
+    return {
+        **defaults,
+        "preferred_source_roles": list(TECHNICAL_EXPLANATION_SOURCE_ROLES),
+        "avoid_source_roles": ["forum_social_video", "low_quality_or_blocked"],
+        "source_role_quotas": {
+            "official_docs": 3,
+            "official_reference": 2,
+            "official_repository": 1,
+            "official_blog_or_changelog": 1,
+            "high_quality_secondary_reference": 1,
+            "academic_or_standard": 0,
+            "generic_article": 0,
+        },
+        "max_secondary_sources": 1,
+    }
+
+
+def _is_technical_explanation_query(query: str) -> bool:
+    lower = query.lower()
+    if _is_deployment_query(query):
+        return False
+    if "what is" in lower and "how" in lower and "work" in lower:
+        return True
+    if "what are" in lower and "how" in lower and "work" in lower:
+        return True
+    if lower.startswith("explain ") and ("how" in lower or "architecture" in lower):
+        return True
+    return any(
+        marker in lower
+        for marker in (
+            "technical explanation",
+            "architecture and execution",
+            "execution model",
+            "how it works",
+        )
+    )
+
+
+def _technical_explanation_subquestions(subject: str) -> list[str]:
+    return [
+        f"What is {subject}?",
+        f"What problem does {subject} solve?",
+        f"What are the core abstractions in {subject}?",
+        f"How does {subject} execute and route workflows?",
+        f"What examples, limitations, and positioning matter for {subject}?",
+    ]
+
+
+def _technical_explanation_answer_outline() -> list[str]:
+    return [
+        "Definition and motivation",
+        "Core abstractions",
+        "Architecture and execution model",
+        "Workflow lifecycle",
+        "Features, examples, limitations, and positioning",
+        "Official source coverage",
+    ]
+
+
+def _technical_explanation_query_matrix(
+    *,
+    subject: str,
+    original_query: str,
+) -> list[PlannedSearchQuery]:
+    subject = subject.strip() or _subject_from_query(original_query)
+    if _is_langgraph_entity(subject):
+        return [
+            _technical_query(
+                original_query,
+                rationale="Preserve the user's original technical explanation question.",
+                expected_source_type="general_web",
+                priority=1,
+                query_source="original_user_query",
+                target_slots=("definition", "motivation_problem"),
+                source_role="high_quality_secondary_reference",
+                query_matrix_slot="user_question",
+            ),
+            _technical_query(
+                "LangGraph official documentation overview",
+                rationale="Find the official definition and overview.",
+                expected_source_type="official_docs",
+                priority=2,
+                target_slots=("definition", "motivation_problem", "official_sources"),
+                source_role="official_docs",
+                query_matrix_slot="definition",
+            ),
+            _technical_query(
+                "LangGraph site:docs.langchain.com concepts state graph nodes edges",
+                rationale="Find official docs for core abstractions.",
+                expected_source_type="official_docs",
+                priority=3,
+                target_slots=("core_abstractions", "architecture", "official_sources"),
+                source_role="official_docs",
+                query_matrix_slot="core_abstractions",
+            ),
+            _technical_query(
+                "LangGraph site:reference.langchain.com StateGraph graph state reference",
+                rationale="Find official API/reference material for StateGraph and graph state.",
+                expected_source_type="reference",
+                priority=4,
+                target_slots=("core_abstractions", "official_sources"),
+                source_role="official_reference",
+                query_matrix_slot="official_reference",
+            ),
+            _technical_query(
+                "LangGraph github langchain-ai langgraph README",
+                rationale="Find the upstream repository README for project-level evidence.",
+                expected_source_type="official_repository",
+                priority=5,
+                target_slots=("official_sources", "examples_use_cases", "key_features"),
+                source_role="official_repository",
+                query_matrix_slot="official_repository",
+            ),
+            _technical_query(
+                "LangGraph execution model durable execution checkpoints streaming",
+                rationale="Find evidence for execution, checkpointing, and streaming behavior.",
+                expected_source_type="official_docs",
+                priority=6,
+                target_slots=("execution_model", "workflow_lifecycle", "key_features"),
+                source_role="official_docs",
+                query_matrix_slot="execution_model",
+            ),
+            _technical_query(
+                "LangGraph architecture runtime graph workflow official docs",
+                rationale="Find official architecture and runtime workflow material.",
+                expected_source_type="official_docs",
+                priority=7,
+                target_slots=("architecture", "workflow_lifecycle", "official_sources"),
+                source_role="official_docs",
+                query_matrix_slot="architecture",
+            ),
+            _technical_query(
+                "LangGraph examples use cases agents workflows human-in-the-loop",
+                rationale="Find grounded examples and use cases.",
+                expected_source_type="official_docs",
+                priority=8,
+                target_slots=("examples_use_cases", "key_features", "workflow_lifecycle"),
+                source_role="official_docs",
+                query_matrix_slot="examples_use_cases",
+            ),
+            _technical_query(
+                "LangGraph limitations comparison LangChain agent frameworks",
+                rationale="Find bounded secondary context for limitations and positioning.",
+                expected_source_type="reference",
+                priority=9,
+                target_slots=("limitations", "comparison_positioning"),
+                source_role="high_quality_secondary_reference",
+                query_matrix_slot="limitations_comparison",
+            ),
+            _technical_query(
+                "LangGraph changelog blog release durable execution platform",
+                rationale="Find official blog or changelog context when available.",
+                expected_source_type="official_about",
+                priority=10,
+                target_slots=("key_features", "official_sources"),
+                source_role="official_blog_or_changelog",
+                query_matrix_slot="official_blog_or_changelog",
+            ),
+        ]
+
+    return [
+        _technical_query(
+            original_query,
+            rationale="Preserve the user's original technical explanation question.",
+            expected_source_type="general_web",
+            priority=1,
+            query_source="original_user_query",
+            target_slots=("definition", "motivation_problem"),
+            source_role="high_quality_secondary_reference",
+            query_matrix_slot="user_question",
+        ),
+        _technical_query(
+            f"{subject} official documentation overview",
+            rationale="Find the official definition and overview.",
+            expected_source_type="official_docs",
+            priority=2,
+            target_slots=("definition", "motivation_problem", "official_sources"),
+            source_role="official_docs",
+            query_matrix_slot="definition",
+        ),
+        _technical_query(
+            f"{subject} core concepts architecture official documentation",
+            rationale="Find official concepts and architecture material.",
+            expected_source_type="official_docs",
+            priority=3,
+            target_slots=("core_abstractions", "architecture", "official_sources"),
+            source_role="official_docs",
+            query_matrix_slot="core_abstractions",
+        ),
+        _technical_query(
+            f"{subject} API reference core concepts",
+            rationale="Find reference or API documentation for concrete abstractions.",
+            expected_source_type="reference",
+            priority=4,
+            target_slots=("core_abstractions", "official_sources"),
+            source_role="official_reference",
+            query_matrix_slot="official_reference",
+        ),
+        _technical_query(
+            f"{subject} GitHub README",
+            rationale="Find the upstream repository README when available.",
+            expected_source_type="github_readme_or_repo",
+            priority=5,
+            target_slots=("official_sources", "examples_use_cases", "key_features"),
+            source_role="official_repository",
+            query_matrix_slot="official_repository",
+        ),
+        _technical_query(
+            f"{subject} execution model workflow lifecycle official documentation",
+            rationale="Find evidence for execution and workflow lifecycle behavior.",
+            expected_source_type="official_docs",
+            priority=6,
+            target_slots=("execution_model", "workflow_lifecycle"),
+            source_role="official_docs",
+            query_matrix_slot="execution_model",
+        ),
+        _technical_query(
+            f"{subject} examples use cases official documentation",
+            rationale="Find grounded examples and common use cases.",
+            expected_source_type="official_docs",
+            priority=7,
+            target_slots=("examples_use_cases", "key_features"),
+            source_role="official_docs",
+            query_matrix_slot="examples_use_cases",
+        ),
+        _technical_query(
+            f"{subject} limitations comparison alternatives",
+            rationale="Find bounded context for limitations and positioning.",
+            expected_source_type="reference",
+            priority=8,
+            target_slots=("limitations", "comparison_positioning"),
+            source_role="high_quality_secondary_reference",
+            query_matrix_slot="limitations_comparison",
+        ),
+        _technical_query(
+            f"{subject} changelog blog release official",
+            rationale="Find official blog, release, or changelog context when available.",
+            expected_source_type="official_about",
+            priority=9,
+            target_slots=("key_features", "official_sources"),
+            source_role="official_blog_or_changelog",
+            query_matrix_slot="official_blog_or_changelog",
+        ),
+    ]
+
+
+def _technical_query(
+    query_text: str,
+    *,
+    rationale: str,
+    expected_source_type: ExpectedSourceType,
+    priority: int,
+    target_slots: tuple[str, ...],
+    source_role: str,
+    query_matrix_slot: str,
+    query_source: str = "guardrail_query",
+) -> PlannedSearchQuery:
+    return PlannedSearchQuery(
+        query_text=query_text,
+        rationale=rationale,
+        expected_source_type=expected_source_type,
+        priority=priority,
+        query_source=query_source,
+        metadata={
+            "target_slots": list(target_slots),
+            "source_role": source_role,
+            "query_matrix_slot": query_matrix_slot,
+            "query_template": "technical_explanation",
+        },
+    )
+
+
 def _merge_and_rank_planned_queries(
     guardrail_queries: list[PlannedSearchQuery],
     planner_queries: list[PlannedSearchQuery],
@@ -1519,11 +1884,11 @@ def _merge_and_rank_planned_queries(
     seen: set[str] = set()
     dropped_or_downweighted: list[dict[str, Any]] = []
 
-    def add(query: PlannedSearchQuery) -> None:
+    def add(query: PlannedSearchQuery) -> bool:
         normalized = query.query_text.strip()
         dedupe_key = normalized.lower()
         if not normalized or dedupe_key in seen:
-            return
+            return False
         merged.append(
             PlannedSearchQuery(
                 query_text=normalized,
@@ -1531,9 +1896,11 @@ def _merge_and_rank_planned_queries(
                 expected_source_type=query.expected_source_type,
                 priority=query.priority,
                 query_source=query.query_source,
+                metadata=dict(query.metadata),
             )
         )
         seen.add(dedupe_key)
+        return True
 
     for query in guardrail_queries:
         add(query)
@@ -1541,7 +1908,10 @@ def _merge_and_rank_planned_queries(
     planner_with_penalty = [
         (
             query,
-            _planner_query_guardrail_penalty(query) if demote_architecture_or_setup else 0,
+            _planner_query_guardrail_penalty(
+                query,
+                demote_architecture_or_setup=demote_architecture_or_setup,
+            ),
         )
         for query in planner_queries
     ]
@@ -1554,7 +1924,8 @@ def _merge_and_rank_planned_queries(
         ),
     )
     for query, penalty in planner_sorted:
-        if penalty > 0:
+        added = add(query)
+        if penalty > 0 and added:
             dropped_or_downweighted.append(
                 {
                     **query.to_payload(),
@@ -1563,9 +1934,8 @@ def _merge_and_rank_planned_queries(
                     "guardrail_penalty": penalty,
                 }
             )
-        add(query)
 
-    effective_max_queries = max(max_search_queries, len(guardrail_queries))
+    effective_max_queries = max_search_queries
     capped = merged[:effective_max_queries]
     dropped_texts = {query.query_text.lower() for query in merged[effective_max_queries:]}
     for query in merged[effective_max_queries:]:
@@ -1584,6 +1954,7 @@ def _merge_and_rank_planned_queries(
             expected_source_type=query.expected_source_type,
             priority=index,
             query_source=query.query_source,
+            metadata=dict(query.metadata),
         )
         for index, query in enumerate(capped, start=1)
     ]
@@ -1656,10 +2027,15 @@ def _normalize_recent_query_year(query: PlannedSearchQuery) -> PlannedSearchQuer
         expected_source_type=query.expected_source_type,
         priority=query.priority,
         query_source=query.query_source,
+        metadata=dict(query.metadata),
     )
 
 
-def _planner_query_guardrail_penalty(query: PlannedSearchQuery) -> int:
+def _planner_query_guardrail_penalty(
+    query: PlannedSearchQuery,
+    *,
+    demote_architecture_or_setup: bool,
+) -> int:
     lower = query.query_text.lower()
     if (
         "github" in lower
@@ -1672,6 +2048,8 @@ def _planner_query_guardrail_penalty(query: PlannedSearchQuery) -> int:
         return 12
     if any(term in lower for term in ("generic article", "use case", "use cases", "examples")):
         return 6
+    if not demote_architecture_or_setup:
+        return 0
     if any(term in lower for term in ("architecture", "admin", "api", "developer", "dev/")):
         return 20
     if any(term in lower for term in ("install", "installation", "setup", "docker")):
@@ -1852,10 +2230,13 @@ def _planned_search_queries(value: Any) -> list[PlannedSearchQuery]:
             query_source = _string_value(item.get("query_source"), default="planner_query")
             priority_value = item.get("priority")
             priority = priority_value if isinstance(priority_value, int) else index
+            metadata_value = item.get("metadata")
+            metadata = dict(metadata_value) if isinstance(metadata_value, dict) else {}
         else:
             continue
         if isinstance(item, str):
             query_source = "planner_query"
+            metadata = {}
         dedupe_key = query_text.lower()
         if not query_text or dedupe_key in seen_query_texts:
             continue
@@ -1866,6 +2247,7 @@ def _planned_search_queries(value: Any) -> list[PlannedSearchQuery]:
                 expected_source_type=expected_source_type,
                 priority=priority,
                 query_source=query_source,
+                metadata=metadata,
             )
         )
         seen_query_texts.add(dedupe_key)

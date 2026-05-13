@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Protocol
 from uuid import UUID
 
+import pytest
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from packages.db.repositories import (
@@ -145,6 +148,47 @@ def test_pipeline_leaves_searching_when_later_search_failure_has_existing_candid
             ended_at=None,
         )
         session.commit()
+
+
+class _StopForever(Exception):
+    """Test sentinel to break the infinite worker loop."""
+
+
+def test_run_forever_survives_poll_operational_error_then_polls_again(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poll_calls = {"n": 0}
+
+    def flaky_run_once(self: ResearchPipelineWorker) -> int:
+        poll_calls["n"] += 1
+        if poll_calls["n"] == 1:
+            raise OperationalError("SELECT 1", {}, RuntimeError("simulated schema drift"))
+        return 0
+
+    monkeypatch.setattr(ResearchPipelineWorker, "run_once", flaky_run_once)
+
+    sleeps = {"n": 0}
+
+    def sleep_side(_duration: float) -> None:
+        sleeps["n"] += 1
+        if sleeps["n"] >= 2:
+            raise _StopForever()
+
+    monkeypatch.setattr(time, "sleep", sleep_side)
+
+    worker = ResearchPipelineWorker(
+        session_factory=session_factory,
+        settings=Settings(search_provider="smoke", index_backend="local"),
+        runner_factory=_complete_task_runner,
+    )
+    monkeypatch.setattr(worker, "recover_interrupted_tasks", lambda: 0)
+
+    with pytest.raises(_StopForever):
+        worker.run_forever()
+
+    assert poll_calls["n"] == 2
+    assert sleeps["n"] == 2
 
 
 def _complete_task_runner(session: Session) -> _TestPipelineRunner:

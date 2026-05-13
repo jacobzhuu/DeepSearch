@@ -7,13 +7,17 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+# Canonical minimal example (orchestrator may append ``+extra`` capability segments).
 EXPECTED_RUNNING_MODE = "real-search+opensearch+planner+report-LLM"
+# ``+``-delimited segments that must all be present (case-insensitive) for real-pipeline acceptance.
+REQUIRED_RUNNING_MODE_SEGMENTS = frozenset({"real-search", "opensearch", "planner", "report-llm"})
 REQUEST_TIMEOUT_SECONDS = 30
 ACTIVE_STATUSES = {
     "QUEUED",
@@ -28,7 +32,28 @@ ACTIVE_STATUSES = {
     "REPORTING",
 }
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED", "PAUSED", "NEEDS_REVISION"}
+GAP_ROUND_OUTCOME_SKIPPED_LABEL = "skipped_drafting"
+GAP_SUMMARY_UNKNOWN_SKIP = "unknown"
+
+
+def _researching_more_skip_drafting_reason(result: dict[str, Any]) -> str | None:
+    """Prefer nested ``skip_drafting_reason``, then top-level ``skip_drafting_reason``."""
+    diag = result.get("gap_round_diagnostics")
+    if isinstance(diag, dict):
+        inner = diag.get("skip_drafting_reason")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    top = result.get("skip_drafting_reason")
+    if isinstance(top, str) and top.strip():
+        return top.strip()
+    return None
+
+
 GROUNDED_WRITER_MODES = {"llm_grounded", "deterministic", "deterministic_grounded"}
+COVERAGE_SUFFICIENT_OPTIONAL_WEAK_ONLY = "coverage_sufficient_optional_weak_only"
+GAP_SKIP_CATEGORY_NOT_ALLOWED = "gap_category_not_allowed"
+GAP_SKIP_PRIORITY_TOO_LOW = "gap_priority_too_low"
+NO_SELECTED_CANDIDATES = "no_selected_candidates"
 
 
 class AcceptanceError(RuntimeError):
@@ -201,12 +226,14 @@ def run_live_acceptance(
     payloads = collect_task_artifacts(base_url=base_url, task_id=task_id, detail=detail)
     payloads["run"] = run_payload if isinstance(run_payload, dict) else {}
     acceptance = profile.evaluate(task_id, payloads["run"], payloads)
+    gap_summary = summarize_gap_loop_from_payloads(payloads)
     return {
         "task_id": task_id,
         "profile": profile.profile_id,
         "base_url": base_url,
         "payloads": payloads,
         "acceptance": acceptance,
+        "gap_summary": gap_summary,
     }
 
 
@@ -286,7 +313,7 @@ def evaluate_deployment_acceptance(
     traceability = traceability_summary(report.get("markdown"), payloads=payloads)
     checks = {
         "task_completed": detail.get("status") == "COMPLETED",
-        "running_mode_real_pipeline": running_mode == EXPECTED_RUNNING_MODE,
+        "running_mode_real_pipeline": running_mode_has_required_capabilities(running_mode),
         "report_language_zh_cn": report.get("report_language") == DEPLOYMENT_REPORT_LANGUAGE,
         "writer_grounded": string_or_none(report.get("writer_mode")) in GROUNDED_WRITER_MODES,
         "report_is_chinese": contains_chinese(report.get("markdown")),
@@ -337,7 +364,7 @@ def evaluate_langgraph_acceptance(
     evidence_chain = evidence_chain_summary(payloads)
     checks = {
         "task_completed": detail.get("status") == "COMPLETED",
-        "running_mode_real_pipeline": running_mode == EXPECTED_RUNNING_MODE,
+        "running_mode_real_pipeline": running_mode_has_required_capabilities(running_mode),
         "planner_or_explicit_fallback": llm_usage["planner_ok"],
         "report_llm_or_grounded_fallback": llm_usage["report_ok"],
         "traceability_present": all(traceability.values()),
@@ -630,6 +657,164 @@ def get_optional_payload(base_url: str, path: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    legacy = event.get("payload_json")
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _sorted_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if events and all(isinstance(item.get("sequence_no"), int) for item in events):
+        return sorted(events, key=lambda item: int(item["sequence_no"]))
+    return list(events)
+
+
+def _sorted_int_counter(counter: Counter) -> dict[str, int]:
+    return {key: int(counter[key]) for key in sorted(counter)}
+
+
+def summarize_gap_loop_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Read-only rollup of ``pipeline.gap_analysis``, ``pipeline.research_strategy``, and
+    ``RESEARCHING_MORE`` ``stage_completed`` diagnostics from API event rows.
+    """
+    ordered = _sorted_events(events)
+    gap_analysis_events = 0
+    research_strategy_events = 0
+    research_more_stage_completed_count = 0
+
+    gap_analysis_reason: Counter[str] = Counter()
+    loop_stop_reason: Counter[str] = Counter()
+    suppressed_strategist: Counter[str] = Counter()
+    coverage_optional_weak_only = 0
+
+    outcome_dist: Counter[str] = Counter()
+    skip_drafting_reason: Counter[str] = Counter()
+    nested_drafting_created = 0
+    nested_verification_supported = 0
+    no_selected_candidates = 0
+    gap_category_not_allowed = 0
+    gap_priority_too_low = 0
+
+    for event in ordered:
+        et = str(event.get("event_type") or "")
+        payload = _event_payload(event)
+        if et.endswith(".gap_analysis"):
+            gap_analysis_events += 1
+            result = payload.get("result")
+            if isinstance(result, dict):
+                reason = result.get("reason")
+                if isinstance(reason, str) and reason.strip():
+                    gap_analysis_reason[reason.strip()] += 1
+                loop = result.get("loop_stop_reason")
+                if isinstance(loop, str) and loop.strip():
+                    loop_stop_reason[loop.strip()] += 1
+                if reason == COVERAGE_SUFFICIENT_OPTIONAL_WEAK_ONLY or loop == (
+                    COVERAGE_SUFFICIENT_OPTIONAL_WEAK_ONLY
+                ):
+                    coverage_optional_weak_only += 1
+                alignment = result.get("coverage_alignment")
+                if isinstance(alignment, dict):
+                    sd = alignment.get("suppressed_strategist_decision")
+                    if isinstance(sd, str) and sd.strip():
+                        suppressed_strategist[sd.strip()] += 1
+            continue
+
+        if et.endswith(".research_strategy"):
+            research_strategy_events += 1
+            continue
+
+        if et.endswith(".stage_completed") and payload.get("stage") == "RESEARCHING_MORE":
+            research_more_stage_completed_count += 1
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                continue
+            diag = result.get("gap_round_diagnostics")
+            outcome_str: str | None = None
+            if isinstance(diag, dict):
+                raw_out = diag.get("gap_round_outcome")
+                if isinstance(raw_out, str) and raw_out.strip():
+                    outcome_str = raw_out.strip()
+                nested_drafting_created += int(diag.get("drafting_created_claims") or 0)
+                raw_ver = diag.get("verification_supported_claims")
+                if raw_ver is not None:
+                    nested_verification_supported += int(raw_ver or 0)
+            if outcome_str is None:
+                top_out = result.get("gap_round_outcome")
+                if isinstance(top_out, str) and top_out.strip():
+                    outcome_str = top_out.strip()
+            if outcome_str:
+                outcome_dist[outcome_str] += 1
+
+            skip = _researching_more_skip_drafting_reason(result)
+            if skip:
+                skip_drafting_reason[skip] += 1
+            elif outcome_str == GAP_ROUND_OUTCOME_SKIPPED_LABEL:
+                skip_drafting_reason[GAP_SUMMARY_UNKNOWN_SKIP] += 1
+            if skip == NO_SELECTED_CANDIDATES:
+                no_selected_candidates += 1
+            for row in result.get("skipped_gap_search_sources") or []:
+                if not isinstance(row, dict):
+                    continue
+                sr = row.get("skip_reason")
+                if sr == GAP_SKIP_CATEGORY_NOT_ALLOWED:
+                    gap_category_not_allowed += 1
+                elif sr == GAP_SKIP_PRIORITY_TOO_LOW:
+                    gap_priority_too_low += 1
+
+    return {
+        "gap_analysis_events": gap_analysis_events,
+        "research_strategy_events": research_strategy_events,
+        "research_more_stage_completed_count": research_more_stage_completed_count,
+        "research_more_gap_rounds_total": research_more_stage_completed_count,
+        "gap_rounds_with_drafting": int(outcome_dist.get("drafted", 0)),
+        "gap_rounds_skipped_drafting": int(outcome_dist.get("skipped_drafting", 0)),
+        "skip_drafting_reason_distribution": _sorted_int_counter(skip_drafting_reason),
+        "gap_round_outcome_distribution": _sorted_int_counter(outcome_dist),
+        "loop_stop_reason_distribution": _sorted_int_counter(loop_stop_reason),
+        "gap_analysis_reason_distribution": _sorted_int_counter(gap_analysis_reason),
+        "coverage_sufficient_optional_weak_only_count": coverage_optional_weak_only,
+        "suppressed_strategist_decision_distribution": _sorted_int_counter(suppressed_strategist),
+        "nested_drafting_created_claims_total": nested_drafting_created,
+        "nested_verification_supported_claims_total": nested_verification_supported,
+        "no_selected_candidates_count": no_selected_candidates,
+        "gap_category_not_allowed_count": gap_category_not_allowed,
+        "gap_priority_too_low_count": gap_priority_too_low,
+    }
+
+
+def summarize_gap_loop_from_payloads(payloads: dict[str, Any]) -> dict[str, Any]:
+    events = as_list((payloads.get("events") or {}).get("events"))
+    return summarize_gap_loop_from_events(events)
+
+
+def print_gap_loop_summary_to_stdout(summary: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+    """Emit a short operator-facing gap / research-loop footer after acceptance JSON."""
+    print("Gap summary:", file=stream)
+    print(f"- gap_analysis_events: {summary.get('gap_analysis_events', 0)}", file=stream)
+    print(
+        f"- RESEARCHING_MORE stages: {summary.get('research_more_stage_completed_count', 0)}",
+        file=stream,
+    )
+    suppressed = summary.get("suppressed_strategist_decision_distribution") or {}
+    continue_ct = int(suppressed.get("continue_search", 0))
+    print(f"- suppressed continue_search: {continue_ct}", file=stream)
+    loop_dist = summary.get("loop_stop_reason_distribution") or {}
+    if len(loop_dist) == 1:
+        only = next(iter(loop_dist.items()))
+        print(f"- loop_stop_reason: {only[0]}", file=stream)
+    elif loop_dist:
+        print(f"- loop_stop_reason_distribution: {loop_dist}", file=stream)
+    else:
+        print("- loop_stop_reason: (none)", file=stream)
+    print(
+        f"- no_selected_candidates: {summary.get('no_selected_candidates_count', 0)}",
+        file=stream,
+    )
+
+
 def write_artifacts(output_dir: Path, result: dict[str, Any]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for name, payload in result["payloads"].items():
@@ -644,10 +829,57 @@ def write_artifacts(output_dir: Path, result: dict[str, Any]) -> None:
         json.dumps(result["acceptance"], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    gap_summary = result.get("gap_summary")
+    if gap_summary is None and isinstance(result.get("payloads"), dict):
+        gap_summary = summarize_gap_loop_from_payloads(result["payloads"])
+    if isinstance(gap_summary, dict):
+        (output_dir / "gap_summary.json").write_text(
+            json.dumps(gap_summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        summary_path = output_dir / "summary.md"
+        if summary_path.is_file():
+            block = (
+                "\n## Gap / research loop summary\n\n"
+                f"- gap_analysis_events: {gap_summary.get('gap_analysis_events', 0)}\n"
+                f"- RESEARCHING_MORE stages: "
+                f"{gap_summary.get('research_more_stage_completed_count', 0)}\n"
+                f"- research_strategy_events: {gap_summary.get('research_strategy_events', 0)}\n"
+                f"- coverage_sufficient_optional_weak_only_count: "
+                f"{gap_summary.get('coverage_sufficient_optional_weak_only_count', 0)}\n"
+                f"- suppressed_strategist_decision_distribution: "
+                f"{gap_summary.get('suppressed_strategist_decision_distribution') or {}}\n"
+                f"- loop_stop_reason_distribution: "
+                f"{gap_summary.get('loop_stop_reason_distribution') or {}}\n"
+                f"- no_selected_candidates_count: "
+                f"{gap_summary.get('no_selected_candidates_count', 0)}\n"
+                f"- gap_category_not_allowed_count: "
+                f"{gap_summary.get('gap_category_not_allowed_count', 0)}\n"
+                f"- gap_priority_too_low_count: "
+                f"{gap_summary.get('gap_priority_too_low_count', 0)}\n"
+            )
+            prev = summary_path.read_text(encoding="utf-8")
+            summary_path.write_text(prev + block, encoding="utf-8")
 
 
 def running_mode_from_detail(detail: dict[str, Any]) -> str | None:
     return string_or_none(observability_from_detail(detail).get("running_mode"))
+
+
+def running_mode_has_required_capabilities(running_mode: str | None) -> bool:
+    """
+    True when ``running_mode`` includes every required orchestrator capability segment.
+
+    Segments are ``+``-separated (as emitted in ``progress.observability.running_mode``).
+    Additional segments (for example ``assist-judge-strategy-review``) are allowed.
+    """
+    if running_mode is None:
+        return False
+    text = str(running_mode).strip()
+    if not text:
+        return False
+    segments = {part.strip().lower() for part in text.split("+") if part.strip()}
+    return REQUIRED_RUNNING_MODE_SEGMENTS <= segments
 
 
 def observability_from_detail(detail: dict[str, Any]) -> dict[str, Any]:

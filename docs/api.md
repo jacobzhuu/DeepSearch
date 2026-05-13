@@ -725,6 +725,28 @@ Response `200 OK`:
 }
 ```
 
+### `GET /api/v1/research/tasks/{task_id}/acquisition/funnel-metrics`
+
+Purpose: return ledger-backed diagnostics for the acquisition and parsing funnel on a single task.
+
+Read contract:
+
+- response includes ``counts``, ``rates`` (all denominators are ledger table row counts listed under ``diagnostics_meta``), ``fetch_status_distribution``, ``fetch_error_code_distribution``, ``domain_failure_distribution`` (attempts with a non-null ``fetch_attempt.error_code``), ``parser_decision_distribution``, ``parser_rejection_reason_distribution``, and ``diagnostics_meta`` describing limitations
+- extended acquisition-yield fields (ledger- and ``task_event``-backed where noted):
+  - ``counts.candidates_without_fetch_job``, ``counts.candidates_with_any_fetch_job``, ``counts.selected_candidate_count``, ``counts.skipped_candidate_count`` (triage ordering mirrors acquisition using the task query and current server ``research_acquisition_max_must_fetch_per_round``)
+  - ``counts.claim``, ``counts.supported_claim`` (``verification_status == supported``), ``counts.report_artifact``
+  - ``candidate_not_fetched_reason_distribution`` classifies ``candidate_url`` rows with **no** ``fetch_job`` (any mode), combining ``acquisition.fetch_batch_summary`` ``stop_reason`` for unattempted ids with triage metadata and duplicate-canonical heuristics (see ``diagnostics_meta.candidate_not_fetched``)
+  - ``fetch_batch_stop_reason_distribution`` from recent ``acquisition.fetch_batch_summary`` events
+  - ``fetch_budget_limit_applied`` (true when any batch summary used ``stop_reason = fetch_budget_exhausted``)
+  - parse backlog diagnostics (ledger + latest ``PARSING`` ``pipeline*.stage_completed`` ``result`` when present): ``eligible_snapshots_without_source_document``, ``parse_not_attempted_snapshot_count`` (same count: succeeded fetch, evidence-parse-eligible snapshots without a ``source_document``), ``parse_limit_exhausted`` (heuristic: backlog beyond ``research_parse_limit`` with drain off, or drain stopped early while backlog remains), ``parse_drain_batches_run``, ``parse_drain_created_documents``, ``parse_drain_stop_reason``, ``unparsed_eligible_snapshot_domains``, ``parse_not_attempted_reason_distribution``
+  - ``fetch_jobs_by_mode``, ``http_fetch_job_status_distribution``
+  - ``acquisition_limits`` echoes acquisition-related settings from the running orchestrator (including ``acquisition_trusted_docs_domains``, ``acquisition_trusted_docs_max_response_bytes``, ``acquisition_min_successful_authoritative_snapshots``, ``acquisition_defer_success_target_for_high_priority``, and parse knobs ``research_parse_limit``, ``research_parse_drain_enabled``, ``research_parse_max_batches``, ``research_parse_target_documents``, ``research_parse_drain_max_seconds``) for benchmark comparisons
+  - ``response_cap_policy_distribution`` / ``response_cap_decision_distribution`` (bounded scan of recent ``fetch_attempt.trace_json``), ``trusted_docs_elevated_cap_fetch_attempts``, ``fetch_batch_success_target_continue_total`` (sum of per-batch ``success_target_continue_count`` from ``acquisition.fetch_batch_summary`` events)
+  - ``browser_fallback_task_metrics`` aggregates recent ``acquisition.browser_fallback`` ``task_event`` payloads (considered / attempted / succeeded / failed / skipped-after-consideration)
+  - ``body_too_large`` groups ``body_too_large`` attempts by ``candidate_url.domain`` and snapshot ``mime_type`` (``unknown`` when no snapshot row), plus configured ``max_response_bytes``
+- ``parser_*_distribution`` fields are **not** fully ledger-backed: they are reconstructed from the most recent ``task_event`` payloads (see ``diagnostics_meta.parser_distributions`` for scan limit and a proposed durable parse-outcome model)
+- safe read-only endpoint; does not mutate ledger rows
+
 ## Phase 4 acquisition rules
 
 | Boundary | Current rule |
@@ -735,10 +757,17 @@ Response `200 OK`:
 | Mixed DNS answers | allowed when at least one resolved IP is global; trace includes `allowed_ips`, `blocked_ips`, and `decision_reason` |
 | Timeout | bounded by `ACQUISITION_TIMEOUT_SECONDS` |
 | Redirects | bounded by `ACQUISITION_MAX_REDIRECTS` |
-| Max response body | bounded by `ACQUISITION_MAX_RESPONSE_BYTES` |
+| Max response body | default cap `ACQUISITION_MAX_RESPONSE_BYTES`; optional higher cap for hosts listed in `ACQUISITION_TRUSTED_DOCS_DOMAINS` when `ACQUISITION_TRUSTED_DOCS_MAX_RESPONSE_BYTES` is set above the global cap (see `response_cap_source` / `cap_decision` on fetch attempt traces) |
+| Success-target stopping | `ACQUISITION_MIN_SUCCESSFUL_AUTHORITATIVE_SNAPSHOTS` and `ACQUISITION_DEFER_SUCCESS_TARGET_FOR_HIGH_PRIORITY` tune early exit when `target_successful_snapshots` is set on acquisition |
 | Snapshot backend | filesystem-backed object store interface in current phase |
-| Non-2xx behavior | persisted as failed attempts with `error_code = "http_error_status"` |
+| Non-2xx behavior | persisted as failed attempts; ``error_code`` is ``status_403`` / ``status_429`` / ``http_error_status`` (other codes); response bytes may still be recorded on the attempt trace |
+| Empty 2xx body | ``error_code = empty_response`` (no snapshot persisted) |
+| Binary 2xx MIME | ``error_code = unsupported_mime`` for image/video/audio/font top-level types (no snapshot persisted) |
+| Transport errors | classified when possible (for example ``timeout_connect``, ``timeout_read``, ``ssl_error``, ``dns_error``) instead of a generic ``network_error`` |
+| Redirect cap exceeded | ``error_code = redirect_loop`` |
 | Storage write failure | persisted as failed attempts with `error_code = "storage_write_failed"` |
+| Weak static HTML (SPA/bot/cookie/JS-only heuristics) | snapshots persist with ``fetch_job.status = SUCCEEDED`` and ``fetch_attempt.error_code = null``; ``trace_json`` sets ``eligible_for_evidence_parse=false`` and ``static_html_quality_decision`` so parsing does not create ``source_document`` rows until a browser retry adds a new fetch attempt |
+| Browser fallback (Playwright) | When ``BROWSER_FETCH_BACKEND=playwright`` and static ``fetch_attempt`` matches ``should_attempt_browser_fallback``, the orchestrator adds a second ``fetch_job`` with ``mode=BROWSER_RENDERED``, runs ``PlaywrightBrowserFetchBackend``, and persists a separate ``content_snapshot``; bytes go through the same parser/chunker path. ``mcp`` remains reserved. |
 
 ## Parsing endpoints
 
@@ -758,10 +787,11 @@ Request:
 Request semantics:
 
 - request body is optional
-- when `content_snapshot_ids` is omitted, the service scans persisted task snapshots in ascending `fetched_at` order
+- when `content_snapshot_ids` is omitted, the service scans persisted task snapshots in ascending `fetched_at` order, **preferring snapshots that do not yet have a `source_document`** so repeated parse batches advance through the queue instead of re-processing only the earliest chronological prefix (already-parsed snapshots may still pad a batch up to `limit` when fewer than `limit` unparsed rows remain)
 - when `content_snapshot_ids` is provided, ids must belong to the task; duplicate ids in the request are ignored after first occurrence
 - `limit` is optional and bounded to `1..50`, then capped again by the current server-side parse cap
 - only already-fetched successful snapshots are eligible for parsing; other snapshots are skipped with an explicit reason
+- snapshots with ``fetch_attempt.trace_json["eligible_for_evidence_parse"] = false`` (static HTML quality hold) still have auditable object-store bytes, but are excluded from default parse selection and return ``skipped_static_html_quality`` when parsed by id
 
 Response `200 OK`:
 
@@ -772,6 +802,7 @@ Response `200 OK`:
   "updated": 0,
   "skipped_existing": 0,
   "skipped_unsupported": 0,
+  "skipped_static_html_hold": 0,
   "failed": 0,
   "entries": [
     {
@@ -1568,7 +1599,8 @@ Execution contract:
     strategist queries replaced deterministic gap queries or stayed in shadow mode
   - verification summaries that identify the deterministic lexical verifier method and distinguish strong support from weak lexical support
   - supplemental acquisition trigger reason, attempted sources, skipped sources, and bounded retry status
-  - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, LangGraph owned-source fallback queries for LangChain docs/reference/GitHub when relevant, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates or low-value results, non-fatal `gap_search_unavailable` / `supplemental_search_failed` warnings when supplemental search fails after usable evidence exists, max-round terminal reasons, and per-round `RESEARCHING_MORE` results
+  - gap-analysis trigger reason, missing/weak required slots, deterministic per-slot supplemental search query variants, LangGraph owned-source fallback queries for LangChain docs/reference/GitHub when relevant, `gap_round_no`/`slot_ids` query metadata, fallback attempts against existing unattempted high-value candidates when supplemental search only returns duplicates or low-value results, non-fatal `gap_search_unavailable` / `supplemental_search_failed` warnings when supplemental search fails after usable evidence exists, max-round terminal reasons, and per-round `RESEARCHING_MORE` results; when overall coverage is already `sufficient` in `coverage_evaluation` and only optional (non-required) slots remain weak, strategist `continue_search` rounds are skipped by default with `loop_stop_reason` / `reason` set to `coverage_sufficient_optional_weak_only` plus a `coverage_alignment` object on the `pipeline.gap_analysis` payload (quality-gate-driven follow-ups still run); when supplemental search fails but usable evidence already exists, `RESEARCHING_MORE` may skip drafting with `skip_drafting_reason` set to `supplemental_search_failed_continuing_existing_evidence` instead of `unknown`
+  - gap supplemental search triage skip reasons on `skipped_gap_search_sources` include `gap_category_not_allowed`, `gap_priority_too_low`, `gap_missing_candidate_id`, `gap_invalid_candidate_id`, and `gap_duplicate_in_round` (legacy rows may still show `low_value_gap_search_result`)
   - technical concept source selection diagnostics: generic title-only tutorial pages remain `generic_article`, localized mirrors such as `github.langchain.ac.cn`, `langgraph.com.cn`, and `langchain-doc.cn` remain `secondary_reference`, third-party GitHub tutorials do not receive upstream repository priority, off-subject official-looking docs can be downranked with `off_subject_source_downranked_for_query`, and job/freelance/listing URLs stay low quality for overview queries
   - claim-drafting failure diagnostics when a no-claims failure remains after supplemental acquisition, including why supplemental acquisition triggered, top rejected candidates, unattempted high-quality sources, why about/Wikipedia was not attempted, per-source answer yield, and an operator `next_action`
   - warnings when fewer than two sources fetch successfully; this does not block completion when at least one source succeeds

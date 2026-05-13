@@ -197,8 +197,8 @@ def test_gap_round_candidate_selection_skips_low_value_new_results_for_fallback(
 
     assert [str(item) for item in selected] == ["22222222-2222-4222-8222-222222222222"]
     assert [item["skip_reason"] for item in skipped] == [
-        "low_value_gap_search_result",
-        "low_value_gap_search_result",
+        "gap_category_not_allowed",
+        "gap_priority_too_low",
     ]
 
 

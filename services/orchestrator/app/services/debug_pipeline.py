@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,6 +65,25 @@ from services.orchestrator.app.services.acquisition import (
     fetch_priority_metadata,
 )
 from services.orchestrator.app.services.claims import ClaimDraftingService
+from services.orchestrator.app.services.gap_round_diagnostics import (
+    GAP_ROUND_OUTCOME_DRAFTED,
+    GAP_ROUND_OUTCOME_SKIPPED,
+    SKIP_FETCH_BUDGET_EXHAUSTED,
+    SKIP_NO_CANDIDATE_URLS,
+    SKIP_NO_CONTENT_SNAPSHOTS,
+    SKIP_NO_FOLLOWUP_QUERIES,
+    SKIP_NO_NEW_CHUNKS,
+    SKIP_NO_SELECTED_CANDIDATES,
+    SKIP_NO_SOURCE_CHUNKS,
+    SKIP_NO_SOURCE_DOCUMENTS,
+    SKIP_NO_SUCCESSFUL_FETCHES,
+    SKIP_SUPPLEMENTAL_SEARCH_FAILED_CONTINUING_EXISTING_EVIDENCE,
+    attach_gap_round_to_stage_result,
+    build_gap_round_diagnostics,
+    canonical_urls_for_candidate_ids,
+    fetch_budget_hint_from_skipped_sources,
+    verification_supported_count_from_summary,
+)
 from services.orchestrator.app.services.indexing import IndexingService
 from services.orchestrator.app.services.parsing import ParsingService, parse_entry_diagnostic
 from services.orchestrator.app.services.reporting import (
@@ -126,6 +147,18 @@ DRAFT_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_DRAFTING_CLAIMS, STAGE
 VERIFY_ALLOWED_STATUSES = ("PLANNED", STATUS_QUEUED, STAGE_VERIFYING, STAGE_RESEARCHING_MORE)
 MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD = 2
 GAP_SEARCH_UNAVAILABLE_WARNING = "gap_search_unavailable"
+
+# Gap search candidate selection skip reasons (pipeline.gap_analysis / acquisition diagnostics).
+GAP_SEARCH_SKIP_CATEGORY_NOT_ALLOWED = "gap_category_not_allowed"
+GAP_SEARCH_SKIP_PRIORITY_TOO_LOW = "gap_priority_too_low"
+GAP_SEARCH_SKIP_MISSING_CANDIDATE_ID = "gap_missing_candidate_id"
+GAP_SEARCH_SKIP_INVALID_CANDIDATE_ID = "gap_invalid_candidate_id"
+GAP_SEARCH_SKIP_DUPLICATE_IN_ROUND = "gap_duplicate_in_round"
+
+# When overall coverage is sufficient and only optional slots remain weak, suppress
+# strategist-driven ``continue_search`` gap rounds by default (see
+# ``_maybe_suppress_strategist_gap_continue_for_coverage_alignment``).
+COVERAGE_SUFFICIENT_OPTIONAL_WEAK_ONLY_STOP = "coverage_sufficient_optional_weak_only"
 SUPPLEMENTAL_SEARCH_FAILED_WARNING = "supplemental_search_failed"
 MIN_REPORT_MAIN_CLAIMS = 12
 MIN_REPORT_SUPPORT_EVIDENCE = 12
@@ -217,6 +250,10 @@ class DebugRealPipelineRunner:
         parse_limit: int = 3,
         index_limit: int = 10,
         claim_limit: int = 5,
+        parse_drain_enabled: bool = False,
+        parse_drain_max_batches: int = 3,
+        parse_drain_target_documents: int = 20,
+        parse_drain_max_seconds: float = 0.0,
         event_source: str = PIPELINE_EVENT_SOURCE,
         event_prefix: str = PIPELINE_EVENT_PREFIX,
         target_successful_snapshots: int = MIN_SUCCESSFUL_SOURCES_WARNING_THRESHOLD,
@@ -254,6 +291,10 @@ class DebugRealPipelineRunner:
         self.parse_limit = parse_limit
         self.index_limit = index_limit
         self.claim_limit = claim_limit
+        self.parse_drain_enabled = bool(parse_drain_enabled)
+        self.parse_drain_max_batches = max(1, int(parse_drain_max_batches))
+        self.parse_drain_target_documents = max(1, int(parse_drain_target_documents))
+        self.parse_drain_max_seconds = max(0.0, float(parse_drain_max_seconds))
         self.event_source = event_source
         self.event_prefix = event_prefix
         self.target_successful_snapshots = target_successful_snapshots
@@ -471,6 +512,14 @@ class DebugRealPipelineRunner:
                     round_no=round_no,
                     max_rounds=max_rounds,
                 )
+            analysis_payload = _maybe_suppress_strategist_gap_continue_for_coverage_alignment(
+                analysis_payload,
+                coverage_evaluation=coverage_evaluation,
+                slot_coverage_summary=slot_coverage_summary,
+                strategy_payload=strategy_payload,
+                research_loop_enabled=self.research_loop_enabled,
+                research_loop_strategist_shadow_mode=self.research_loop_strategist_shadow_mode,
+            )
             if not analysis_payload.get("triggered"):
                 quality_gate = self._current_report_quality_gate(
                     task_id,
@@ -513,6 +562,148 @@ class DebugRealPipelineRunner:
             round_no += 1
         return None
 
+    def _attach_gap_round_diagnostics(
+        self,
+        task_id: UUID,
+        gap_analysis: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        gap_round_outcome: str,
+        skip_drafting_reason: str | None,
+        coverage_before: list[dict[str, Any]] | None,
+        coverage_after: list[dict[str, Any]] | None,
+        search_attempted: bool,
+        search_skipped_reason: str | None,
+        search_result: dict[str, Any],
+        selected_candidate_ids: list[UUID],
+        skipped_gap_search_sources: list[dict[str, Any]],
+        skipped_fallback_sources: list[dict[str, Any]],
+        acquisition_batch: Any | None,
+        acquisition_result: dict[str, Any] | None,
+        snapshot_ids: list[UUID] | None,
+        parse_batch: Any | None,
+        parsing_result: dict[str, Any] | None,
+        source_chunk_ids: list[UUID] | None,
+        index_batch: Any | None,
+        indexing_result: dict[str, Any] | None,
+        drafting_result: dict[str, Any] | None,
+        drafting_attempted: bool,
+        verification_result: dict[str, Any] | None,
+        verification_attempted: bool,
+        supplemental_search_failed: bool,
+        continuing_with_existing_evidence: bool,
+        loop_stop_reason: str | None = None,
+    ) -> dict[str, Any]:
+        gap_round_raw = gap_analysis.get("round_no")
+        gap_round_index: int | None
+        if isinstance(gap_round_raw, int):
+            gap_round_index = gap_round_raw
+        else:
+            gap_round_index = None
+            if gap_round_raw is not None:
+                try:
+                    gap_round_index = int(gap_round_raw)
+                except (TypeError, ValueError):
+                    gap_round_index = None
+        gap_triggered_raw = gap_analysis.get("triggered")
+        gap_triggered: bool | None
+        if isinstance(gap_triggered_raw, bool):
+            gap_triggered = gap_triggered_raw
+        elif gap_triggered_raw is not None:
+            gap_triggered = bool(gap_triggered_raw)
+        else:
+            gap_triggered = None
+
+        sqc = int(search_result.get("search_query_count") or 0)
+        src = int(search_result.get("search_result_count") or 0)
+        cadded = int(search_result.get("candidate_urls_added") or 0)
+
+        fetch_jobs_created = None
+        fetch_attempts_created = None
+        content_snapshots_created = None
+        if acquisition_batch is not None:
+            fetch_jobs_created = int(acquisition_batch.created)
+            fetch_attempts_created = sum(
+                1
+                for e in acquisition_batch.entries
+                if getattr(e, "fetch_attempt", None) is not None
+            )
+            content_snapshots_created = sum(
+                1
+                for e in acquisition_batch.entries
+                if getattr(e, "content_snapshot", None) is not None
+            )
+        elif acquisition_result is not None:
+            fetch_jobs_created = int(acquisition_result.get("created") or 0)
+            fetch_attempts_created = int(len(acquisition_result.get("attempted_sources") or []))
+            content_snapshots_created = int(acquisition_result.get("content_snapshots") or 0)
+
+        source_documents_created = None
+        source_chunks_created = None
+        if parse_batch is not None:
+            source_documents_created = int(parse_batch.created)
+            source_chunks_created = sum(
+                len(e.source_document.chunks)
+                for e in parse_batch.entries
+                if e.source_document is not None
+            )
+        elif parsing_result is not None and source_documents_created is None:
+            source_documents_created = int(parsing_result.get("created") or 0)
+
+        parse_attempted = bool(snapshot_ids)
+        index_attempted = bool(source_chunk_ids)
+
+        d_created = None
+        d_reused = None
+        if isinstance(drafting_result, dict):
+            d_created = int(drafting_result.get("created_claims") or 0)
+            d_reused = int(drafting_result.get("reused_claims") or 0)
+
+        ver_supported = None
+        if isinstance(verification_result, dict):
+            vs = verification_result.get("verification_summary")
+            if isinstance(vs, dict):
+                ver_supported = verification_supported_count_from_summary(vs)
+
+        selected_urls = canonical_urls_for_candidate_ids(
+            self.session,
+            task_id,
+            list(selected_candidate_ids),
+        )
+
+        diagnostics = build_gap_round_diagnostics(
+            gap_round_outcome=gap_round_outcome,
+            skip_drafting_reason=skip_drafting_reason,
+            gap_round_index=gap_round_index,
+            strategy_decision=gap_analysis.get("strategy_decision"),
+            gap_triggered=gap_triggered,
+            search_attempted=search_attempted,
+            search_skipped_reason=search_skipped_reason,
+            search_queries_count=sqc,
+            search_result_count=src,
+            candidate_urls_added=cadded,
+            selected_candidate_ids=list(selected_candidate_ids),
+            selected_candidate_urls=selected_urls,
+            fetch_jobs_created=fetch_jobs_created,
+            fetch_attempts_created=fetch_attempts_created,
+            content_snapshots_created=content_snapshots_created,
+            source_documents_created=source_documents_created,
+            source_chunks_created=source_chunks_created,
+            parse_attempted=parse_attempted,
+            index_attempted=index_attempted,
+            drafting_attempted=drafting_attempted,
+            drafting_created_claims=d_created,
+            drafting_reused_claims=d_reused,
+            verification_attempted=verification_attempted,
+            verification_supported_claims=ver_supported,
+            coverage_before=coverage_before,
+            coverage_after=coverage_after,
+            loop_stop_reason=loop_stop_reason,
+            supplemental_search_failed=supplemental_search_failed,
+            continuing_with_existing_evidence=continuing_with_existing_evidence,
+        )
+        return attach_gap_round_to_stage_result(result, diagnostics)
+
     def _run_research_more_round(
         self,
         task_id: UUID,
@@ -521,6 +712,7 @@ class DebugRealPipelineRunner:
         task = self._get_task(task_id)
         planned_queries = _planned_queries_from_gap_analysis(gap_analysis)
         strategy_decision = gap_analysis.get("strategy_decision")
+        coverage_before = self._current_slot_coverage_summary(task_id)
 
         search_result: dict[str, Any] = {
             "search_queries": [],
@@ -532,9 +724,13 @@ class DebugRealPipelineRunner:
             "source_judgments": [],
         }
 
+        search_attempted = strategy_decision != "fetch_more_existing_candidates"
+        search_skipped_reason: str | None = None
+
         if strategy_decision == "fetch_more_existing_candidates":
             search_result["skipped"] = True
             search_result["reason"] = "fetch_more_existing_candidates_decision"
+            search_skipped_reason = str(search_result.get("reason"))
         else:
             try:
                 search_result = self._run_search(
@@ -554,7 +750,8 @@ class DebugRealPipelineRunner:
                         "continuing to reporting with existing evidence."
                     ),
                 ]
-                return {
+                cov_after = self._current_slot_coverage_summary(task_id)
+                base = {
                     "gap_analysis": gap_analysis,
                     "search": {
                         "supplemental_search": True,
@@ -567,9 +764,38 @@ class DebugRealPipelineRunner:
                     },
                     "warnings": warnings,
                     "existing_evidence": existing_evidence,
-                    "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                    "slot_coverage_summary": cov_after,
                     "continuing_with_existing_evidence": True,
                 }
+                return self._attach_gap_round_diagnostics(
+                    task_id,
+                    gap_analysis,
+                    base,
+                    gap_round_outcome=GAP_ROUND_OUTCOME_SKIPPED,
+                    skip_drafting_reason=SKIP_SUPPLEMENTAL_SEARCH_FAILED_CONTINUING_EXISTING_EVIDENCE,
+                    coverage_before=coverage_before,
+                    coverage_after=cov_after,
+                    search_attempted=True,
+                    search_skipped_reason=None,
+                    search_result=base["search"],
+                    selected_candidate_ids=[],
+                    skipped_gap_search_sources=[],
+                    skipped_fallback_sources=[],
+                    acquisition_batch=None,
+                    acquisition_result=None,
+                    snapshot_ids=None,
+                    parse_batch=None,
+                    parsing_result=None,
+                    source_chunk_ids=None,
+                    index_batch=None,
+                    indexing_result=None,
+                    drafting_result=None,
+                    drafting_attempted=False,
+                    verification_result=None,
+                    verification_attempted=False,
+                    supplemental_search_failed=True,
+                    continuing_with_existing_evidence=True,
+                )
         tolerated_failure = _supplemental_search_provider_failure(search_result)
         if tolerated_failure is not None:
             existing_evidence = self._existing_evidence_status_for_gap_fallback(task_id)
@@ -586,7 +812,8 @@ class DebugRealPipelineRunner:
                         "continuing to reporting with existing evidence."
                     ),
                 ]
-                return {
+                cov_after = self._current_slot_coverage_summary(task_id)
+                base = {
                     "gap_analysis": gap_analysis,
                     "search": {
                         **search_result,
@@ -596,9 +823,38 @@ class DebugRealPipelineRunner:
                     },
                     "warnings": warnings,
                     "existing_evidence": existing_evidence,
-                    "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                    "slot_coverage_summary": cov_after,
                     "continuing_with_existing_evidence": True,
                 }
+                return self._attach_gap_round_diagnostics(
+                    task_id,
+                    gap_analysis,
+                    base,
+                    gap_round_outcome=GAP_ROUND_OUTCOME_SKIPPED,
+                    skip_drafting_reason=SKIP_SUPPLEMENTAL_SEARCH_FAILED_CONTINUING_EXISTING_EVIDENCE,
+                    coverage_before=coverage_before,
+                    coverage_after=cov_after,
+                    search_attempted=True,
+                    search_skipped_reason=None,
+                    search_result=search_result,
+                    selected_candidate_ids=[],
+                    skipped_gap_search_sources=[],
+                    skipped_fallback_sources=[],
+                    acquisition_batch=None,
+                    acquisition_result=None,
+                    snapshot_ids=None,
+                    parse_batch=None,
+                    parsing_result=None,
+                    source_chunk_ids=None,
+                    index_batch=None,
+                    indexing_result=None,
+                    drafting_result=None,
+                    drafting_attempted=False,
+                    verification_result=None,
+                    verification_attempted=False,
+                    supplemental_search_failed=True,
+                    continuing_with_existing_evidence=True,
+                )
         selected_candidate_ids, skipped_gap_search_sources = _select_gap_search_candidate_ids(
             search_result,
             limit=self.max_supplemental_sources,
@@ -606,6 +862,7 @@ class DebugRealPipelineRunner:
         round_warnings: list[str] = []
         fallback_sources: list[dict[str, Any]] = []
         skipped_fallback_sources: list[dict[str, Any]] = []
+        attempted_search_fallback = False
         if not selected_candidate_ids:
             fetch_more_limit = self.max_supplemental_sources
             if strategy_decision == "fetch_more_existing_candidates":
@@ -618,6 +875,8 @@ class DebugRealPipelineRunner:
                 limit=fetch_more_limit,
                 high_value_only=True,
             )
+            attempted_search_fallback = True
+            fallback_nonempty = bool(fallback_candidates)
             selected_candidate_ids = [candidate.id for candidate in fallback_candidates]
             fallback_sources = [
                 {
@@ -628,34 +887,87 @@ class DebugRealPipelineRunner:
             ]
             if not selected_candidate_ids:
                 round_warnings.append("Gap round produced no new or unattempted candidate URLs.")
-                return {
+                combined_skipped = [*skipped_gap_search_sources, *skipped_fallback_sources]
+                if fetch_budget_hint_from_skipped_sources(combined_skipped):
+                    no_sel_skip = SKIP_FETCH_BUDGET_EXHAUSTED
+                elif not planned_queries and strategy_decision != "fetch_more_existing_candidates":
+                    no_sel_skip = SKIP_NO_FOLLOWUP_QUERIES
+                elif (
+                    int(search_result.get("candidate_urls_added") or 0) == 0
+                    and not fallback_nonempty
+                ):
+                    no_sel_skip = SKIP_NO_CANDIDATE_URLS
+                else:
+                    no_sel_skip = SKIP_NO_SELECTED_CANDIDATES
+                cov_after = self._current_slot_coverage_summary(task_id)
+                base = {
                     "gap_analysis": gap_analysis,
                     "search": search_result,
                     "fallback_sources": fallback_sources,
                     "skipped_gap_search_sources": skipped_gap_search_sources,
                     "skipped_fallback_sources": skipped_fallback_sources,
                     "warnings": round_warnings,
-                    "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                    "slot_coverage_summary": cov_after,
                 }
-                if strategy_decision != "fetch_more_existing_candidates":
-                    round_warnings.append(
-                        "Gap round search added no high-value URLs; attempting existing "
-                        "unattempted high-value candidates."
-                    )
+                return self._attach_gap_round_diagnostics(
+                    task_id,
+                    gap_analysis,
+                    base,
+                    gap_round_outcome=GAP_ROUND_OUTCOME_SKIPPED,
+                    skip_drafting_reason=no_sel_skip,
+                    coverage_before=coverage_before,
+                    coverage_after=cov_after,
+                    search_attempted=search_attempted,
+                    search_skipped_reason=search_skipped_reason,
+                    search_result=search_result,
+                    selected_candidate_ids=[],
+                    skipped_gap_search_sources=skipped_gap_search_sources,
+                    skipped_fallback_sources=skipped_fallback_sources,
+                    acquisition_batch=None,
+                    acquisition_result=None,
+                    snapshot_ids=None,
+                    parse_batch=None,
+                    parsing_result=None,
+                    source_chunk_ids=None,
+                    index_batch=None,
+                    indexing_result=None,
+                    drafting_result=None,
+                    drafting_attempted=False,
+                    verification_result=None,
+                    verification_attempted=False,
+                    supplemental_search_failed=False,
+                    continuing_with_existing_evidence=False,
+                )
+        if (
+            attempted_search_fallback
+            and selected_candidate_ids
+            and strategy_decision != "fetch_more_existing_candidates"
+        ):
+            round_warnings.append(
+                "Gap round search added no high-value URLs; attempting existing "
+                "unattempted high-value candidates."
+            )
 
-        acquisition = self.acquisition_service.acquire_candidates(
+        acquisition_batch = self.acquisition_service.acquire_candidates(
             task_id,
             candidate_url_ids=selected_candidate_ids,
             limit=len(selected_candidate_ids),
             target_successful_snapshots=None,
         )
-        acquisition_result = _acquisition_stage_result(acquisition)
+        acquisition_result = _acquisition_stage_result(acquisition_batch)
         snapshot_ids = [
-            entry.content_snapshot.id for entry in acquisition.entries if entry.content_snapshot
+            entry.content_snapshot.id
+            for entry in acquisition_batch.entries
+            if entry.content_snapshot
         ]
         if not snapshot_ids:
             round_warnings.append("Gap round fetched no successful content snapshots.")
-            return {
+            cov_after = self._current_slot_coverage_summary(task_id)
+            if int(acquisition_result.get("fetch_succeeded") or 0) == 0:
+                snap_skip = SKIP_NO_SUCCESSFUL_FETCHES
+            else:
+                snap_skip = SKIP_NO_CONTENT_SNAPSHOTS
+            base = {
                 "gap_analysis": gap_analysis,
                 "search": search_result,
                 "acquisition": acquisition_result,
@@ -663,8 +975,37 @@ class DebugRealPipelineRunner:
                 "skipped_gap_search_sources": skipped_gap_search_sources,
                 "skipped_fallback_sources": skipped_fallback_sources,
                 "warnings": round_warnings,
-                "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                "slot_coverage_summary": cov_after,
             }
+            return self._attach_gap_round_diagnostics(
+                task_id,
+                gap_analysis,
+                base,
+                gap_round_outcome=GAP_ROUND_OUTCOME_SKIPPED,
+                skip_drafting_reason=snap_skip,
+                coverage_before=coverage_before,
+                coverage_after=cov_after,
+                search_attempted=search_attempted,
+                search_skipped_reason=search_skipped_reason,
+                search_result=search_result,
+                selected_candidate_ids=selected_candidate_ids,
+                skipped_gap_search_sources=skipped_gap_search_sources,
+                skipped_fallback_sources=skipped_fallback_sources,
+                acquisition_batch=acquisition_batch,
+                acquisition_result=acquisition_result,
+                snapshot_ids=[],
+                parse_batch=None,
+                parsing_result=None,
+                source_chunk_ids=None,
+                index_batch=None,
+                indexing_result=None,
+                drafting_result=None,
+                drafting_attempted=False,
+                verification_result=None,
+                verification_attempted=False,
+                supplemental_search_failed=False,
+                continuing_with_existing_evidence=False,
+            )
 
         parse_result = self.parsing_service.parse_snapshots(
             task_id,
@@ -682,12 +1023,25 @@ class DebugRealPipelineRunner:
             "updated": parse_result.updated,
             "skipped_existing": parse_result.skipped_existing,
             "skipped_unsupported": parse_result.skipped_unsupported,
+            "skipped_static_html_hold": parse_result.skipped_static_html_hold,
+            "skipped_no_valid_chunks": parse_result.skipped_no_valid_chunks,
             "failed": parse_result.failed,
+            "invalid_chunk_rejection_count": parse_result.invalid_chunk_rejection_count,
+            "invalid_chunk_rejection_reason_distribution": (
+                parse_result.invalid_chunk_rejection_reason_distribution or {}
+            ),
+            "snapshots_with_no_valid_chunks": parse_result.snapshots_with_no_valid_chunks,
+            "parser_invalid_output_count": parse_result.snapshots_with_no_valid_chunks,
             "parse_decisions": parse_decisions,
         }
         if not source_chunk_ids:
             round_warnings.append("Gap round parsed no source chunks.")
-            return {
+            has_any_doc = any(e.source_document is not None for e in parse_result.entries)
+            chunk_skip = (
+                SKIP_NO_SOURCE_DOCUMENTS if not has_any_doc else SKIP_NO_SOURCE_CHUNKS
+            )
+            cov_after = self._current_slot_coverage_summary(task_id)
+            base = {
                 "gap_analysis": gap_analysis,
                 "search": search_result,
                 "acquisition": acquisition_result,
@@ -696,7 +1050,7 @@ class DebugRealPipelineRunner:
                 "skipped_gap_search_sources": skipped_gap_search_sources,
                 "skipped_fallback_sources": skipped_fallback_sources,
                 "warnings": round_warnings,
-                "slot_coverage_summary": self._current_slot_coverage_summary(task_id),
+                "slot_coverage_summary": cov_after,
                 "candidate_counts": _aggregate_candidate_counts(
                     search_result=search_result,
                     fallback_sources=fallback_sources,
@@ -705,6 +1059,35 @@ class DebugRealPipelineRunner:
                     skipped_fallback_sources=skipped_fallback_sources,
                 ),
             }
+            return self._attach_gap_round_diagnostics(
+                task_id,
+                gap_analysis,
+                base,
+                gap_round_outcome=GAP_ROUND_OUTCOME_SKIPPED,
+                skip_drafting_reason=chunk_skip,
+                coverage_before=coverage_before,
+                coverage_after=cov_after,
+                search_attempted=search_attempted,
+                search_skipped_reason=search_skipped_reason,
+                search_result=search_result,
+                selected_candidate_ids=selected_candidate_ids,
+                skipped_gap_search_sources=skipped_gap_search_sources,
+                skipped_fallback_sources=skipped_fallback_sources,
+                acquisition_batch=acquisition_batch,
+                acquisition_result=acquisition_result,
+                snapshot_ids=snapshot_ids,
+                parse_batch=parse_result,
+                parsing_result=parsing_result,
+                source_chunk_ids=[],
+                index_batch=None,
+                indexing_result=None,
+                drafting_result=None,
+                drafting_attempted=False,
+                verification_result=None,
+                verification_attempted=False,
+                supplemental_search_failed=False,
+                continuing_with_existing_evidence=False,
+            )
 
         index_result = self.indexing_service.index_source_chunks(
             task_id,
@@ -712,17 +1095,21 @@ class DebugRealPipelineRunner:
             limit=len(source_chunk_ids),
         )
         indexing_result = {"indexed_count": len(index_result.indexed_chunks)}
+        drafting_precondition_failed = False
         try:
             drafting_result = self._run_draft_claims(task_id)
         except DebugPipelinePreconditionError as error:
+            drafting_precondition_failed = True
             round_warnings.append(f"Gap round produced no new draft claims: {error}")
             drafting_result = {
                 "created_claims": 0,
                 "reused_claims": 0,
                 "diagnostics": _json_safe(error.details or {}),
             }
+        verification_attempted = False
         try:
             verification_result = self._run_verify_claims(task_id)
+            verification_attempted = True
         except DebugPipelinePreconditionError as error:
             round_warnings.append(f"Gap round found no draft claims to verify: {error}")
             verification_result = {
@@ -740,7 +1127,13 @@ class DebugRealPipelineRunner:
             round_warnings.append(
                 "Required answer slots remain missing or weak after this gap round."
             )
-        return {
+        if drafting_precondition_failed:
+            gap_outcome = GAP_ROUND_OUTCOME_SKIPPED
+            gap_skip_reason = SKIP_NO_NEW_CHUNKS
+        else:
+            gap_outcome = GAP_ROUND_OUTCOME_DRAFTED
+            gap_skip_reason = None
+        base = {
             "gap_analysis": gap_analysis,
             "search": search_result,
             "acquisition": acquisition_result,
@@ -763,6 +1156,35 @@ class DebugRealPipelineRunner:
             "warnings": round_warnings,
             "query": task.query,
         }
+        return self._attach_gap_round_diagnostics(
+            task_id,
+            gap_analysis,
+            base,
+            gap_round_outcome=gap_outcome,
+            skip_drafting_reason=gap_skip_reason,
+            coverage_before=coverage_before,
+            coverage_after=slot_coverage_summary,
+            search_attempted=search_attempted,
+            search_skipped_reason=search_skipped_reason,
+            search_result=search_result,
+            selected_candidate_ids=selected_candidate_ids,
+            skipped_gap_search_sources=skipped_gap_search_sources,
+            skipped_fallback_sources=skipped_fallback_sources,
+            acquisition_batch=acquisition_batch,
+            acquisition_result=acquisition_result,
+            snapshot_ids=snapshot_ids,
+            parse_batch=parse_result,
+            parsing_result=parsing_result,
+            source_chunk_ids=source_chunk_ids,
+            index_batch=index_result,
+            indexing_result=indexing_result,
+            drafting_result=drafting_result,
+            drafting_attempted=True,
+            verification_result=verification_result,
+            verification_attempted=verification_attempted,
+            supplemental_search_failed=False,
+            continuing_with_existing_evidence=False,
+        )
 
     def _run_search(
         self,
@@ -1135,24 +1557,118 @@ class DebugRealPipelineRunner:
         parse_limit = (
             max(self.parse_limit, 4) if self._is_planner_overview_run() else self.parse_limit
         )
-        result = self.parsing_service.parse_snapshots(
-            task_id,
-            content_snapshot_ids=None,
-            limit=parse_limit,
+        start = time.monotonic()
+        batches_run = 0
+        agg_created = 0
+        agg_updated = 0
+        agg_skipped_existing = 0
+        agg_skipped_unsupported = 0
+        agg_skipped_static_html_hold = 0
+        agg_skipped_no_valid_chunks = 0
+        agg_failed = 0
+        agg_invalid_chunk = 0
+        agg_invalid_reasons: Counter[str] = Counter()
+        all_parse_decisions: list[dict[str, Any]] = []
+        first_created_plus_updated = 0
+        last_result = None
+        drain_stop_reason = "unknown"
+
+        while True:
+            batches_run += 1
+            last_result = self.parsing_service.parse_snapshots(
+                task_id,
+                content_snapshot_ids=None,
+                limit=parse_limit,
+            )
+            agg_created += last_result.created
+            agg_updated += last_result.updated
+            agg_skipped_existing += last_result.skipped_existing
+            agg_skipped_unsupported += last_result.skipped_unsupported
+            agg_skipped_static_html_hold += last_result.skipped_static_html_hold
+            agg_skipped_no_valid_chunks += last_result.skipped_no_valid_chunks
+            agg_failed += last_result.failed
+            agg_invalid_chunk += last_result.invalid_chunk_rejection_count
+            dist = last_result.invalid_chunk_rejection_reason_distribution or {}
+            for k, v in dist.items():
+                if isinstance(v, int):
+                    agg_invalid_reasons[str(k)] += v
+            all_parse_decisions.extend(
+                parse_entry_diagnostic(entry) for entry in last_result.entries
+            )
+            if batches_run == 1:
+                first_created_plus_updated = last_result.created + last_result.updated
+
+            if not self.parse_drain_enabled:
+                drain_stop_reason = "disabled"
+                break
+            if batches_run >= self.parse_drain_max_batches:
+                drain_stop_reason = "max_batches"
+                break
+            if self.parse_drain_max_seconds > 0 and (
+                time.monotonic() - start >= self.parse_drain_max_seconds
+            ):
+                drain_stop_reason = "max_seconds"
+                break
+            if self.parsing_service.count_source_documents_for_task(task_id) >= (
+                self.parse_drain_target_documents
+            ):
+                drain_stop_reason = "target_documents"
+                break
+            if last_result.created + last_result.updated == 0:
+                drain_stop_reason = "no_progress"
+                break
+            if self.parsing_service.count_eligible_snapshots_without_source_document(task_id) == 0:
+                drain_stop_reason = "fully_drained"
+                break
+
+        extra_batches = max(0, batches_run - 1)
+        extra_documents = max(0, agg_created + agg_updated - first_created_plus_updated)
+        unparsed_eligible_after = (
+            self.parsing_service.count_eligible_snapshots_without_source_document(task_id)
         )
-        parse_decisions = [parse_entry_diagnostic(entry) for entry in result.entries]
+        if self.parse_drain_enabled and unparsed_eligible_after == 0:
+            drain_stop_reason = "fully_drained"
+
+        rlimit = max(1, int(self.parse_limit))
+        parse_limit_exhausted = unparsed_eligible_after > 0 and (
+            (not self.parse_drain_enabled and unparsed_eligible_after > rlimit)
+            or (
+                self.parse_drain_enabled
+                and drain_stop_reason
+                in ("max_batches", "max_seconds", "target_documents", "no_progress")
+            )
+        )
+
         stage_result = {
-            "created": result.created,
-            "updated": result.updated,
-            "skipped_existing": result.skipped_existing,
-            "skipped_unsupported": result.skipped_unsupported,
-            "failed": result.failed,
-            "rejection_reason_distribution": _aggregate_parse_rejection_reasons(parse_decisions),
-            "parse_decisions": parse_decisions,
+            "created": agg_created,
+            "updated": agg_updated,
+            "skipped_existing": agg_skipped_existing,
+            "skipped_unsupported": agg_skipped_unsupported,
+            "skipped_static_html_hold": agg_skipped_static_html_hold,
+            "skipped_no_valid_chunks": agg_skipped_no_valid_chunks,
+            "failed": agg_failed,
+            "invalid_chunk_rejection_count": agg_invalid_chunk,
+            "invalid_chunk_rejection_reason_distribution": dict(
+                sorted(agg_invalid_reasons.items())
+            ),
+            "snapshots_with_no_valid_chunks": agg_skipped_no_valid_chunks,
+            "parser_invalid_output_count": agg_skipped_no_valid_chunks,
+            "rejection_reason_distribution": _aggregate_parse_rejection_reasons(
+                all_parse_decisions
+            ),
+            "parse_decisions": all_parse_decisions,
+            "parse_drain_enabled": self.parse_drain_enabled,
+            "parse_drain_batches_run": batches_run,
+            "parse_drain_extra_batches": extra_batches,
+            "parse_drain_extra_documents": extra_documents,
+            "parse_drain_created_documents": agg_created + agg_updated,
+            "parse_drain_stop_reason": drain_stop_reason,
+            "eligible_snapshots_without_source_document": unparsed_eligible_after,
+            "parse_limit_exhausted": parse_limit_exhausted,
         }
-        if result.created + result.updated + result.skipped_existing <= 0:
+        if agg_created + agg_updated + agg_skipped_existing <= 0:
             raise DebugPipelinePreconditionError(
-                _format_parse_no_documents_message(parse_decisions),
+                _format_parse_no_documents_message(all_parse_decisions),
                 details=stage_result,
             )
         return stage_result
@@ -1619,16 +2135,23 @@ class DebugRealPipelineRunner:
                 "stages_completed": list(stages_completed),
             },
         )
+        payload: dict[str, Any] = {
+            **self._pipeline_payload(from_status=task.status, to_status=task.status),
+            "stage": stage,
+            "result": _json_safe(stage_result),
+            "counts": _counts_to_dict(self._safe_counts(task_id)),
+            "warnings": _stage_warnings(stage_result),
+        }
+        if stage == STAGE_RESEARCHING_MORE and isinstance(stage_result, dict):
+            gap_diag = stage_result.get("gap_round_diagnostics")
+            if isinstance(gap_diag, dict):
+                payload["gap_round_outcome"] = gap_diag.get("gap_round_outcome")
+                payload["skip_drafting_reason"] = gap_diag.get("skip_drafting_reason")
+                payload["gap_round_index"] = gap_diag.get("gap_round_index")
         self._record_event(
             task_id,
             self._event_type("stage_completed"),
-            {
-                **self._pipeline_payload(from_status=task.status, to_status=task.status),
-                "stage": stage,
-                "result": _json_safe(stage_result),
-                "counts": _counts_to_dict(self._safe_counts(task_id)),
-                "warnings": _stage_warnings(stage_result),
-            },
+            payload,
             run_id=run.id,
         )
         self.session.commit()
@@ -2592,6 +3115,70 @@ def _gap_analysis_payload_from_strategy(
     }
 
 
+def _maybe_suppress_strategist_gap_continue_for_coverage_alignment(
+    analysis_payload: dict[str, Any],
+    *,
+    coverage_evaluation: dict[str, Any],
+    slot_coverage_summary: list[dict[str, Any]],
+    strategy_payload: dict[str, Any] | None,
+    research_loop_enabled: bool,
+    research_loop_strategist_shadow_mode: bool,
+) -> dict[str, Any]:
+    """
+    If the LLM strategist requests ``continue_search`` but required coverage is already
+    sufficient (overall ``sufficient``) and only optional weak slots remain, skip the
+    supplemental gap search round by default.
+
+    Quality-gate-driven follow-ups (``report_quality_gate_insufficient``) still run because
+    this runs before the quality gate merge and only mutates strategist-triggered payloads.
+    """
+    if not research_loop_enabled or research_loop_strategist_shadow_mode:
+        return analysis_payload
+    if strategy_payload is None:
+        return analysis_payload
+    if strategy_payload.get("status") not in {"used", "fallback"}:
+        return analysis_payload
+    if strategy_payload.get("decision") != "continue_search":
+        return analysis_payload
+    planned = strategy_payload.get("planned_queries") or []
+    if not planned:
+        return analysis_payload
+    if not analysis_payload.get("triggered"):
+        return analysis_payload
+    if coverage_evaluation.get("overall_status") != "sufficient":
+        return analysis_payload
+    miss_eval = coverage_evaluation.get("required_slots_missing") or []
+    weak_eval = coverage_evaluation.get("required_slots_weak") or []
+    if miss_eval or weak_eval:
+        return analysis_payload
+    for slot in slot_coverage_summary:
+        if slot.get("required") is True and slot.get("status") in {"missing", "weak"}:
+            return analysis_payload
+    fallback = analysis_payload.get("fallback_gap_analysis")
+    base = fallback if isinstance(fallback, dict) else analysis_payload
+    if base.get("required_slots_missing") or base.get("required_slots_weak"):
+        return analysis_payload
+
+    out = dict(analysis_payload)
+    out["triggered"] = False
+    out["reason"] = COVERAGE_SUFFICIENT_OPTIONAL_WEAK_ONLY_STOP
+    out["supplemental_queries"] = []
+    out["loop_stop_reason"] = COVERAGE_SUFFICIENT_OPTIONAL_WEAK_ONLY_STOP
+    out["coverage_alignment"] = {
+        "suppressed_strategist_decision": "continue_search",
+        "stop_reason": COVERAGE_SUFFICIENT_OPTIONAL_WEAK_ONLY_STOP,
+        "prior_gap_reason": analysis_payload.get("reason"),
+        "prior_strategy_status": strategy_payload.get("status"),
+    }
+    warns = list(out.get("warnings") or [])
+    warns.append(
+        "Strategist requested continue_search, but coverage is sufficient with only optional "
+        "weak slots remaining; skipping supplemental gap search round."
+    )
+    out["warnings"] = warns
+    return out
+
+
 def _gap_analysis_payload_from_quality_gate(
     fallback_gap_analysis: dict[str, Any],
     quality_gate: dict[str, Any],
@@ -3116,23 +3703,36 @@ def _select_gap_search_candidate_ids(
     }
     selected: list[UUID] = []
     skipped: list[dict[str, Any]] = []
+    seen_ids: set[UUID] = set()
     for source in search_result.get("selected_sources", []):
         if not isinstance(source, dict):
             continue
         raw_id = source.get("candidate_url_id")
-        if not isinstance(raw_id, str):
-            skipped.append({**source, "skip_reason": "missing_candidate_url_id"})
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            skipped.append({**source, "skip_reason": GAP_SEARCH_SKIP_MISSING_CANDIDATE_ID})
+            continue
+        try:
+            cand_uuid = UUID(raw_id.strip())
+        except (ValueError, TypeError):
+            skipped.append({**source, "skip_reason": GAP_SEARCH_SKIP_INVALID_CANDIDATE_ID})
+            continue
+        if cand_uuid in seen_ids:
+            skipped.append({**source, "skip_reason": GAP_SEARCH_SKIP_DUPLICATE_IN_ROUND})
             continue
         category = str(source.get("source_category") or "")
         raw_priority = source.get("fetch_priority_score")
         priority = raw_priority if isinstance(raw_priority, int) else 50
-        if category not in high_value_categories or priority >= 35:
-            skipped.append({**source, "skip_reason": "low_value_gap_search_result"})
+        if category not in high_value_categories:
+            skipped.append({**source, "skip_reason": GAP_SEARCH_SKIP_CATEGORY_NOT_ALLOWED})
+            continue
+        if priority >= 35:
+            skipped.append({**source, "skip_reason": GAP_SEARCH_SKIP_PRIORITY_TOO_LOW})
             continue
         if len(selected) >= limit:
             skipped.append({**source, "skip_reason": "gap_search_limit_reached"})
             continue
-        selected.append(UUID(raw_id))
+        selected.append(cand_uuid)
+        seen_ids.add(cand_uuid)
     return selected, skipped
 
 
@@ -4091,6 +4691,11 @@ def _aggregate_candidate_counts(
         if s.get("skip_reason")
         in {
             "low_value_gap_search_result",
+            GAP_SEARCH_SKIP_CATEGORY_NOT_ALLOWED,
+            GAP_SEARCH_SKIP_PRIORITY_TOO_LOW,
+            GAP_SEARCH_SKIP_MISSING_CANDIDATE_ID,
+            GAP_SEARCH_SKIP_INVALID_CANDIDATE_ID,
+            GAP_SEARCH_SKIP_DUPLICATE_IN_ROUND,
             "low_priority_for_overview_supplemental_acquisition",
             "not_a_high_value_supplemental_source",
         }

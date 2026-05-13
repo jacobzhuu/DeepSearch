@@ -16,6 +16,7 @@ try:
         ApiError,
         evaluate_deployment_acceptance,
         get_profiles,
+        print_gap_loop_summary_to_stdout,
         print_json,
         run_live_acceptance,
         write_artifacts,
@@ -27,6 +28,7 @@ except ModuleNotFoundError:
         ApiError,
         evaluate_deployment_acceptance,
         get_profiles,
+        print_gap_loop_summary_to_stdout,
         print_json,
         run_live_acceptance,
         write_artifacts,
@@ -61,6 +63,7 @@ def main() -> int:
         )
 
     print_json(result["acceptance"])
+    print_gap_loop_summary_to_stdout(result.get("gap_summary") or {})
     return 0 if result["acceptance"]["passed"] else 1
 
 

@@ -456,6 +456,56 @@ def test_chunk_quality_marks_explanatory_paragraph_eligible() -> None:
     assert quality.information_density_score >= 0.35
 
 
+def test_chunk_quality_marks_short_leading_share_comment_ui_as_boilerplate_like() -> None:
+    quality = assess_chunk_quality(
+        text=(
+            "Skip to content / 分享此文章 / 收件人的邮箱地址 / 您的名字 / "
+            "Comments / 邮件已发送"
+        ),
+        query="NVIDIA open model ecosystem releases",
+        source_quality_score=0.92,
+        parsed_metadata={},
+        chunk_no=0,
+        page_title="NVIDIA Technical Blog",
+    )
+
+    assert quality.is_boilerplate_like is True
+    assert quality.eligible_for_claims is False
+    assert quality.content_quality == "low"
+    assert "leading_boilerplate_like" in quality.reasons
+
+
+def test_chunk_quality_preserves_short_meaningful_leading_summary() -> None:
+    quality = assess_chunk_quality(
+        text="NVIDIA Blackwell is a GPU architecture for accelerated computing.",
+        query="NVIDIA Blackwell GPU architecture",
+        source_quality_score=0.92,
+        parsed_metadata={},
+        chunk_no=0,
+        page_title="NVIDIA Blackwell GPU architecture",
+    )
+
+    assert quality.is_boilerplate_like is False
+    assert quality.eligible_for_claims is True
+    assert quality.content_quality_score >= 0.35
+
+
+def test_chunk_quality_keeps_short_cjk_meaningful_paragraph_from_low_density_rejection() -> None:
+    quality = assess_chunk_quality(
+        text="英伟达发布了用于开源模型训练的新工具。",
+        query="英伟达 开源模型生态",
+        source_quality_score=0.92,
+        parsed_metadata={},
+        chunk_no=0,
+        page_title="英伟达开源模型工具",
+    )
+
+    assert quality.is_boilerplate_like is False
+    assert quality.eligible_for_claims is True
+    assert quality.information_density_score >= 0.35
+    assert "low_information_density" not in quality.reasons
+
+
 def test_chunk_quality_keeps_references_heading_chunk_ineligible() -> None:
     quality = assess_chunk_quality(
         text=(

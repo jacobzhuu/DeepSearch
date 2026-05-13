@@ -556,6 +556,8 @@ class ParsingService:
                 query=task.query,
                 source_quality_score=source_quality.score,
                 parsed_metadata=parsed_content.metadata,
+                chunk_no=parsed_chunk.chunk_no,
+                page_title=parsed_content.title or candidate_url.title,
             )
             metadata.update(
                 {
@@ -615,6 +617,7 @@ class ParsingService:
                     "information_density_score": chunk_quality.information_density_score,
                     "eligible_for_claims": chunk_quality.eligible_for_claims,
                     "should_generate_claims": chunk_quality.eligible_for_claims,
+                    "is_boilerplate_like": chunk_quality.is_boilerplate_like,
                     "is_navigation_noise": chunk_quality.is_navigation_noise,
                     "is_reference_section": chunk_quality.is_reference_section,
                     "is_diagram_or_config_section": chunk_quality.is_diagram_or_config_section,

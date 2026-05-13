@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+", re.UNICODE)
+_CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _STOPWORDS = {
     "a",
     "an",
@@ -51,6 +52,36 @@ _NAVIGATION_PHRASES = (
     "cookie policy",
     "terms of use",
     "navigation menu",
+)
+_LEADING_UI_BOILERPLATE_PHRASES = (
+    "add a comment",
+    "comment",
+    "comments",
+    "copy link",
+    "email address",
+    "email sent",
+    "leave a comment",
+    "mail sent",
+    "print",
+    "recipient email",
+    "required fields",
+    "share",
+    "share this article",
+    "sign in",
+    "sign up",
+    "skip to content",
+    "subscribe",
+    "your email",
+    "your name",
+    "分享",
+    "分享此文章",
+    "评论",
+    "跳至内容",
+    "收件人的邮箱地址",
+    "您的名字",
+    "你的名字",
+    "邮件已发送",
+    "电子邮件地址",
 )
 _POINTER_PROJECT_META_PHRASES = (
     "developer documentation",
@@ -146,6 +177,7 @@ class ChunkQuality:
     boilerplate_score: float
     information_density_score: float
     eligible_for_claims: bool
+    is_boilerplate_like: bool
     is_navigation_noise: bool
     is_reference_section: bool
     is_diagram_or_config_section: bool
@@ -272,6 +304,8 @@ def assess_chunk_quality(
     query: str,
     source_quality_score: float,
     parsed_metadata: dict[str, object] | None = None,
+    chunk_no: int | None = None,
+    page_title: str | None = None,
 ) -> ChunkQuality:
     metadata = parsed_metadata or {}
     normalized = " ".join(text.split())
@@ -289,12 +323,31 @@ def assess_chunk_quality(
     ) and _looks_like_deployment_code_or_config(normalized)
     if is_deployment_code_or_config:
         is_diagram_or_config_section = False
+    title_or_query_overlap = _has_title_or_query_overlap(
+        normalized,
+        query=query,
+        page_title=page_title,
+    )
+    substantive_short_signal = _looks_like_substantive_short_sentence(normalized)
+    protected_short_meaningful = len(normalized) < 48 and (
+        title_or_query_overlap or substantive_short_signal
+    )
+    is_boilerplate_like = _looks_like_low_density_leading_boilerplate(
+        normalized,
+        lower,
+        chunk_no=chunk_no,
+        title_or_query_overlap=title_or_query_overlap,
+    )
     boilerplate_score = _boilerplate_score(lower)
+    if is_boilerplate_like:
+        boilerplate_score = max(boilerplate_score, 0.72)
     query_relevance_score = _query_relevance_score(normalized, query)
     information_density_score = _chunk_information_density_score(normalized)
     explanatory_score = 0.16 if _contains_explanatory_terms(lower) else 0.0
     paragraph_score = 0.08 if _looks_like_prose(normalized) else 0.0
-    length_penalty = 0.22 if len(normalized) < 48 else 0.0
+    if protected_short_meaningful:
+        paragraph_score = max(paragraph_score, 0.08)
+    length_penalty = 0.0 if protected_short_meaningful else 0.22 if len(normalized) < 48 else 0.0
     repetition_penalty = 0.12 if _has_high_repetition(normalized) else 0.0
 
     if redirect_stub:
@@ -310,7 +363,11 @@ def assess_chunk_quality(
         reasons.append("diagram_or_config_section")
     if is_deployment_code_or_config:
         reasons.append("deployment_code_or_config")
-    if len(normalized) < 48:
+    if is_boilerplate_like:
+        reasons.append("leading_boilerplate_like")
+    if protected_short_meaningful:
+        reasons.append("short_meaningful_content")
+    elif len(normalized) < 48:
         reasons.append("very_short")
     if repetition_penalty:
         reasons.append("high_repetition")
@@ -330,6 +387,8 @@ def assess_chunk_quality(
         score = min(score, 0.12)
     if is_reference_section or is_navigation_noise:
         score = min(score, 0.24)
+    if is_boilerplate_like:
+        score = min(score, 0.3)
     if is_diagram_or_config_section:
         score = min(score, 0.18)
     if is_deployment_code_or_config:
@@ -341,8 +400,9 @@ def assess_chunk_quality(
         and not redirect_stub
         and not is_reference_section
         and not is_navigation_noise
+        and not is_boilerplate_like
         and not is_diagram_or_config_section
-        and (len(normalized) >= 48 or is_deployment_code_or_config)
+        and (len(normalized) >= 48 or is_deployment_code_or_config or protected_short_meaningful)
     )
     if eligible:
         quality = "high" if score >= 0.72 else "medium"
@@ -361,6 +421,7 @@ def assess_chunk_quality(
         boilerplate_score=round(boilerplate_score, 2),
         information_density_score=round(information_density_score, 2),
         eligible_for_claims=eligible,
+        is_boilerplate_like=is_boilerplate_like,
         is_navigation_noise=is_navigation_noise,
         is_reference_section=is_reference_section,
         is_diagram_or_config_section=is_diagram_or_config_section,
@@ -375,10 +436,14 @@ def _tokenize(value: str) -> tuple[str, ...]:
 
 def _query_relevance_score(text: str, query: str) -> float:
     query_tokens = [token for token in dict.fromkeys(_tokenize(query)) if token not in _STOPWORDS]
+    cjk_score = _cjk_overlap_score(text, query)
     if not query_tokens:
-        return 0.0
+        return cjk_score
     text_tokens = set(_tokenize(text))
-    return len([token for token in query_tokens if token in text_tokens]) / len(query_tokens)
+    token_score = len([token for token in query_tokens if token in text_tokens]) / len(
+        query_tokens
+    )
+    return max(token_score, cjk_score)
 
 
 def _boilerplate_score(lower_text: str) -> float:
@@ -492,7 +557,15 @@ def _parse_datetime(value: object) -> datetime | None:
 def _chunk_information_density_score(text: str) -> float:
     tokens = _tokenize(text)
     if not tokens:
-        return 0.0
+        cjk_chars = _cjk_chars(text)
+        if not cjk_chars:
+            return 0.0
+        char_count = len(cjk_chars)
+        unique_ratio = len(set(cjk_chars)) / char_count
+        length_score = min(char_count / 120, 1.0)
+        sentence_signal = 0.2 if _looks_like_prose(text) else 0.0
+        score = (unique_ratio * 0.42) + (length_score * 0.38) + sentence_signal
+        return min(1.0, max(0.0, score))
     token_count = len(tokens)
     unique_ratio = len(set(tokens)) / token_count
     length_score = min(token_count / 90, 1.0)
@@ -540,6 +613,106 @@ def _looks_like_navigation_noise(lower_text: str) -> bool:
         for term in ("menu", "sidebar", "navigation", "footer", "privacy", "cookie", "edit")
     )
     return token_count <= 80 and nav_token_hits / token_count >= 0.12
+
+
+def _looks_like_low_density_leading_boilerplate(
+    text: str,
+    lower_text: str,
+    *,
+    chunk_no: int | None,
+    title_or_query_overlap: bool,
+) -> bool:
+    if chunk_no != 0 or not text or len(text) > 260 or title_or_query_overlap:
+        return False
+    marker_hits = sum(1 for phrase in _LEADING_UI_BOILERPLATE_PHRASES if phrase in lower_text)
+    if marker_hits < 2:
+        return False
+    token_count = len(_tokenize(text))
+    cjk_count = len(_cjk_chars(text))
+    content_units = max(1.0, token_count + (cjk_count / 2.0))
+    marker_density = marker_hits / content_units
+    if marker_hits >= 4:
+        return True
+    return marker_density >= 0.16 and not _looks_like_substantive_short_sentence(text)
+
+
+def _has_title_or_query_overlap(text: str, *, query: str, page_title: str | None) -> bool:
+    lower_text = text.lower()
+    if _query_relevance_score(text, query) >= 0.25:
+        return True
+    query_terms = [
+        token for token in _tokenize(query) if len(token) >= 4 and token not in _STOPWORDS
+    ]
+    if any(term in lower_text for term in query_terms):
+        return True
+    if _cjk_overlap_score(text, query) >= 0.18:
+        return True
+    if not page_title:
+        return False
+    title = page_title.strip()
+    lower_title = title.lower()
+    if len(title) >= 8 and (lower_text in lower_title or lower_title in lower_text):
+        return True
+    title_terms = [
+        token for token in _tokenize(title) if len(token) >= 4 and token not in _STOPWORDS
+    ]
+    if title_terms and any(term in lower_text for term in title_terms):
+        return True
+    return _cjk_overlap_score(text, title) >= 0.18
+
+
+def _looks_like_substantive_short_sentence(text: str) -> bool:
+    if len(text) < 20 or not any(mark in text for mark in (".", "。", "!", "！")):
+        return False
+    lower = text.lower()
+    tokens = _tokenize(text)
+    if len(tokens) >= 6 and (
+        _contains_explanatory_terms(lower)
+        or any(token.endswith(("ed", "es", "ing")) for token in tokens)
+    ):
+        return True
+    cjk_chars = _cjk_chars(text)
+    if len(cjk_chars) >= 10:
+        return any(
+            marker in text
+            for marker in (
+                "是",
+                "为",
+                "发布",
+                "宣布",
+                "推出",
+                "支持",
+                "提供",
+                "用于",
+                "可以",
+                "能够",
+                "包括",
+                "显示",
+            )
+        )
+    return False
+
+
+def _cjk_chars(value: str) -> list[str]:
+    return _CJK_PATTERN.findall(value)
+
+
+def _cjk_overlap_score(text: str, query: str) -> float:
+    query_chars = _cjk_chars(query)
+    if len(query_chars) < 2:
+        return 0.0
+    query_bigrams = {
+        left + right for left, right in zip(query_chars, query_chars[1:], strict=False)
+    }
+    if not query_bigrams:
+        return 0.0
+    text_chars = _cjk_chars(text)
+    text_bigrams = {
+        left + right for left, right in zip(text_chars, text_chars[1:], strict=False)
+    }
+    if not text_bigrams:
+        return 0.0
+    return len(query_bigrams & text_bigrams) / len(query_bigrams)
 
 
 def _looks_like_pointer_or_project_meta_noise(lower_text: str) -> bool:

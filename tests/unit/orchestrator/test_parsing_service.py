@@ -183,6 +183,53 @@ def test_parsing_service_creates_source_document_and_chunks(
     assert chunks[0].metadata_json["extracted_text_length"] >= len("Alpha.")
 
 
+def test_parsing_service_records_leading_share_comment_ui_chunk_quality(
+    db_session: Session,
+    tmp_path: Path,
+) -> None:
+    html = """
+    <html>
+      <head><title>NVIDIA Technical Blog</title></head>
+      <body>
+        <main>
+          <article>
+            <p>
+              Skip to content / 分享此文章 / 收件人的邮箱地址 / 您的名字 /
+              Comments / 邮件已发送
+            </p>
+          </article>
+        </main>
+      </body>
+    </html>
+    """.encode()
+    content_snapshot, source_document_repo, source_chunk_repo = _seed_snapshot(
+        db_session,
+        snapshot_root=tmp_path,
+        query="NVIDIA open model ecosystem releases",
+        canonical_url="https://blogs.nvidia.com/example",
+        content=html,
+    )
+    service = create_parsing_service(
+        db_session,
+        snapshot_object_store=FilesystemSnapshotObjectStore(root_directory=str(tmp_path)),
+    )
+
+    result = service.parse_snapshots(
+        content_snapshot.fetch_attempt.fetch_job.task_id,
+        content_snapshot_ids=[content_snapshot.id],
+        limit=1,
+    )
+
+    source_document = source_document_repo.get_for_content_snapshot(content_snapshot.id)
+    assert result.created == 1
+    assert source_document is not None
+    chunks = source_chunk_repo.list_for_document(source_document.id)
+    assert len(chunks) == 1
+    assert chunks[0].metadata_json["is_boilerplate_like"] is True
+    assert chunks[0].metadata_json["eligible_for_claims"] is False
+    assert "leading_boilerplate_like" in chunks[0].metadata_json["quality_reasons"]
+
+
 def test_parsing_service_skips_static_html_parse_hold_without_source_document(
     db_session: Session,
     tmp_path: Path,

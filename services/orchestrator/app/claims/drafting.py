@@ -659,6 +659,9 @@ def score_claim_statement(
         query_relevance=query_relevance,
         intent=intent,
         target_slot_id=target_slot_id,
+        query=query,
+        statement=normalized,
+        page_title=page_title,
     )
     source_suitability = _compute_source_suitability(
         domain=domain,
@@ -1559,6 +1562,51 @@ def _extract_subject_terms(query: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(proper_terms[:2]))
 
 
+def _is_strict_zero_query_overlap(
+    *,
+    query: str | None,
+    statement: str | None,
+    page_title: str | None,
+) -> bool:
+    """Return True when the query carries meaningful ASCII tokens that
+    appear in neither the statement nor the page title (by token match or
+    substring match), AND the statement itself has ASCII content we can
+    actually compare against.
+
+    Used by the generic-intent branch of ``_compute_query_answer_score`` to
+    skip the 0.45 score floor in the strict off-topic case. The function is
+    intentionally conservative: when we lack a comparable signal (no
+    meaningful query tokens, or a CJK-only statement that the ASCII tokenizer
+    cannot see), it returns False so the existing floor still applies.
+    """
+
+    query_tokens = set(_meaningful_query_tokens(query))
+    if not query_tokens:
+        return False
+
+    statement_value = statement or ""
+    title_value = page_title or ""
+
+    statement_tokens = set(_tokenize(statement_value))
+    title_tokens = set(_tokenize(title_value))
+    if query_tokens & (statement_tokens | title_tokens):
+        return False
+
+    lower_statement = statement_value.lower()
+    lower_title = title_value.lower()
+    if any(token in lower_statement or token in lower_title for token in query_tokens):
+        return False
+
+    # Only treat the candidate as strictly off-topic when the statement carries
+    # at least one ASCII alphanumeric token of its own; otherwise the
+    # tokenizer cannot read the statement (e.g. CJK-only sentences) and we
+    # should not punish it on missing English overlap alone.
+    if not statement_tokens:
+        return False
+
+    return True
+
+
 def _compute_query_relevance_score(
     statement: str,
     *,
@@ -1627,10 +1675,22 @@ def _compute_query_answer_score(
     query_relevance: float,
     intent: QueryIntent,
     target_slot_id: str | None = None,
+    query: str | None = None,
+    statement: str | None = None,
+    page_title: str | None = None,
 ) -> float:
     if intent.intent_name == "generic":
         if category in intent.avoid_claim_types:
             return 0.15
+        # Generic intent normally floors the answer score at 0.45 so claims
+        # with weak literal overlap (e.g. pronoun-led continuations) survive.
+        # When the query carries meaningful topical tokens and *none* of them
+        # appear in either the statement or the page title, the floor turns
+        # an off-topic sentence into an "answer-relevant" candidate. Detect
+        # that strict zero-overlap case and skip the floor so the standard
+        # MIN_DRAFT_QUERY_ANSWER_SCORE gate filters the candidate out.
+        if _is_strict_zero_query_overlap(query=query, statement=statement, page_title=page_title):
+            return _clamp_score(query_relevance)
         return _clamp_score(max(query_relevance, 0.45))
 
     expected_scores = {

@@ -574,3 +574,48 @@ def test_docker_exec_root_is_troubleshooting_not_security() -> None:
     assert slot_ids == ("deployment_troubleshooting",)
     assert "deployment_troubleshooting" in slot_ids
     assert "deployment_security" not in slot_ids
+
+
+def test_generic_intent_zero_overlap_off_topic_sentence_is_not_answer_relevant() -> None:
+    # Reproduces the failure mode from task 2ee01a1c-... where the generic
+    # intent floor of 0.45 made a PubMed sentence about HIV pharmacology pass
+    # the answer-relevance gate for a question about NVIDIA's open-source
+    # ecosystem.
+    query = "近30天 NVIDIA在开源模型生态上的关键发布与影响"
+    off_topic_statement = (
+        "To compare time to suicidality with efavirenz-containing versus "
+        "efavirenz-free antiretroviral regimens for initial treatment of HIV."
+    )
+    page_title = (
+        "Association between efavirenz as initial therapy for HIV-1 infection "
+        "and increased risk for suicidal ideation or attempted or completed suicide."
+    )
+
+    score = score_claim_statement(
+        statement=off_topic_statement,
+        query=query,
+        page_title=page_title,
+    )
+
+    intent = classify_query_intent(query)
+    assert intent.intent_name == "generic"
+    assert score.query_relevance_score == 0.0
+    assert score.query_answer_score < 0.35
+    assert score.answer_relevant is False
+
+
+def test_generic_intent_keeps_floor_when_query_token_appears_in_title() -> None:
+    # A page whose title carries the query subject should not be punished even
+    # when the individual sentence lacks any overlap, so pronoun-led
+    # continuations remain answer-relevant under generic intent.
+    query = "近30天 NVIDIA在开源模型生态上的关键发布与影响"
+    pronoun_statement = "It runs on commodity hardware and is widely deployed."
+    page_title = "NVIDIA open source release overview"
+
+    score = score_claim_statement(
+        statement=pronoun_statement,
+        query=query,
+        page_title=page_title,
+    )
+
+    assert score.query_answer_score >= 0.35

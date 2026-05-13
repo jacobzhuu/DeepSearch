@@ -18,6 +18,31 @@ SEARXNG_RESILIENT_FALLBACK_ENGINES: tuple[str, ...] = (
     "semantic scholar",
 )
 
+# site: filters are a Web-search idiom honoured by general engines (Brave,
+# Google, DuckDuckGo, ...). The resilient fallback only hits academic / code
+# engines (Wikipedia, arXiv, Semantic Scholar, GitHub, PyPI) which do not
+# honour `site:` and treat it as literal text -- this degrades the retry into
+# matching the literal token "site" against unrelated abstracts. Strip these
+# operators before issuing the fallback request so the academic engines see a
+# clean topical query, and record the strip so callers can see what changed.
+_SITE_OPERATOR_PATTERN = re.compile(r"(?:^|\s)-?site:\S+", re.IGNORECASE)
+
+
+def _strip_site_operators(query_text: str) -> tuple[str, tuple[str, ...]]:
+    """Return ``(cleaned_query, stripped_operators)``.
+
+    The cleaned query is collapsed-whitespace; ``stripped_operators`` is the
+    tuple of raw matches in order (without leading whitespace). When no
+    operators are found the original query is returned unchanged.
+    """
+
+    matches = _SITE_OPERATOR_PATTERN.findall(query_text)
+    if not matches:
+        return query_text, ()
+    stripped = _SITE_OPERATOR_PATTERN.sub(" ", query_text)
+    cleaned = re.sub(r"\s+", " ", stripped).strip()
+    return cleaned, tuple(match.strip() for match in matches)
+
 
 @dataclass(frozen=True)
 class SearchRequest:
@@ -297,10 +322,13 @@ class SearXNGSearchProvider:
         except SearchProviderError as error:
             if not _should_retry_with_resilient_engines(error, request=request):
                 raise
+            cleaned_query, stripped_site_operators = _strip_site_operators(request.query_text)
             fallback_params = {
                 **request_params,
                 "engines": ",".join(SEARXNG_RESILIENT_FALLBACK_ENGINES),
             }
+            if stripped_site_operators:
+                fallback_params["q"] = cleaned_query
             try:
                 payload = self._perform_request(fallback_params)
             except SearchProviderError as fallback_error:
@@ -310,6 +338,13 @@ class SearXNGSearchProvider:
                 "fallback_after_provider_error": error.to_payload(),
                 "fallback_source_engines": list(SEARXNG_RESILIENT_FALLBACK_ENGINES),
             }
+            if stripped_site_operators:
+                fallback_metadata["fallback_query_rewrites"] = {
+                    "original_query": request.query_text,
+                    "fallback_query": cleaned_query,
+                    "stripped_site_operators": list(stripped_site_operators),
+                    "rewrite_reason": "site_operator_stripped_for_academic_only_fallback",
+                }
         raw_results = payload.get("results", [])
         if not isinstance(raw_results, list):
             raw_results = []

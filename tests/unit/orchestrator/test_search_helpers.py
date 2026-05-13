@@ -346,6 +346,102 @@ def test_searxng_provider_retries_empty_unresponsive_general_search_with_resilie
     assert "stackoverflow" not in response.metadata["fallback_source_engines"]
 
 
+def test_searxng_provider_strips_site_operators_when_falling_back_to_academic_engines() -> None:
+    seen_queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_queries.append(dict(request.url.params).get("q", ""))
+        if "engines=" not in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [],
+                    "unresponsive_engines": [["duckduckgo", "CAPTCHA"]],
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "number_of_results": 1,
+                "results": [
+                    {
+                        "url": "https://arxiv.org/abs/2604.17187",
+                        "title": "Open weights paper",
+                        "content": "Discussion of open weights research.",
+                        "engine": "arxiv",
+                        "category": "science",
+                    }
+                ],
+                "unresponsive_engines": [],
+            },
+            request=request,
+        )
+
+    provider = SearXNGSearchProvider(
+        base_url="http://searxng.test",
+        timeout_seconds=5.0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    original_query = "NVIDIA open weights model 2026 site:blogs.nvidia.com -site:reddit.com"
+    response = provider.search(SearchRequest(query_text=original_query, language=None, limit=5))
+
+    assert len(seen_queries) == 2
+    assert seen_queries[0] == original_query
+    assert seen_queries[1] == "NVIDIA open weights model 2026"
+
+    rewrites = response.metadata["fallback_query_rewrites"]
+    assert rewrites["original_query"] == original_query
+    assert rewrites["fallback_query"] == "NVIDIA open weights model 2026"
+    assert set(rewrites["stripped_site_operators"]) == {
+        "site:blogs.nvidia.com",
+        "-site:reddit.com",
+    }
+    assert rewrites["rewrite_reason"] == "site_operator_stripped_for_academic_only_fallback"
+
+
+def test_searxng_fallback_without_site_operators_does_not_emit_rewrite_metadata() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "engines=" not in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [],
+                    "unresponsive_engines": [["duckduckgo", "CAPTCHA"]],
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "number_of_results": 1,
+                "results": [
+                    {
+                        "url": "https://example.test/a",
+                        "title": "ok",
+                        "content": "ok",
+                        "engine": "github",
+                    }
+                ],
+                "unresponsive_engines": [],
+            },
+            request=request,
+        )
+
+    provider = SearXNGSearchProvider(
+        base_url="http://searxng.test",
+        timeout_seconds=5.0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = provider.search(
+        SearchRequest(query_text="open source research", language=None, limit=5)
+    )
+
+    assert "fallback_query_rewrites" not in response.metadata
+
+
 def test_searxng_provider_wraps_read_timeout_as_search_provider_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)

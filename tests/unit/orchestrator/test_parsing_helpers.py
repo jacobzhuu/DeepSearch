@@ -459,8 +459,7 @@ def test_chunk_quality_marks_explanatory_paragraph_eligible() -> None:
 def test_chunk_quality_marks_short_leading_share_comment_ui_as_boilerplate_like() -> None:
     quality = assess_chunk_quality(
         text=(
-            "Skip to content / 分享此文章 / 收件人的邮箱地址 / 您的名字 / "
-            "Comments / 邮件已发送"
+            "Skip to content / 分享此文章 / 收件人的邮箱地址 / 您的名字 / " "Comments / 邮件已发送"
         ),
         query="NVIDIA open model ecosystem releases",
         source_quality_score=0.92,

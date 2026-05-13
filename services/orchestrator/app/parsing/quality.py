@@ -440,9 +440,7 @@ def _query_relevance_score(text: str, query: str) -> float:
     if not query_tokens:
         return cjk_score
     text_tokens = set(_tokenize(text))
-    token_score = len([token for token in query_tokens if token in text_tokens]) / len(
-        query_tokens
-    )
+    token_score = len([token for token in query_tokens if token in text_tokens]) / len(query_tokens)
     return max(token_score, cjk_score)
 
 
@@ -707,9 +705,7 @@ def _cjk_overlap_score(text: str, query: str) -> float:
     if not query_bigrams:
         return 0.0
     text_chars = _cjk_chars(text)
-    text_bigrams = {
-        left + right for left, right in zip(text_chars, text_chars[1:], strict=False)
-    }
+    text_bigrams = {left + right for left, right in zip(text_chars, text_chars[1:], strict=False)}
     if not text_bigrams:
         return 0.0
     return len(query_bigrams & text_bigrams) / len(query_bigrams)

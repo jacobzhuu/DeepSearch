@@ -723,6 +723,9 @@ class ReportSynthesisService:
         report_writer = {
             **report_writer,
             "report_filter_summary": dict(report_filter_counts),
+            "critic_result": rendered.critic_result or {},
+            "synthesis_plan": rendered.synthesis_plan or {},
+            "redundancy_clusters": rendered.redundancy_clusters or [],
         }
         finalized_focus = _finalize_report_focus_diagnostics(focus_diag)
         return PreparedReport(

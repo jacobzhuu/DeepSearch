@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from urllib.parse import urlsplit
-import pytest
-from services.orchestrator.app.claims import classify_query_intent, score_claim_statement, is_claimable_statement
+from services.orchestrator.app.claims import classify_query_intent, score_claim_statement
 from services.orchestrator.app.parsing.quality import assess_source_quality
 
 def test_news_intent_classification() -> None:

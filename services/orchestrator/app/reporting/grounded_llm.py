@@ -31,6 +31,7 @@ class GroundedLLMReportValidationError(ValueError):
 
 
 _CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_EVIDENCE_ANCHOR_NUM = re.compile(r"^e(\d+)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class _GroundedItem:
     claim_ids: tuple[str, ...]
     claim_evidence_ids: tuple[str, ...]
     citation_span_ids: tuple[str, ...]
+    support_type: str = "direct_evidence"
 
 
 def render_grounded_llm_report(
@@ -97,7 +99,7 @@ def render_grounded_llm_report(
         )
     )
     payload = _parse_json_object(response.text)
-    rendered = _render_validated_llm_payload(
+    rendered, llm_sidecar = _render_validated_llm_payload(
         payload,
         task_id=task_id,
         research_question=research_question,
@@ -124,6 +126,7 @@ def render_grounded_llm_report(
             for claim in grounded_claims
         ),
         "include_ledger_debug_appendix": include_ledger_debug_appendix,
+        **llm_sidecar,
     }
     return GroundedLLMReport(rendered=rendered, metadata=metadata)
 
@@ -164,10 +167,18 @@ def _system_prompt(report_language: str) -> str:
             '    "items": [item]\n'
             "  }],\n"
             '  "uncertainties": [item],\n'
-            '  "unresolved": [string]\n'
+            '  "unresolved": [string],\n'
+            '  "coverage_notes": [string]\n'
             "}\n"
             '其中 item 是 {"text": string, "claim_ids": [string], '
-            '"claim_evidence_ids": [string], "citation_span_ids": [string]}。'
+            '"claim_evidence_ids": [string], "citation_span_ids": [string], '
+            '"support_type": "direct_evidence" | "inference" | "background" | "unsupported", '
+            '"competitive_implication": boolean (可选)}。\n'
+            "要求：执行摘要与关键结论章节的 item 必须使用 support_type=direct_evidence，"
+            "且不得将 competitive_implication 设为 true（该字段仅用于不确定性章节且须配合 inference/background）。\n"
+            "涉及厂商对比或竞争格局的表述须克制，避免无证据的强弱结论；需要推断时请标为 inference 或 background，"
+            "并放在 uncertainties。\n"
+            "coverage_notes 用于简述与 planner 子问题/槽位的覆盖关系（不得引入 bundle 外事实）。"
         )
 
     return (
@@ -206,10 +217,18 @@ def _system_prompt(report_language: str) -> str:
         '    "items": [item]\n'
         "  }],\n"
         '  "uncertainties": [item],\n'
-        '  "unresolved": [string]\n'
+        '  "unresolved": [string],\n'
+        '  "coverage_notes": [string]\n'
         "}\n"
         'Item is {"text": string, "claim_ids": [string], '
-        '"claim_evidence_ids": [string], "citation_span_ids": [string]}.'
+        '"claim_evidence_ids": [string], "citation_span_ids": [string], '
+        '"support_type": "direct_evidence" | "inference" | "background" | "unsupported", '
+        '"competitive_implication": boolean (optional)}.\n'
+        "Rules: executive_summary and sections[].items must use support_type=direct_evidence and must "
+        "not set competitive_implication to true (use uncertainties with inference/background for "
+        "cautious competitive framing).\n"
+        "coverage_notes summarizes alignment with planner subquestions/slots without introducing "
+        "facts outside the bundle."
     )
 
 
@@ -237,8 +256,11 @@ def _build_grounding_bundle(
             "Use supported claims as settled findings only when support_level is not weak.",
             "Use mixed or unsupported claims only in uncertainty sections.",
             "Every item must include claim_ids and claim_evidence_ids from this bundle.",
+            "Label support_type: direct_evidence for paraphrases tightly tied to excerpts; "
+            "inference/background only when the prose goes beyond the excerpt in uncertainties.",
             "planner_research_plan provides structure and goals, but is NOT a factual source.",
             "If a planner goal lacks verified claims, report it as a coverage gap.",
+            "Avoid aggressive competitive claims unless evidence-backed; use cautious wording.",
         ],
         "answer_slots": [
             {
@@ -334,6 +356,96 @@ def _source_role_distribution(
     }
 
 
+def _norm_inline(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _evidence_anchor_sort_key(anchor: str) -> int:
+    match = _EVIDENCE_ANCHOR_NUM.match(anchor.strip())
+    if match:
+        return int(match.group(1))
+    return 10**9
+
+
+def _build_evidence_anchor_map(claims: list[ReportClaimItem]) -> dict[str, str]:
+    anchors: dict[str, str] = {}
+    counter = 1
+    for claim in claims:
+        for evidence in claim.support_evidence + claim.contradict_evidence:
+            eid = str(evidence.claim_evidence_id)
+            if eid not in anchors:
+                anchors[eid] = f"e{counter}"
+                counter += 1
+    return anchors
+
+
+def _footnote_citation_suffix(
+    evidence_ids: tuple[str, ...],
+    anchor_by_evidence_id: dict[str, str],
+) -> str:
+    parts: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for eid in evidence_ids:
+        anchor = anchor_by_evidence_id.get(eid)
+        if anchor and eid not in seen:
+            seen.add(eid)
+            parts.append((_evidence_anchor_sort_key(anchor), f"[^{anchor}]"))
+    parts.sort(key=lambda item: item[0])
+    return "".join(fragment for _, fragment in parts)
+
+
+def _render_evidence_footnote_section(
+    claims: list[ReportClaimItem],
+    anchor_by_evidence_id: dict[str, str],
+    labels: dict[str, Any],
+) -> list[str]:
+    if not anchor_by_evidence_id:
+        return []
+    evidence_rows: dict[str, tuple[ReportClaimItem, ReportEvidenceItem]] = {}
+    for claim in claims:
+        for evidence in claim.support_evidence + claim.contradict_evidence:
+            eid = str(evidence.claim_evidence_id)
+            if eid in anchor_by_evidence_id:
+                evidence_rows[eid] = (claim, evidence)
+    lines = ["", f"## {labels['evidence_footnotes']}", ""]
+    ordered = sorted(
+        anchor_by_evidence_id.items(),
+        key=lambda item: _evidence_anchor_sort_key(item[1]),
+    )
+    for eid, anchor in ordered:
+        row = evidence_rows.get(eid)
+        if row is None:
+            continue
+        _, evidence = row
+        url = evidence.canonical_url.strip()
+        lines.append(
+            f"[^{anchor}]: [{_norm_inline(evidence.domain)}](<{url}>) — "
+            f"{labels['excerpt']}: \"{_norm_inline(evidence.excerpt)}\" — "
+            f"{labels['footnote_trace']}: `{evidence.claim_evidence_id}`"
+        )
+        lines.append("")
+    return lines
+
+
+def _support_type_sidecar(
+    *,
+    executive_items: list[_GroundedItem],
+    sections: list[tuple[str, list[_GroundedItem], tuple[str, ...]]],
+    uncertainty_items: list[_GroundedItem],
+) -> dict[str, object]:
+    counts: dict[str, int] = {}
+
+    def feed(items: list[_GroundedItem]) -> None:
+        for grounded in items:
+            counts[grounded.support_type] = counts.get(grounded.support_type, 0) + 1
+
+    feed(executive_items)
+    for _, sec, _ in sections:
+        feed(sec)
+    feed(uncertainty_items)
+    return {"grounded_report_support_type_counts": counts}
+
+
 def _render_validated_llm_payload(
     payload: dict[str, Any],
     *,
@@ -346,13 +458,14 @@ def _render_validated_llm_payload(
     answer_relevant_claim_count: int,
     excluded_low_quality_claim_count: int,
     include_ledger_debug_appendix: bool,
-) -> RenderedMarkdownReport:
+) -> tuple[RenderedMarkdownReport, dict[str, object]]:
     labels = _labels(report_language)
     if is_chinese_report_language(report_language) and not _payload_contains_cjk(payload):
         raise GroundedLLMReportValidationError(
             "LLM report response did not follow the requested Chinese report language"
         )
     evidence_by_id, citation_by_evidence_id, claim_by_id, evidence_claim_id = _allowed_ids(claims)
+    anchor_by_evidence_id = _build_evidence_anchor_map(claims)
 
     executive_items = _validated_items(
         payload.get("executive_summary"),
@@ -362,6 +475,7 @@ def _render_validated_llm_payload(
         evidence_claim_id=evidence_claim_id,
         allowed_statuses={"supported"},
         allow_weak_support=False,
+        restrict_support_types=True,
     )
     sections = _validated_sections(
         payload.get("sections"),
@@ -378,8 +492,9 @@ def _render_validated_llm_payload(
         evidence_claim_id=evidence_claim_id,
         allowed_statuses={"mixed", "unsupported", "contradicted", "supported"},
         allow_weak_support=True,
+        restrict_support_types=False,
     )
-    if not executive_items and not any(items for _, items in sections) and not uncertainty_items:
+    if not executive_items and not any(items for _, items, _ in sections) and not uncertainty_items:
         raise GroundedLLMReportValidationError("LLM report JSON contained no grounded items")
 
     title = _string_or_none(payload.get("title")) or build_report_title(
@@ -402,26 +517,39 @@ def _render_validated_llm_payload(
     ]
 
     alignment = payload.get("question_alignment")
-    if isinstance(alignment, dict):
+    has_alignment = isinstance(alignment, dict)
+    coverage_raw = payload.get("coverage_notes")
+    coverage_notes_clean = [
+        note.strip()
+        for note in (coverage_raw if isinstance(coverage_raw, list) else [])
+        if isinstance(note, str) and note.strip()
+    ]
+
+    if has_alignment or coverage_notes_clean:
         lines.extend([f"## {labels['question_alignment']}", ""])
-        orig_q = _string_or_none(alignment.get("original_user_question"))
-        if orig_q:
-            lines.append(f"- **{labels['original_question_label']}**: {orig_q}")
+        if has_alignment:
+            orig_q = _string_or_none(alignment.get("original_user_question"))
+            if orig_q:
+                lines.append(f"- **{labels['original_question_label']}**: {orig_q}")
 
-        intent = _string_or_none(alignment.get("planner_intent"))
-        if intent:
-            lines.append(f"- **{labels['planner_intent_label']}**: {intent}")
+            intent = _string_or_none(alignment.get("planner_intent"))
+            if intent:
+                lines.append(f"- **{labels['planner_intent_label']}**: {intent}")
 
-        for key, label in [
-            ("answered_parts", labels["answered_label"]),
-            ("partially_answered_parts", labels["partially_answered_label"]),
-            ("unanswered_parts", labels["unanswered_label"]),
-        ]:
-            parts = _string_list(alignment.get(key))
-            if parts:
-                lines.append(f"- **{label}**:")
-                for part in parts:
-                    lines.append(f"  - {part}")
+            for key, label in [
+                ("answered_parts", labels["answered_label"]),
+                ("partially_answered_parts", labels["partially_answered_label"]),
+                ("unanswered_parts", labels["unanswered_label"]),
+            ]:
+                parts = _string_list(alignment.get(key))
+                if parts:
+                    lines.append(f"- **{label}**:")
+                    for part in parts:
+                        lines.append(f"  - {part}")
+        if coverage_notes_clean:
+            lines.append(f"- **{labels['coverage_notes_label']}**:")
+            for note in coverage_notes_clean:
+                lines.append(f"  - {note}")
         lines.append("")
 
     lines.extend(
@@ -431,39 +559,28 @@ def _render_validated_llm_payload(
         ]
     )
     if executive_items:
-        lines.extend(_render_grounded_items(executive_items, labels=labels))
+        lines.extend(
+            _render_grounded_items(
+                executive_items, labels=labels, anchor_by_evidence_id=anchor_by_evidence_id
+            )
+        )
     else:
         lines.append(f"- {labels['no_supported_items']}")
 
     lines.extend(["", f"## {labels['key_findings']}", ""])
     if sections:
-        for section in payload.get("sections", []):
-            if not isinstance(section, dict):
-                continue
-            heading = _string_or_none(section.get("heading"))
-            if not heading:
-                continue
-
-            items = _validated_items(
-                section.get("items"),
-                claim_by_id=claim_by_id,
-                evidence_by_id=evidence_by_id,
-                citation_by_evidence_id=citation_by_evidence_id,
-                evidence_claim_id=evidence_claim_id,
-                allowed_statuses={"supported"},
-                allow_weak_support=False,
-            )
-            if not items:
-                continue
-
+        for heading, items, planner_subs in sections:
             lines.extend([f"### {heading}", ""])
 
-            planner_subs = _string_list(section.get("related_planner_subquestions"))
             if planner_subs:
                 lines.append(f"_{labels['related_subs']}: {', '.join(planner_subs)}_")
                 lines.append("")
 
-            lines.extend(_render_grounded_items(items, labels=labels))
+            lines.extend(
+                _render_grounded_items(
+                    items, labels=labels, anchor_by_evidence_id=anchor_by_evidence_id
+                )
+            )
             lines.append("")
     else:
         lines.append(f"- {labels['no_section_items']}")
@@ -479,7 +596,11 @@ def _render_validated_llm_payload(
 
     lines.extend(["", f"## {labels['uncertainty']}", ""])
     if uncertainty_items:
-        lines.extend(_render_grounded_items(uncertainty_items, labels=labels))
+        lines.extend(
+            _render_grounded_items(
+                uncertainty_items, labels=labels, anchor_by_evidence_id=anchor_by_evidence_id
+            )
+        )
     else:
         lines.append(f"- {labels['no_uncertainty_items']}")
 
@@ -499,7 +620,10 @@ def _render_validated_llm_payload(
 
     source_domains = sorted({source.domain for source in sources})
     lines.extend(["", f"## {labels['source_scope']}", ""])
-    lines.append(f"- {labels['source_scope_strict']}")
+    if _render_has_inference_or_background(executive_items, sections, uncertainty_items):
+        lines.append(f"- {labels['source_scope_mixed']}")
+    else:
+        lines.append(f"- {labels['source_scope_strict']}")
     lines.append(f"- {labels['llm_generation']}")
     lines.append(
         "- "
@@ -524,19 +648,34 @@ def _render_validated_llm_payload(
         lines.extend(["", f"## {labels['claim_mapping']}", ""])
         lines.extend(_render_claim_mapping(claims, labels=labels))
 
+    lines.extend(_render_evidence_footnote_section(claims, anchor_by_evidence_id, labels=labels))
+
     markdown = "\n".join(lines).strip() + "\n"
-    return RenderedMarkdownReport(
-        title=title,
-        markdown=markdown,
-        supported_count=sum(1 for claim in claims if claim.verification_status == "supported"),
-        mixed_count=sum(1 for claim in claims if claim.verification_status == "mixed"),
-        contradicted_count=sum(
-            1 for claim in claims if claim.verification_status == "contradicted"
+    sidecar = _support_type_sidecar(
+        executive_items=executive_items,
+        sections=sections,
+        uncertainty_items=uncertainty_items,
+    )
+    return (
+        RenderedMarkdownReport(
+            title=title,
+            markdown=markdown,
+            supported_count=sum(1 for claim in claims if claim.verification_status == "supported"),
+            mixed_count=sum(1 for claim in claims if claim.verification_status == "mixed"),
+            contradicted_count=sum(
+                1 for claim in claims if claim.verification_status == "contradicted"
+            ),
+            unsupported_count=sum(
+                1 for claim in claims if claim.verification_status == "unsupported"
+            ),
+            draft_count=0,
+            answer_relevant_count=answer_relevant_claim_count,
+            excluded_low_quality_count=excluded_low_quality_claim_count,
+            synthesis_plan=None,
+            critic_result=None,
+            redundancy_clusters=None,
         ),
-        unsupported_count=sum(1 for claim in claims if claim.verification_status == "unsupported"),
-        draft_count=0,
-        answer_relevant_count=answer_relevant_claim_count,
-        excluded_low_quality_count=excluded_low_quality_claim_count,
+        sidecar,
     )
 
 
@@ -547,16 +686,17 @@ def _validated_sections(
     evidence_by_id: dict[str, ReportEvidenceItem],
     citation_by_evidence_id: dict[str, str],
     evidence_claim_id: dict[str, str],
-) -> list[tuple[str, list[_GroundedItem]]]:
+) -> list[tuple[str, list[_GroundedItem], tuple[str, ...]]]:
     if not isinstance(value, list):
         return []
-    result: list[tuple[str, list[_GroundedItem]]] = []
+    result: list[tuple[str, list[_GroundedItem], tuple[str, ...]]] = []
     for section in value:
         if not isinstance(section, dict):
             continue
         heading = _string_or_none(section.get("heading"))
         if heading is None:
             continue
+        planner_subs = tuple(_string_list(section.get("related_planner_subquestions")))
         items = _validated_items(
             section.get("items"),
             claim_by_id=claim_by_id,
@@ -565,10 +705,28 @@ def _validated_sections(
             evidence_claim_id=evidence_claim_id,
             allowed_statuses={"supported"},
             allow_weak_support=False,
+            restrict_support_types=True,
         )
         if items:
-            result.append((heading, items))
+            result.append((heading, items, planner_subs))
     return result
+
+
+_VALID_SUPPORT_TYPES = frozenset({"direct_evidence", "inference", "background", "unsupported"})
+
+
+def _normalize_support_type(raw: object) -> str:
+    if isinstance(raw, str) and raw.strip():
+        key = raw.strip().lower().replace(" ", "_").replace("-", "_")
+        aliases = {
+            "direct": "direct_evidence",
+            "evidence": "direct_evidence",
+            "directevidence": "direct_evidence",
+        }
+        key = aliases.get(key, key)
+        if key in _VALID_SUPPORT_TYPES:
+            return key
+    return "direct_evidence"
 
 
 def _validated_items(
@@ -580,6 +738,7 @@ def _validated_items(
     evidence_claim_id: dict[str, str],
     allowed_statuses: set[str],
     allow_weak_support: bool,
+    restrict_support_types: bool,
 ) -> list[_GroundedItem]:
     if not isinstance(value, list):
         return []
@@ -616,15 +775,40 @@ def _validated_items(
             citation_ids = tuple(
                 citation_by_evidence_id[evidence_id] for evidence_id in evidence_ids
             )
+        support_type = _normalize_support_type(item.get("support_type"))
+        if restrict_support_types:
+            if support_type != "direct_evidence":
+                continue
+            if item.get("competitive_implication") is True:
+                continue
         result.append(
             _GroundedItem(
                 text=text,
                 claim_ids=claim_ids,
                 claim_evidence_ids=evidence_ids,
                 citation_span_ids=citation_ids,
+                support_type=support_type,
             )
         )
     return result
+
+
+def _render_has_inference_or_background(
+    executive_items: list[_GroundedItem],
+    sections: list[tuple[str, list[_GroundedItem], tuple[str, ...]]],
+    uncertainty_items: list[_GroundedItem],
+) -> bool:
+    for grounded in executive_items:
+        if grounded.support_type in {"inference", "background"}:
+            return True
+    for _, sec_items, _ in sections:
+        for grounded in sec_items:
+            if grounded.support_type in {"inference", "background"}:
+                return True
+    for grounded in uncertainty_items:
+        if grounded.support_type in {"inference", "background"}:
+            return True
+    return False
 
 
 def _allowed_ids(
@@ -818,10 +1002,21 @@ def _deployment_statement_intro(statement: str, *, code_block: str | None = None
     return statement.split(":", 1)[0].strip() + ":"
 
 
-def _render_grounded_items(items: list[_GroundedItem], *, labels: dict[str, str]) -> list[str]:
+def _render_grounded_items(
+    items: list[_GroundedItem],
+    *,
+    labels: dict[str, Any],
+    anchor_by_evidence_id: dict[str, str],
+) -> list[str]:
     lines: list[str] = []
+    st_labels = labels.get("support_type_labels", {})
+    if not isinstance(st_labels, dict):
+        st_labels = {}
     for item in items:
-        lines.append(f"- {item.text}")
+        suffix = _footnote_citation_suffix(item.claim_evidence_ids, anchor_by_evidence_id)
+        st_key = item.support_type if item.support_type in _VALID_SUPPORT_TYPES else "direct_evidence"
+        st_human = st_labels.get(st_key) or st_key
+        lines.append(f"- [{st_human}] {item.text}{suffix}")
     return lines
 
 
@@ -944,14 +1139,17 @@ def _labels(report_language: str) -> dict[str, Any]:
             "claim_evidence": "claim_evidence",
             "claim_mapping": "附录：claim/evidence/citation 映射",
             "claims": "claims",
+            "coverage_notes_label": "覆盖与缺口备注",
             "deployment_coverage_gap": (
                 "覆盖缺口：`{slot}` 当前为 `{status}`，没有可渲染的强支持证据。"
             ),
             "deployment_evidence": "部署证据覆盖",
             "deployment_slot_gap": "`{slot}` 暂无强支持命令或配置证据。",
             "evidence_sources": "带证据链接的来源文档：{count} 个；域名：{domains}。",
+            "evidence_footnotes": "证据来源",
             "excluded_claims": "已排除低质量或偏离问题的 claim：{count}。",
             "excerpt": "摘录",
+            "footnote_trace": "追溯键",
             "executive_summary": "执行摘要",
             "generated": (
                 "_由 grounded LLM report writer 基于已持久化证据在 revision `{revision_no}` 生成。"
@@ -978,6 +1176,10 @@ def _labels(report_language: str) -> dict[str, Any]:
             "research_question": "研究问题",
             "source": "source",
             "source_scope": "来源范围与限制",
+            "source_scope_mixed": (
+                "执行摘要与关键结论中的条目均标注为直接证据范围内表述；不确定性章节可含推断/背景类说明。"
+                "全文仍由已持久化的 claim、evidence 与 citation span 经 id 校验生成，未引入未校验的外部事实。"
+            ),
             "source_scope_strict": (
                 "本报告严格由已持久化的 claim、evidence 和 citation span 综合，不使用外部事实。"
             ),
@@ -990,6 +1192,12 @@ def _labels(report_language: str) -> dict[str, Any]:
                 "Security": "安全",
                 "Troubleshooting": "故障排查",
                 "Update / maintenance": "更新 / 维护",
+            },
+            "support_type_labels": {
+                "direct_evidence": "直接证据",
+                "inference": "推断",
+                "background": "背景",
+                "unsupported": "无直接支持",
             },
             "unanswered_label": "未回答部分",
             "uncertainty": "冲突 / 不确定性",
@@ -1009,6 +1217,7 @@ def _labels(report_language: str) -> dict[str, Any]:
         "claim_evidence": "claim_evidence",
         "claim_mapping": "Appendix: Claim Evidence Mapping",
         "claims": "claims",
+        "coverage_notes_label": "Coverage notes",
         "deployment_coverage_gap": (
             "Coverage gap: `{slot}` is currently `{status}` with no renderable strongly "
             "supported evidence."
@@ -1018,8 +1227,10 @@ def _labels(report_language: str) -> dict[str, Any]:
             "No strongly supported command or configuration evidence for `{slot}`."
         ),
         "evidence_sources": "Evidence-linked source documents: {count} across domains: {domains}.",
+        "evidence_footnotes": "Evidence footnotes",
         "excluded_claims": "Excluded low-quality or off-query claims: {count}.",
         "excerpt": "excerpt",
+        "footnote_trace": "Trace key",
         "executive_summary": "Executive Summary",
         "generated": (
             "_Generated by grounded LLM report writer from persisted evidence at revision "
@@ -1048,10 +1259,31 @@ def _labels(report_language: str) -> dict[str, Any]:
         "research_question": "Research Question",
         "source": "source",
         "source_scope": "Source Scope and Limitations",
+        "source_scope_mixed": (
+            "Executive summary and key-finding bullets are restricted to direct_evidence; uncertainty "
+            "sections may include inference or background interpretation. The narrative is still "
+            "assembled only from persisted claims, evidence, and citation spans with id validation."
+        ),
         "source_scope_strict": (
             "This report is synthesized strictly from persisted claims, evidence, and "
             "citation spans, with no external facts."
         ),
+        "slot_label_mapping": {
+            "Prerequisites": "Prerequisites",
+            "Docker run / Docker Compose": "Docker run / Docker Compose",
+            "Volumes": "Volumes",
+            "Ports": "Ports",
+            "Configuration": "Configuration",
+            "Security": "Security",
+            "Troubleshooting": "Troubleshooting",
+            "Update / maintenance": "Update / maintenance",
+        },
+        "support_type_labels": {
+            "direct_evidence": "Direct evidence",
+            "inference": "Inference",
+            "background": "Background",
+            "unsupported": "Unsupported",
+        },
         "unanswered_label": "Unanswered parts",
         "uncertainty": "Conflicts / Uncertainty",
         "unresolved": "Unresolved Questions",

@@ -153,6 +153,7 @@ _OFFICIAL_VENDOR_DOMAINS = (
     "microsoft.com",
     "amazon.com",
     "meta.com",
+    "claude.com",
 )
 
 
@@ -284,7 +285,7 @@ def _authority_score(
     ) or _is_docs_path(path):
         return 0.95, "official_docs"
     if _is_official_vendor_domain(normalized_domain):
-        if _is_blog_path(path) or _is_news_path(path):
+        if _is_vendor_high_trust_content_path(normalized_domain, path):
             return 0.92, "official_docs"
         return 0.75, "official_vendor_domain"
     if normalized_domain.endswith("wikipedia.org"):
@@ -825,6 +826,8 @@ def _is_docs_path(path: str) -> bool:
             "/guides",
             "/manual",
             "/reference",
+            "/release-notes",
+            "/release_notes",
         )
     )
 
@@ -839,6 +842,23 @@ def _is_news_path(path: str) -> bool:
 
 def _is_official_vendor_domain(domain: str) -> bool:
     return any(domain == item or domain.endswith(f".{item}") for item in _OFFICIAL_VENDOR_DOMAINS)
+
+
+def _is_vendor_high_trust_content_path(domain: str, path: str) -> bool:
+    if _is_blog_path(path) or _is_news_path(path) or _is_docs_path(path):
+        return True
+    lower = path.lower()
+    if (
+        domain.startswith("support.")
+        and (domain.endswith(".claude.com") or domain == "support.claude.com")
+        and ("/articles" in lower or "/hc/" in lower or lower.startswith("/en/"))
+    ):
+        return True
+    if domain.startswith("code.") and domain.endswith(".claude.com") and (
+        "/docs" in lower or "/reference" in lower or "/api" in lower
+    ):
+        return True
+    return False
 
 
 def _is_project_homepage(domain: str, path: str) -> bool:

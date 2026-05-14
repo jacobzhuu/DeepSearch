@@ -48,6 +48,7 @@ export interface ResearchTaskProgress {
     supplemental_acquisition?: Record<string, any> | null;
     gap_analysis?: Record<string, any> | null;
     gap_rounds?: Array<Record<string, any>>;
+    research_rounds?: Array<Record<string, any>>;
     failure_diagnostics?: Record<string, any> | null;
     pipeline_counts?: Partial<PipelineCounts>;
     warnings: string[];

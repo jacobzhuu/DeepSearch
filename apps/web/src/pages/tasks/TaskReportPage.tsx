@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { PageLayout } from '../../components/layout/PageLayout';
 import { LoadingState } from '../../components/common/LoadingState';
 import { ErrorState } from '../../components/common/ErrorState';
@@ -10,12 +11,19 @@ import { Button } from '../../components/common/Button';
 import { Badge } from '../../components/common/Badge';
 import { useReport } from '../../features/report/hooks';
 import { formatChinaDateTime } from '../../lib/datetime';
+import { sanitizeReportMarkdown } from '../../lib/reportMarkdownDisplay';
+import { reportMarkdownComponents } from '../../lib/reportMarkdownComponents';
 
 export const TaskReportPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
   const { report, isLoading, error, refetch } = useReport(taskId);
   const [viewMode, setViewMode] = useState<'html' | 'raw'>('html');
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
+
+  const displayMarkdown = useMemo(
+    () => (report ? sanitizeReportMarkdown(report.markdown) : ''),
+    [report?.markdown],
+  );
 
   if (isLoading) return <PageLayout title="研究报告"><LoadingState message="正在生成报告视图..." /></PageLayout>;
 
@@ -42,13 +50,13 @@ export const TaskReportPage: React.FC = () => {
   }
 
   const copyMarkdown = async () => {
-    await navigator.clipboard.writeText(report.markdown);
+    await navigator.clipboard.writeText(displayMarkdown);
     setCopyStatus('已复制');
     window.setTimeout(() => setCopyStatus(null), 1800);
   };
 
   const downloadMarkdown = () => {
-    const blob = new Blob([report.markdown], { type: 'text/markdown;charset=utf-8' });
+    const blob = new Blob([displayMarkdown], { type: 'text/markdown;charset=utf-8' });
     const url = window.URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -102,7 +110,12 @@ export const TaskReportPage: React.FC = () => {
           >
             {viewMode === 'html' ? (
               <div className="markdown-body">
-                <ReactMarkdown>{report.markdown}</ReactMarkdown>
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={reportMarkdownComponents}
+                >
+                  {displayMarkdown}
+                </ReactMarkdown>
               </div>
             ) : (
               <pre style={{
@@ -114,7 +127,7 @@ export const TaskReportPage: React.FC = () => {
                 fontFamily: 'monospace',
                 color: 'var(--text-secondary)'
               }}>
-                {report.markdown}
+                {displayMarkdown}
               </pre>
             )}
           </div>
@@ -204,6 +217,36 @@ export const TaskReportPage: React.FC = () => {
         }
         .markdown-body th {
           background-color: var(--bg-color);
+        }
+        .markdown-body sup a[data-footnote-ref] {
+          font-size: 0.72em;
+          font-weight: 600;
+          text-decoration: none;
+          color: var(--primary-color);
+          padding: 0 0.1em;
+        }
+        .markdown-body sup a[data-footnote-ref]:hover {
+          text-decoration: underline;
+        }
+        .markdown-body section.footnotes {
+          margin-top: 2.5rem;
+          padding-top: 1.25rem;
+          border-top: 1px solid var(--border-color);
+          font-size: 0.95rem;
+          line-height: 1.55;
+        }
+        .markdown-body section.footnotes ol {
+          padding-left: 1.25rem;
+        }
+        .markdown-body section.footnotes li {
+          margin-bottom: 0.85rem;
+        }
+        .markdown-body section.footnotes li p {
+          margin-bottom: 0.35rem;
+        }
+        .markdown-body section.footnotes code {
+          font-size: 0.82em;
+          word-break: break-all;
         }
         @media (max-width: 900px) {
           main > div > div {

@@ -401,6 +401,24 @@ const PipelineFailureHelp: React.FC<{ failure: PipelineFailure | null; dependenc
 
 type TaskObservability = NonNullable<NonNullable<ResearchTask['progress']>['observability']>;
 
+const formatStringList = (value: unknown, maxItems = 6): string => {
+  if (!Array.isArray(value)) return '—';
+  const parts = value
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((s) => s.trim());
+  if (!parts.length) return '—';
+  const head = parts.slice(0, maxItems).join(' · ');
+  return parts.length > maxItems ? `${head} (+${parts.length - maxItems} more)` : head;
+};
+
+const formatUrlList = (value: unknown, maxItems = 4): string => {
+  if (!Array.isArray(value)) return '—';
+  const urls = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  if (!urls.length) return '—';
+  const head = urls.slice(0, maxItems).join('\n');
+  return urls.length > maxItems ? `${head}\n(+${urls.length - maxItems} more)` : head;
+};
+
 const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null, taskId: string, counts: PipelineCounts }> = ({ observability, taskId, counts }) => {
   if (!observability) return null;
 
@@ -421,6 +439,7 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
   const evidenceYield = observability.evidence_yield_summary;
   const verification = observability.verification_summary;
   const gapAnalysis = observability.gap_analysis;
+  const researchRounds = Array.isArray(observability.research_rounds) ? observability.research_rounds : [];
 
   // Use pipeline counts for the top 3 metrics as they are more reliable after completion
   const searchFoundCount = counts.candidate_urls || observability.search_result_count || 0;
@@ -461,7 +480,7 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
         )}
       </SectionCard>
 
-      {(evidenceYield || verification || gapAnalysis) && (
+      {(evidenceYield || verification || gapAnalysis || researchRounds.length > 0) && (
         <SectionCard title="研究深度指标">
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1.5rem' }}>
             {evidenceYield && (
@@ -496,6 +515,48 @@ const TaskObservabilityPanel: React.FC<{ observability: TaskObservability | null
               </div>
             )}
           </div>
+          {researchRounds.length > 0 && (
+            <div style={{ marginTop: '1.25rem', paddingTop: '1.25rem', borderTop: '1px solid var(--border-color)' }}>
+              <div style={{ fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.75rem' }}>Gap 递延轮次 (research_rounds)</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {researchRounds.map((rr: Record<string, unknown>, idx: number) => (
+                  <div
+                    key={`rr-${String(rr.sequence_index ?? rr.round ?? idx)}`}
+                    style={{
+                      fontSize: '0.8125rem',
+                      backgroundColor: '#f8f9fa',
+                      padding: '0.75rem',
+                      borderRadius: 'var(--radius-sm)',
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, marginBottom: '0.35rem' }}>
+                      round {String(rr.round ?? '—')} · {String(rr.status ?? '—')}
+                    </div>
+                    {rr.reason != null && String(rr.reason).trim() !== '' && (
+                      <div style={{ color: 'var(--text-secondary)', marginBottom: '0.35rem' }}>
+                        reason: {String(rr.reason)}
+                      </div>
+                    )}
+                    <div style={{ color: 'var(--text-secondary)' }}>
+                      queries: {formatStringList(rr.queries)}
+                    </div>
+                    <div style={{ color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
+                      candidate_urls: {formatUrlList(rr.candidate_urls)}
+                    </div>
+                    <div style={{ color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
+                      new_candidate_urls: {formatUrlList(rr.new_candidate_urls)}
+                    </div>
+                    <div style={{ marginTop: '0.35rem' }}>
+                      fetch_succeeded {String(rr.fetch_succeeded ?? '—')} · source_documents{' '}
+                      {String(rr.source_documents ?? '—')} · claims {String(rr.claims ?? '—')} · supported_claims{' '}
+                      {String(rr.supported_claims ?? '—')}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </SectionCard>
       )}
 

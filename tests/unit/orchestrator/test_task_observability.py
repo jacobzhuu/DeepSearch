@@ -201,3 +201,53 @@ def test_claim_slot_summary_uses_nested_evidence_candidate_slot_ids() -> None:
     assert row["source_document_id"] == "source-stategraph"
     assert limitations["supported_claim_count"] == 1
     assert limitations["status"] == "covered"
+
+
+def test_gap_rounds_only_from_researching_more_stage_completed() -> None:
+    """``pipeline.gap_analysis`` / ``research_strategy`` share ``stage=RESEARCHING_MORE`` but are not rounds."""
+    task_id = uuid4()
+    task = ResearchTask(
+        id=task_id,
+        query="q",
+        status="COMPLETED",
+        constraints_json={},
+    )
+    events = [
+        TaskEvent(
+            id=uuid4(),
+            task_id=task_id,
+            event_type="pipeline.gap_analysis",
+            sequence_no=1,
+            payload_json={
+                "stage": "RESEARCHING_MORE",
+                "result": {"gap_analysis": {"triggered": True, "round_no": 1}},
+            },
+            created_at=datetime(2026, 5, 8, 13, 22, 41, tzinfo=UTC),
+        ),
+        TaskEvent(
+            id=uuid4(),
+            task_id=task_id,
+            event_type="pipeline.stage_completed",
+            sequence_no=2,
+            payload_json={
+                "stage": "RESEARCHING_MORE",
+                "result": {
+                    "gap_analysis": {"round_no": 1},
+                    "gap_round_diagnostics": {
+                        "gap_round_outcome": "drafted",
+                        "gap_round_index": 1,
+                        "drafting_created_claims": 1,
+                        "verification_supported_claims": 1,
+                        "supplemental_search_failed": False,
+                    },
+                    "search": {"search_queries": [{"query_text": "extra"}]},
+                },
+            },
+            created_at=datetime(2026, 5, 8, 13, 23, 16, tzinfo=UTC),
+        ),
+    ]
+    obs = _derive_observability(TaskSnapshot(task=task, events=events))
+    assert obs is not None
+    assert len(obs.gap_rounds) == 1
+    assert len(obs.research_rounds) == 1
+    assert obs.research_rounds[0]["status"] == "produced"

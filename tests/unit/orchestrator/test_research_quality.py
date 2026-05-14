@@ -29,6 +29,46 @@ def test_source_intent_generalizes_docs_about_and_wikipedia() -> None:
     assert opensearch_wikipedia.fetch_priority_score == 1
 
 
+def test_anthropic_and_claude_vendor_surfaces_are_official_docs() -> None:
+    query = "What is new in Claude 4?"
+    news = classify_source_intent(
+        canonical_url="https://www.anthropic.com/news/claude-4",
+        domain="www.anthropic.com",
+        title="Introducing Claude 4",
+        query=query,
+    )
+    blog = classify_source_intent(
+        canonical_url="https://anthropic.com/blog/building-with-claude",
+        domain="anthropic.com",
+        title="Engineering blog",
+        query=query,
+    )
+    rel = classify_source_intent(
+        canonical_url="https://www.anthropic.com/release-notes/api",
+        domain="www.anthropic.com",
+        title="API release notes",
+        query=query,
+    )
+    support = classify_source_intent(
+        canonical_url="https://support.claude.com/en/articles/123-billing",
+        domain="support.claude.com",
+        title="Billing help",
+        query=query,
+    )
+    code_docs = classify_source_intent(
+        canonical_url="https://code.claude.com/docs/sdk/overview",
+        domain="code.claude.com",
+        title="SDK overview",
+        query=query,
+    )
+    for item in (news, blog, rel, support, code_docs):
+        assert item.source_category == "official_docs_reference"
+        assert item.source_intent == "official_docs_reference"
+        assert item.fetch_priority_score <= 10
+        assert item.downrank_reason is None
+    assert news.source_role == "official_blog_or_changelog"
+
+
 def test_source_intent_does_not_promote_generic_what_is_pages_to_official() -> None:
     query = "What is LangGraph and how does it work?"
     geeksforgeeks = classify_source_intent(

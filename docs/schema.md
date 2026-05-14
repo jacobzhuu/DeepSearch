@@ -45,6 +45,10 @@ Phase 11 still uses the reversible Phase 1 plus Phase 2 research ledger schema, 
 - source quality uses existing `source_document` score columns and `source_chunk.metadata_json`; current metadata records final source score, authority, relevance, crawlability, information density, safety, explicit `freshness_state`, chunk content quality, query relevance, boilerplate score, conservative leading boilerplate-like signals, and quality reasons such as `deployment_code_or_config`
 - verification stores deterministic lexical verifier metadata in `claim.notes_json["verification"]`, including `verifier_method`, strong and weak support counts, contradiction counts, insufficient-evidence count, selected/dropped evidence counts, evidence rank scores, relation details, citation precision, shallow-overlap flags, numeric/date mismatch flags, and scope-mismatch flags
 - report language and optional grounded LLM writer provenance are stored in existing `report_artifact.manifest_json` keys: `report_language`, `report_writer.mode`, `report_writer.status`, `report_writer.report_language`, and sanitized provider/model/usage/error metadata when the LLM writer is attempted
+- deterministic Markdown reporting stores inline-citation, synthesis, critic, and redundancy
+  diagnostics in existing `report_artifact.manifest_json.report_writer` keys:
+  `synthesis_plan`, `critic_result`, and `redundancy_clusters`; no report paragraph,
+  report citation, report critic, or synthesis-plan table exists
 - LLM-assisted quality diagnostics use existing JSON seams only: query-rewriter and
   evidence-reranker summaries live in task events/checkpoints, source-judge decisions live in
   `candidate_url.metadata_json`, claim-review decisions live in `claim.notes_json`, and report

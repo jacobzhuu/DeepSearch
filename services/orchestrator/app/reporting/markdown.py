@@ -108,6 +108,9 @@ class RenderedMarkdownReport:
     draft_count: int
     answer_relevant_count: int
     excluded_low_quality_count: int
+    synthesis_plan: dict[str, object] | None = None
+    critic_result: dict[str, object] | None = None
+    redundancy_clusters: list[dict[str, object]] | None = None
 
 
 def extract_report_title(markdown: str) -> str:
@@ -388,6 +391,9 @@ def render_markdown_report(
         draft_count=len(draft_claims),
         answer_relevant_count=answer_relevant_claim_count,
         excluded_low_quality_count=excluded_low_quality_claim_count,
+        synthesis_plan=None,
+        critic_result=None,
+        redundancy_clusters=None,
     )
 
 

@@ -34,6 +34,7 @@ from services.orchestrator.app.planning import (
 )
 from services.orchestrator.app.reporting import normalize_report_language
 from services.orchestrator.app.research_quality import summarize_evidence_yield
+from services.orchestrator.app.services.gap_round_diagnostics import research_rounds_from_gap_stage_results
 from services.orchestrator.app.services.research_tasks import (
     ResearchTaskService,
     TaskNotFoundError,
@@ -800,7 +801,8 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
                 _object_list(result.get("slot_coverage_summary")) or slot_coverage_summary
             )
         elif stage == "RESEARCHING_MORE":
-            if result:
+            event_type = str(event.event_type or "")
+            if result and event_type.endswith(".stage_completed"):
                 gap_rounds.append(result)
             gap = result.get("gap_analysis")
             if isinstance(gap, dict):
@@ -989,8 +991,11 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         and running_mode is None
         and dependencies is None
         and plan_source is None
+        and not gap_rounds
     ):
         return None
+
+    research_rounds = research_rounds_from_gap_stage_results(gap_rounds)
 
     return ResearchTaskObservabilityResponse(
         running_mode=running_mode,
@@ -1036,6 +1041,7 @@ def _derive_observability(snapshot: TaskSnapshot) -> ResearchTaskObservabilityRe
         research_strategy=research_strategy,
         gap_analysis=gap_analysis,
         gap_rounds=gap_rounds,
+        research_rounds=research_rounds,
         failure_diagnostics=failure_diagnostics,
         pipeline_counts=pipeline_counts,
         warnings=deduped_warnings,

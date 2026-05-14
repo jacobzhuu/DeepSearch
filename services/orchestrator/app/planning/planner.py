@@ -27,12 +27,19 @@ from services.orchestrator.app.llm import (
     create_llm_provider,
 )
 from services.orchestrator.app.llm.providers import NoopLLMProvider
+from services.orchestrator.app.planning.million_context_normalization import (
+    apply_million_context_corrections,
+)
 from services.orchestrator.app.planning.types import PlannedSearchQuery, ResearchPlan
 from services.orchestrator.app.research_quality import answer_slots_for_query
 from services.orchestrator.app.settings import Settings
 
 SYSTEM_PROMPT = """You plan evidence-first web research.
-Return one JSON object only. Do not use markdown fences, explanations, claims, or final answers."""
+Return one JSON object only. Do not use markdown fences, explanations, claims, or final answers.
+Chinese quantity note: 100万 / 一百万 / 百万级 (in token or context-window phrases) means
+one million (1M), never 100K. Use 1M / one million / 100万 consistently. Only use 100K when
+the user explicitly asks for one hundred thousand (e.g. English \"100K\", 100千, or 十万 in
+that sense)."""
 
 PLANNER_PROMPT_VERSION = "research_planner_v1"
 PLANNER_OUTPUT_SCHEMA_VERSION = "research_planner_output_v1"
@@ -1380,6 +1387,17 @@ def _apply_research_plan_guardrails(
             risk_notes,
         )
 
+    normalized_question_out = plan.normalized_question
+    subquestions, normalized_question_out, search_queries, million_context_warnings = (
+        apply_million_context_corrections(
+            query,
+            subquestions=subquestions,
+            normalized_question=normalized_question_out,
+            search_queries=search_queries,
+        )
+    )
+    warnings.extend(million_context_warnings)
+
     final_search_queries = [item.to_payload() for item in search_queries]
     dropped_or_downweighted = [
         *source_preference_diagnostics,
@@ -1387,7 +1405,7 @@ def _apply_research_plan_guardrails(
     ]
     return ResearchPlan(
         intent=guarded_intent,
-        normalized_question=plan.normalized_question,
+        normalized_question=normalized_question_out,
         subquestions=subquestions,
         search_queries=search_queries,
         source_preferences=source_preferences,

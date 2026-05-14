@@ -93,12 +93,12 @@ _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
         "secondary_domains": (),
     },
     "claude": {
-        "owned_domains": ("anthropic.com",),
+        "owned_domains": ("anthropic.com", "claude.com"),
         "github_repos": (("anthropics", "claude-sdk"),),
         "secondary_domains": (),
     },
     "anthropic": {
-        "owned_domains": ("anthropic.com",),
+        "owned_domains": ("anthropic.com", "claude.com"),
         "github_repos": (("anthropics", "claude-sdk"),),
         "secondary_domains": (),
     },
@@ -133,7 +133,12 @@ _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
         "secondary_domains": (),
     },
     "nvidia": {
-        "owned_domains": ("nvidia.com", "blogs.nvidia.com"),
+        "owned_domains": (
+            "nvidia.com",
+            "blogs.nvidia.com",
+            "developer.nvidia.com",
+            "research.nvidia.com",
+        ),
         "github_repos": (),
         "secondary_domains": (),
     },
@@ -193,6 +198,10 @@ def classify_source_intent(
         query=query,
     )
     score = source_intent_priority(category, query=query)
+    normalized_domain = (domain or "").strip().lower().removeprefix("www.")
+    path = urlsplit(canonical_url or "").path.strip().lower()
+    if _nvidia_official_domain_for_score_boost(normalized_domain, path):
+        score = min(score, 4)
     if _should_downrank_off_subject_source(
         category=category,
         canonical_url=canonical_url,
@@ -333,6 +342,40 @@ def source_role_for_category(
     )
 
 
+def _nvidia_official_domain_for_score_boost(domain: str, path: str) -> bool:
+    if domain == "developer.nvidia.com":
+        return True
+    if domain in {"research.nvidia.com", "www.research.nvidia.com"}:
+        return True
+    if domain.endswith(".research.nvidia.com"):
+        return True
+    if domain == "huggingface.co" and (
+        path.startswith("/nvidia")
+        or path.startswith("/orgs/nvidia")
+        or path.startswith("/organizations/nvidia")
+    ):
+        return True
+    return False
+
+
+def _nvidia_source_role_override(domain: str, path: str, title: str) -> str | None:
+    if domain == "developer.nvidia.com":
+        if "/blog" in path or "blog" in title:
+            return "official_technical_blog"
+        return "official_docs"
+    if domain in {"research.nvidia.com", "www.research.nvidia.com"} or domain.endswith(
+        ".research.nvidia.com"
+    ):
+        return "official_research"
+    if domain == "huggingface.co" and (
+        path.startswith("/nvidia")
+        or path.startswith("/orgs/nvidia")
+        or path.startswith("/organizations/nvidia")
+    ):
+        return "official_model_card"
+    return None
+
+
 def _source_role(
     *,
     source_category: str,
@@ -344,6 +387,9 @@ def _source_role(
     normalized_domain = (domain or "").strip().lower().removeprefix("www.")
     path = urlsplit(canonical_url or "").path.strip().lower()
     normalized_title = (title or "").strip().lower()
+    role_override = _nvidia_source_role_override(normalized_domain, path, normalized_title)
+    if role_override:
+        return role_override
     if source_category in {"low_quality_or_blocked", "forum_social_video"}:
         return source_category
     if source_category == "standards_or_academic":
@@ -390,6 +436,25 @@ def _source_category(
         subject_terms=subject_terms,
     )
 
+    if normalized_domain == "developer.nvidia.com" or normalized_domain.endswith(
+        ".developer.nvidia.com"
+    ):
+        return "official_docs_reference"
+    if normalized_domain in {"research.nvidia.com", "www.research.nvidia.com"} or normalized_domain.endswith(
+        ".research.nvidia.com"
+    ):
+        return "official_docs_reference"
+
+    if normalized_domain == "huggingface.co" and path.startswith("/nvidia"):
+        if official_context or "nvidia" in subject_terms:
+            if _candidate_mentions_subject(
+                domain=normalized_domain,
+                path=path,
+                title=normalized_title,
+                subject_terms=subject_terms,
+            ):
+                return "official_docs_reference"
+
     if not normalized_domain or path in {"/404", "/403"}:
         return "low_quality_or_blocked"
     if _is_low_value_overview_result(
@@ -403,6 +468,12 @@ def _source_category(
         return "forum_social_video"
     if normalized_domain.endswith("wikipedia.org") and path.startswith("/wiki/"):
         return "wikipedia_reference"
+    if _is_anthropic_claude_vendor_domain(normalized_domain) and _anthropic_claude_official_surface_path(
+        domain=normalized_domain,
+        path=path,
+        title=normalized_title,
+    ):
+        return "official_docs_reference"
     if _is_package_registry_domain(normalized_domain):
         return "package_registry"
     if _is_standards_or_academic_domain(normalized_domain):
@@ -819,6 +890,12 @@ def _should_downrank_off_subject_source(
     normalized_domain = (domain or "").strip().lower().removeprefix("www.")
     path = urlsplit(canonical_url or "").path.strip().lower().rstrip("/")
     normalized_title = (title or "").strip().lower()
+    if _is_anthropic_claude_vendor_domain(normalized_domain) and _anthropic_claude_official_surface_path(
+        domain=normalized_domain,
+        path=path,
+        title=normalized_title,
+    ):
+        return False
     profiles = _project_profiles(subject_terms)
     if category == "generic_article" and profiles:
         return any(
@@ -839,6 +916,17 @@ def _should_downrank_off_subject_source(
     )
 
 
+_VENDOR_TRUST_ROOTS = frozenset({"anthropic.com", "claude.com", "openai.com"})
+
+
+def _profile_has_vendor_trust_root(profile: _ProjectOwnershipProfile) -> bool:
+    for owned in profile["owned_domains"]:
+        for root in _VENDOR_TRUST_ROOTS:
+            if owned == root or owned.endswith(f".{root}"):
+                return True
+    return False
+
+
 def _has_official_project_context(
     *,
     domain: str,
@@ -848,6 +936,11 @@ def _has_official_project_context(
 ) -> bool:
     profiles = _project_profiles(subject_terms)
     if profiles:
+        if any(
+            _domain_matches_owned_profile(domain, profile) and _profile_has_vendor_trust_root(profile)
+            for profile in profiles
+        ):
+            return True
         return any(
             _domain_matches_owned_profile(domain, profile)
             and _candidate_mentions_subject(
@@ -909,6 +1002,41 @@ def _project_profiles(subject_terms: tuple[str, ...]) -> tuple[_ProjectOwnership
 def _domain_matches_owned_profile(domain: str, profile: _ProjectOwnershipProfile) -> bool:
     owned_domains = profile["owned_domains"]
     return any(domain == item or domain.endswith(f".{item}") for item in owned_domains)
+
+
+def _is_anthropic_claude_vendor_domain(domain: str) -> bool:
+    """Registered product / docs hosts for Anthropic Claude (subdomains included)."""
+    return domain == "anthropic.com" or domain.endswith(
+        ".anthropic.com"
+    ) or domain == "claude.com" or domain.endswith(".claude.com")
+
+
+def _anthropic_claude_official_surface_path(*, domain: str, path: str, title: str) -> bool:
+    if _is_docs_like(domain=domain, path=path, title=title):
+        return True
+    if _looks_like_official_blog_or_changelog(domain=domain, path=path, title=title):
+        return True
+    if _looks_like_about_path(path, title):
+        return True
+    if _is_project_homepage(domain=domain, path=path):
+        return True
+    if domain.startswith("support.") or "/support" in path or "/hc/" in path:
+        return True
+    if domain.startswith("code.") and ("/docs" in path or "/reference" in path or "/api" in path):
+        return True
+    lower_path = path.lower()
+    return any(
+        lower_path.startswith(prefix)
+        for prefix in (
+            "/articles/",
+            "/en/articles/",
+            "/docs/",
+            "/blog",
+            "/news",
+            "/release-notes",
+            "/release_notes",
+        )
+    )
 
 
 def _is_secondary_project_reference_domain(
@@ -1047,6 +1175,8 @@ def _is_known_project_domain(domain: str) -> bool:
         "autogen",
         "dify",
         "modelcontextprotocol",
+        "anthropic",
+        "claude",
     )
     compact_domain = _compact(domain)
     return any(marker in compact_domain for marker in project_markers)

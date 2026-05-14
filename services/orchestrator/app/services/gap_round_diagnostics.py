@@ -236,3 +236,165 @@ def verification_supported_count_from_summary(verification_summary: dict[str, An
         return 0
     raw = counts.get("supported")
     return int(raw) if isinstance(raw, int) else 0
+
+
+def research_round_entry_from_gap_stage_result(
+    stage: dict[str, Any],
+    *,
+    sequence_index: int,
+) -> dict[str, Any]:
+    """
+    One RESEARCHING_MORE stage_completed ``result`` object -> compact per-round observability.
+
+    ``sequence_index`` is 0-based order within the task when multiple gap rounds exist.
+    """
+    search = stage.get("search")
+    search = search if isinstance(search, dict) else {}
+    acquisition = stage.get("acquisition")
+    acquisition = acquisition if isinstance(acquisition, dict) else {}
+    parsing = stage.get("parsing")
+    parsing = parsing if isinstance(parsing, dict) else {}
+    drafting = stage.get("drafting")
+    drafting = drafting if isinstance(drafting, dict) else {}
+    verification = stage.get("verification")
+    verification = verification if isinstance(verification, dict) else {}
+    gap_diag = stage.get("gap_round_diagnostics")
+    gap_diag = gap_diag if isinstance(gap_diag, dict) else {}
+    gap_analysis = stage.get("gap_analysis")
+    gap_analysis = gap_analysis if isinstance(gap_analysis, dict) else {}
+
+    queries: list[str] = []
+    for row in search.get("search_queries", []):
+        if not isinstance(row, dict):
+            continue
+        qt = row.get("query_text")
+        if isinstance(qt, str) and qt.strip():
+            queries.append(qt.strip())
+
+    candidate_urls: list[str] = []
+    for row in search.get("selected_sources", []):
+        if not isinstance(row, dict):
+            continue
+        url = row.get("canonical_url")
+        if isinstance(url, str) and url.strip():
+            candidate_urls.append(url.strip())
+    candidate_urls = list(dict.fromkeys(candidate_urls))[:80]
+
+    new_urls_raw = gap_diag.get("selected_candidate_urls")
+    new_candidate_urls: list[str] = []
+    if isinstance(new_urls_raw, list):
+        new_candidate_urls = [
+            str(u).strip() for u in new_urls_raw if isinstance(u, str) and str(u).strip()
+        ][:80]
+
+    fetch_attempts = gap_diag.get("fetch_attempts_created")
+    if not isinstance(fetch_attempts, int):
+        fetch_attempts = int(acquisition.get("fetch_succeeded") or 0) + int(
+            acquisition.get("fetch_failed") or 0
+        )
+    fetch_succeeded = gap_diag.get("content_snapshots_created")
+    if not isinstance(fetch_succeeded, int):
+        fetch_succeeded = int(acquisition.get("fetch_succeeded") or acquisition.get("succeeded") or 0)
+
+    source_documents = gap_diag.get("source_documents_created")
+    if not isinstance(source_documents, int):
+        source_documents = int(parsing.get("created") or 0)
+
+    source_chunks = gap_diag.get("source_chunks_created")
+    if not isinstance(source_chunks, int):
+        source_chunks = 0
+
+    claims_created = gap_diag.get("drafting_created_claims")
+    claims_reused = gap_diag.get("drafting_reused_claims")
+    if not isinstance(claims_created, int):
+        claims_created = int(drafting.get("created_claims") or 0)
+    if not isinstance(claims_reused, int):
+        claims_reused = int(drafting.get("reused_claims") or 0)
+    claims_total = claims_created + claims_reused
+
+    supported = gap_diag.get("verification_supported_claims")
+    if not isinstance(supported, int):
+        vs = verification.get("verification_summary")
+        supported = (
+            verification_supported_count_from_summary(vs)
+            if isinstance(vs, dict)
+            else 0
+        )
+
+    round_no = gap_diag.get("gap_round_index")
+    if not isinstance(round_no, int):
+        raw_rn = gap_analysis.get("round_no")
+        if isinstance(raw_rn, int):
+            round_no = raw_rn
+        else:
+            try:
+                round_no = int(raw_rn) if raw_rn is not None else sequence_index + 1
+            except (TypeError, ValueError):
+                round_no = sequence_index + 1
+
+    status, reason = _research_round_status_reason(stage, gap_diag=gap_diag)
+
+    return {
+        "round": round_no,
+        "sequence_index": sequence_index,
+        "queries": queries,
+        "candidate_urls": candidate_urls,
+        "new_candidate_urls": new_candidate_urls,
+        "fetch_attempts": int(fetch_attempts),
+        "fetch_succeeded": int(fetch_succeeded),
+        "source_documents": int(source_documents),
+        "source_chunks": int(source_chunks),
+        "claims": int(claims_total),
+        "supported_claims": int(supported),
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _research_round_status_reason(
+    stage: dict[str, Any],
+    *,
+    gap_diag: dict[str, Any],
+) -> tuple[str, str | None]:
+    outcome = str(gap_diag.get("gap_round_outcome") or "")
+    skip = gap_diag.get("skip_drafting_reason")
+    skip_s = str(skip).strip() if isinstance(skip, str) and skip.strip() else None
+    search = stage.get("search")
+    search = search if isinstance(search, dict) else {}
+
+    if gap_diag.get("supplemental_search_failed"):
+        if search.get("failed") is True:
+            sr = search.get("reason")
+            msg = str(sr) if isinstance(sr, str) and sr.strip() else "supplemental_search_failed"
+            return "search_timeout", skip_s or msg
+        return "search_timeout", skip_s or "supplemental_search_failed"
+
+    if skip_s in {
+        SKIP_NO_CANDIDATE_URLS,
+        SKIP_NO_SELECTED_CANDIDATES,
+        SKIP_NO_FOLLOWUP_QUERIES,
+    }:
+        return "no_new_urls", skip_s
+
+    if outcome == GAP_ROUND_OUTCOME_DRAFTED:
+        supported = int(gap_diag.get("verification_supported_claims") or 0)
+        created = int(gap_diag.get("drafting_created_claims") or 0)
+        if supported > 0 or created > 0:
+            return "produced", None
+        return "drafted", skip_s
+
+    if outcome == GAP_ROUND_OUTCOME_SKIPPED:
+        return "skipped", skip_s
+
+    if outcome == GAP_ROUND_OUTCOME_FAILED:
+        return "failed", skip_s
+
+    return "unknown", skip_s
+
+
+def research_rounds_from_gap_stage_results(gap_rounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        research_round_entry_from_gap_stage_result(item, sequence_index=idx)
+        for idx, item in enumerate(gap_rounds)
+        if isinstance(item, dict)
+    ]

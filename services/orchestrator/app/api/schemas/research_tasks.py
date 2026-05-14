@@ -152,6 +152,7 @@ class ResearchTaskObservabilityResponse(BaseModel):
     research_strategy: dict[str, Any] | None = None
     gap_analysis: dict[str, Any] | None = None
     gap_rounds: list[dict[str, Any]] = Field(default_factory=list)
+    research_rounds: list[dict[str, Any]] = Field(default_factory=list)
     failure_diagnostics: dict[str, Any] | None = None
     pipeline_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)

@@ -18,6 +18,7 @@ from services.orchestrator.app.services.debug_pipeline import (
 from services.orchestrator.app.services.gap_round_diagnostics import (
     GAP_ROUND_OUTCOME_DRAFTED,
     GAP_ROUND_OUTCOME_SKIPPED,
+    SKIP_NO_CANDIDATE_URLS,
     SKIP_NO_CONTENT_SNAPSHOTS,
     SKIP_NO_NEW_CHUNKS,
     SKIP_NO_SOURCE_CHUNKS,
@@ -26,6 +27,7 @@ from services.orchestrator.app.services.gap_round_diagnostics import (
     SKIP_UNKNOWN,
     attach_gap_round_to_stage_result,
     build_gap_round_diagnostics,
+    research_round_entry_from_gap_stage_result,
     summarize_gap_round_diagnostics_for_task,
 )
 from services.orchestrator.app.services.indexing import IndexingBatchResult
@@ -552,4 +554,108 @@ def test_summarize_gap_round_diagnostics_for_task() -> None:
     }
     assert summary["nested_drafting_created_claims_total"] == 2
     assert summary["nested_verification_supported_claims_total"] == 2
+
+
+def test_research_round_entry_search_timeout() -> None:
+    stage = {
+        "gap_analysis": {"round_no": 2},
+        "search": {"failed": True, "reason": "searx_timeout", "search_queries": []},
+        "gap_round_diagnostics": {
+            "gap_round_index": 2,
+            "supplemental_search_failed": True,
+            "skip_drafting_reason": SKIP_SUPPLEMENTAL_SEARCH_FAILED_CONTINUING_EXISTING_EVIDENCE,
+        },
+    }
+    row = research_round_entry_from_gap_stage_result(stage, sequence_index=1)
+    assert row["status"] == "search_timeout"
+    assert row["round"] == 2
+
+
+def test_research_round_entry_no_new_urls() -> None:
+    diag = build_gap_round_diagnostics(
+        gap_round_outcome=GAP_ROUND_OUTCOME_SKIPPED,
+        skip_drafting_reason=SKIP_NO_CANDIDATE_URLS,
+        gap_round_index=1,
+        strategy_decision=None,
+        gap_triggered=True,
+        search_attempted=True,
+        search_skipped_reason=None,
+        search_queries_count=1,
+        search_result_count=0,
+        candidate_urls_added=0,
+        selected_candidate_ids=[],
+        selected_candidate_urls=[],
+        fetch_jobs_created=0,
+        fetch_attempts_created=0,
+        content_snapshots_created=0,
+        source_documents_created=0,
+        source_chunks_created=0,
+        parse_attempted=False,
+        index_attempted=False,
+        drafting_attempted=False,
+        drafting_created_claims=None,
+        drafting_reused_claims=None,
+        verification_attempted=False,
+        verification_supported_claims=None,
+        coverage_before=[],
+        coverage_after=[],
+    )
+    stage = {
+        "gap_analysis": {"round_no": 1},
+        "search": {
+            "search_queries": [{"query_text": "Claude API limits"}],
+            "selected_sources": [],
+            "candidate_urls_added": 0,
+        },
+        "gap_round_diagnostics": diag,
+    }
+    row = research_round_entry_from_gap_stage_result(stage, sequence_index=0)
+    assert row["status"] == "no_new_urls"
+    assert row["queries"] == ["Claude API limits"]
+    assert row["new_candidate_urls"] == []
+
+
+def test_research_round_entry_produced() -> None:
+    diag = build_gap_round_diagnostics(
+        gap_round_outcome=GAP_ROUND_OUTCOME_DRAFTED,
+        skip_drafting_reason=None,
+        gap_round_index=3,
+        strategy_decision=None,
+        gap_triggered=True,
+        search_attempted=True,
+        search_skipped_reason=None,
+        search_queries_count=1,
+        search_result_count=4,
+        candidate_urls_added=2,
+        selected_candidate_ids=[],
+        selected_candidate_urls=["https://a.example/x", "https://b.example/y"],
+        fetch_jobs_created=2,
+        fetch_attempts_created=2,
+        content_snapshots_created=2,
+        source_documents_created=1,
+        source_chunks_created=5,
+        parse_attempted=True,
+        index_attempted=True,
+        drafting_attempted=True,
+        drafting_created_claims=2,
+        drafting_reused_claims=1,
+        verification_attempted=True,
+        verification_supported_claims=2,
+        coverage_before=[],
+        coverage_after=[],
+    )
+    stage = {
+        "gap_analysis": {"round_no": 3},
+        "search": {
+            "search_queries": [{"query_text": "q1"}],
+            "selected_sources": [{"canonical_url": "https://c.example/z"}],
+        },
+        "gap_round_diagnostics": diag,
+    }
+    row = research_round_entry_from_gap_stage_result(stage, sequence_index=2)
+    assert row["status"] == "produced"
+    assert row["fetch_succeeded"] == 2
+    assert row["claims"] == 3
+    assert row["supported_claims"] == 2
+    assert len(row["new_candidate_urls"]) == 2
 

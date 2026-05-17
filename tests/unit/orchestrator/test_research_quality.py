@@ -23,8 +23,8 @@ def test_source_intent_generalizes_docs_about_and_wikipedia() -> None:
         query="What is OpenSearch and how does it work?",
     )
 
-    assert langgraph_about.source_intent == "official_about"
-    assert langgraph_about.fetch_priority_score == 0
+    assert langgraph_about.source_intent == "official_docs_reference"
+    assert langgraph_about.fetch_priority_score == 10
     assert opensearch_wikipedia.source_intent == "wikipedia_reference"
     assert opensearch_wikipedia.fetch_priority_score == 1
 
@@ -102,9 +102,11 @@ def test_source_intent_does_not_promote_generic_what_is_pages_to_official() -> N
         query=query,
     )
 
-    assert geeksforgeeks.source_intent == "generic_article"
-    assert ibm.source_intent == "generic_article"
-    assert official_docs.source_intent == "official_about"
+    assert geeksforgeeks.source_category == "generic_article"
+    assert geeksforgeeks.source_intent.startswith("generic_article_")
+    assert ibm.source_category == "generic_article"
+    assert ibm.source_intent.startswith("generic_article_")
+    assert official_docs.source_intent == "official_docs_reference"
     assert reference_docs.source_intent == "official_docs_reference"
     assert reference_docs.fetch_priority_score < geeksforgeeks.fetch_priority_score
     assert unrelated_docs.downrank_reason == "off_subject_source_downranked_for_query"
@@ -182,7 +184,7 @@ def test_source_intent_handles_multiple_comparison_entities() -> None:
         query=query,
     )
 
-    assert langgraph_docs.source_intent == "official_about"
+    assert langgraph_docs.source_intent == "official_docs_reference"
     assert autogen_docs.source_intent == "official_docs_reference"
     assert autogen_repo.source_intent == "github_readme_or_repo"
     assert autogen_docs.downrank_reason is None

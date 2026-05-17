@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,8 +32,13 @@ from services.orchestrator.app.claims import (
     score_claim_statement,
 )
 from services.orchestrator.app.llm import LLMError, LLMProvider
+from services.orchestrator.app.llm.providers import NoopLLMProvider
 from services.orchestrator.app.planning import ResearchPlan
 from services.orchestrator.app.planning.planner import research_plan_from_serialized_payload
+from services.orchestrator.app.query_intent_signals import (
+    detect_report_archetype,
+    query_has_lexical_recency_or_update_markers,
+)
 from services.orchestrator.app.reporting import (
     DEFAULT_REPORT_LANGUAGE,
     ClaimStatus,
@@ -48,6 +54,24 @@ from services.orchestrator.app.reporting import (
     render_grounded_llm_report,
     render_markdown_report,
     resolve_report_language,
+)
+from services.orchestrator.app.reporting.structured_llm_synthesis.diagnostics import (
+    collect_sections_rendered,
+    pack_structured_llm_synthesis_diagnostics,
+)
+from services.orchestrator.app.reporting.structured_llm_synthesis.invoke import (
+    invoke_structured_synthesis_bundle,
+)
+from services.orchestrator.app.reporting.structured_llm_synthesis.render import (
+    append_to_rendered_markdown,
+    render_validated_bundle_markdown,
+)
+from services.orchestrator.app.reporting.structured_llm_synthesis.schema import (
+    StructuredSynthesisStageFlags,
+)
+from services.orchestrator.app.reporting.structured_llm_synthesis.validate import (
+    bundle_has_renderable_content,
+    validate_and_sanitize_bundle,
 )
 from services.orchestrator.app.research_quality import (
     build_slot_coverage_summary,
@@ -243,6 +267,13 @@ class ReportSynthesisService:
         llm_model: str = "",
         llm_report_writer_enabled: bool = False,
         llm_report_max_output_tokens: int = 2400,
+        llm_structured_synthesis_enabled: bool = False,
+        llm_report_structure_enabled: bool = False,
+        llm_method_card_extraction_enabled: bool = False,
+        llm_comparison_table_enabled: bool = False,
+        llm_synthesis_insights_enabled: bool = False,
+        llm_structured_synthesis_confidence_threshold: float = 0.55,
+        llm_structured_synthesis_max_input_chars: int = 12000,
         include_ledger_debug_appendix: bool = False,
     ) -> None:
         self.session = session
@@ -257,6 +288,17 @@ class ReportSynthesisService:
         self.llm_model = llm_model
         self.llm_report_writer_enabled = llm_report_writer_enabled
         self.llm_report_max_output_tokens = llm_report_max_output_tokens
+        self.llm_structured_synthesis_enabled = llm_structured_synthesis_enabled
+        self.llm_report_structure_enabled = llm_report_structure_enabled
+        self.llm_method_card_extraction_enabled = llm_method_card_extraction_enabled
+        self.llm_comparison_table_enabled = llm_comparison_table_enabled
+        self.llm_synthesis_insights_enabled = llm_synthesis_insights_enabled
+        self.llm_structured_synthesis_confidence_threshold = (
+            llm_structured_synthesis_confidence_threshold
+        )
+        self.llm_structured_synthesis_max_input_chars = (
+            llm_structured_synthesis_max_input_chars
+        )
         self.include_ledger_debug_appendix = include_ledger_debug_appendix
 
     def generate_markdown_report(self, task_id: UUID) -> ReportSynthesisResult:
@@ -453,6 +495,144 @@ class ReportSynthesisService:
             draft_claims=0,
         )
 
+
+    def _maybe_append_structured_llm_synthesis(
+        self,
+        *,
+        rendered: RenderedMarkdownReport,
+        task: ResearchTask,
+        report_claims: list[ReportClaimItem],
+        sources: list[ReportSourceItem],
+        report_language: str,
+        research_plan_payload: dict[str, object] | None,
+        report_archetype: str,
+        plan_intent: str | None,
+    ) -> tuple[RenderedMarkdownReport, dict[str, object]]:
+        master_enabled = self.llm_structured_synthesis_enabled
+
+        def pack(
+            *,
+            attempted: bool,
+            rendered_ok: bool,
+            skipped_reason: str,
+            warnings: list[str] | None = None,
+            sections: list[str] | None = None,
+        ) -> dict[str, object]:
+            return pack_structured_llm_synthesis_diagnostics(
+                enabled=master_enabled,
+                attempted=attempted,
+                rendered=rendered_ok,
+                skipped_reason=skipped_reason,
+                warnings=list(warnings or []),
+                sections_rendered=list(sections or []),
+            )
+
+        if not master_enabled:
+            return rendered, pack(
+                attempted=False, rendered_ok=False, skipped_reason="master_disabled"
+            )
+        if self.llm_provider is None or isinstance(self.llm_provider, NoopLLMProvider):
+            return rendered, pack(attempted=False, rendered_ok=False, skipped_reason="no_llm_provider")
+        if report_archetype not in {"research_survey", "technical_comparison"}:
+            return rendered, pack(attempted=False, rendered_ok=False, skipped_reason="archetype_skipped")
+        flags = StructuredSynthesisStageFlags(
+            structure=self.llm_report_structure_enabled,
+            method_cards=self.llm_method_card_extraction_enabled,
+            comparison_table=self.llm_comparison_table_enabled,
+            insights=self.llm_synthesis_insights_enabled,
+        )
+        if not any(
+            (
+                flags.structure,
+                flags.method_cards,
+                flags.comparison_table,
+                flags.insights,
+            )
+        ):
+            return rendered, pack(attempted=False, rendered_ok=False, skipped_reason="all_subflags_off")
+        if query_has_lexical_recency_or_update_markers(task.query):
+            return rendered, pack(attempted=False, rendered_ok=False, skipped_reason="recency_query")
+        try:
+            raw = invoke_structured_synthesis_bundle(
+                llm_provider=self.llm_provider,
+                llm_model=self.llm_model,
+                max_output_tokens=min(self.llm_report_max_output_tokens, 1600),
+                task_id=task.id,
+                research_question=task.query,
+                report_archetype=report_archetype,
+                plan_intent=plan_intent,
+                research_plan=cast(dict[str, Any] | None, research_plan_payload),
+                claims=report_claims,
+                sources=sources,
+                max_input_chars=self.llm_structured_synthesis_max_input_chars,
+            )
+            bundle, warnings = validate_and_sanitize_bundle(
+                raw,
+                claims=report_claims,
+                research_question=task.query,
+                deterministic_archetype=report_archetype,
+                confidence_threshold=self.llm_structured_synthesis_confidence_threshold,
+                flags=flags,
+            )
+            warn_list = list(warnings)
+            if bundle is None or not bundle_has_renderable_content(bundle, flags):
+                skipped = "validation_failed"
+                if warn_list == ["recency_lexical_skips_structured_synthesis"]:
+                    skipped = "recency_query"
+                elif any(w.startswith("schema_validation_error") for w in warn_list):
+                    skipped = "schema_validation_failed"
+                elif "missing_archetype_judge" in warn_list:
+                    skipped = "missing_archetype_judge"
+                elif "archetype_confidence_below_threshold" in warn_list:
+                    skipped = "archetype_confidence_below_threshold"
+                elif "invalid_archetype_enum" in warn_list:
+                    skipped = "invalid_archetype_enum"
+                elif bundle is not None and not bundle_has_renderable_content(bundle, flags):
+                    skipped = "no_renderable_content_after_validation"
+                return rendered, pack(
+                    attempted=True,
+                    rendered_ok=False,
+                    skipped_reason=skipped,
+                    warnings=warn_list,
+                )
+            fragment = render_validated_bundle_markdown(
+                bundle,
+                claims=report_claims,
+                base_markdown=rendered.markdown,
+                report_language=report_language,
+                flags=flags,
+            )
+            sections = collect_sections_rendered(bundle, flags)
+            return append_to_rendered_markdown(rendered, fragment=fragment), pack(
+                attempted=True,
+                rendered_ok=True,
+                skipped_reason="",
+                warnings=warn_list,
+                sections=sections,
+            )
+        except LLMError as error:
+            logger.warning(
+                "report.structured_llm_synthesis_failed",
+                extra={"task_id": str(task.id), "error": error.to_payload()},
+            )
+            return rendered, pack(
+                attempted=True,
+                rendered_ok=False,
+                skipped_reason="llm_error",
+                warnings=[f"llm_error:{error.error_code}"],
+            )
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            logger.warning(
+                "report.structured_llm_synthesis_parse_failed",
+                extra={"task_id": str(task.id), "error": str(error)},
+            )
+            return rendered, pack(
+                attempted=True,
+                rendered_ok=False,
+                skipped_reason="parse_error",
+                warnings=["parse_error"],
+            )
+
     def _prepare_report(self, task: ResearchTask) -> PreparedReport:
         report_language = resolve_report_language(task.constraints_json)
         claims = self.claim_repository.list_for_task(task.id)
@@ -645,6 +825,19 @@ class ReportSynthesisService:
 
         sources = list(source_items.values())
         self.session.flush()
+        research_plan = self._latest_existing_research_plan(task)
+        research_plan_payload = research_plan.to_payload() if research_plan else None
+        plan_intent: str | None = None
+        if isinstance(research_plan_payload, dict):
+            raw_pi = research_plan_payload.get("intent")
+            if isinstance(raw_pi, str) and raw_pi.strip():
+                plan_intent = raw_pi.strip()
+        domain_list = [s.domain for s in sources if s.domain]
+        report_archetype = detect_report_archetype(
+            task.query,
+            plan_intent=plan_intent,
+            source_domains=domain_list,
+        )
         deterministic_rendered = render_markdown_report(
             task_id=task.id,
             research_question=task.query,
@@ -668,8 +861,6 @@ class ReportSynthesisService:
             if claim.verification_status == "supported" and claim.support_level == "weak"
         )
         if self.llm_report_writer_enabled and self.llm_provider is not None:
-            research_plan = self._latest_existing_research_plan(task)
-            research_plan_payload = research_plan.to_payload() if research_plan else None
             try:
                 llm_report = render_grounded_llm_report(
                     task_id=task.id,
@@ -720,12 +911,24 @@ class ReportSynthesisService:
                 rendered = llm_report.rendered
                 report_writer = dict(llm_report.metadata)
                 report_writer["language"] = report_language
+        rendered, structured_diag = self._maybe_append_structured_llm_synthesis(
+            rendered=rendered,
+            task=task,
+            report_claims=report_claims,
+            sources=sources,
+            report_language=report_language,
+            research_plan_payload=research_plan_payload,
+            report_archetype=report_archetype,
+            plan_intent=plan_intent,
+        )
         report_writer = {
             **report_writer,
+            "report_archetype": report_archetype,
             "report_filter_summary": dict(report_filter_counts),
             "critic_result": rendered.critic_result or {},
             "synthesis_plan": rendered.synthesis_plan or {},
             "redundancy_clusters": rendered.redundancy_clusters or [],
+            "structured_llm_synthesis": structured_diag,
         }
         finalized_focus = _finalize_report_focus_diagnostics(focus_diag)
         return PreparedReport(
@@ -839,6 +1042,9 @@ def create_report_synthesis_service(
     llm_report_max_output_tokens: int = 2400,
     include_ledger_debug_appendix: bool = False,
 ) -> ReportSynthesisService:
+    from services.orchestrator.app.settings import get_settings
+
+    cfg = get_settings()
     return ReportSynthesisService(
         session,
         task_repository=ResearchTaskRepository(session),
@@ -852,6 +1058,15 @@ def create_report_synthesis_service(
         llm_model=llm_model,
         llm_report_writer_enabled=llm_report_writer_enabled,
         llm_report_max_output_tokens=llm_report_max_output_tokens,
+        llm_structured_synthesis_enabled=cfg.llm_structured_synthesis_enabled,
+        llm_report_structure_enabled=cfg.llm_report_structure_enabled,
+        llm_method_card_extraction_enabled=cfg.llm_method_card_extraction_enabled,
+        llm_comparison_table_enabled=cfg.llm_comparison_table_enabled,
+        llm_synthesis_insights_enabled=cfg.llm_synthesis_insights_enabled,
+        llm_structured_synthesis_confidence_threshold=(
+            cfg.llm_structured_synthesis_confidence_threshold
+        ),
+        llm_structured_synthesis_max_input_chars=cfg.llm_structured_synthesis_max_input_chars,
         include_ledger_debug_appendix=include_ledger_debug_appendix,
     )
 

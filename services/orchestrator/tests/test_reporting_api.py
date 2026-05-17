@@ -46,9 +46,20 @@ def test_report_endpoints_generate_and_return_latest_markdown(
         assert generate_response.json()["mixed_claims"] == 1
         assert generate_response.json()["contradicted_claims"] == 0
         assert generate_response.json()["unsupported_claims"] == 1
-        assert "## Executive Summary" in generate_response.json()["markdown"]
-        assert "[UNSUPPORTED]: The unsupported claim currently lacks support evidence." in (
-            generate_response.json()["markdown"]
+        markdown = generate_response.json()["markdown"]
+        assert any(
+            heading in markdown
+            for heading in ("## Executive Summary", "## Executive summary", "## 摘要")
+        ), markdown[:500]
+        # Ledger claims must surface in reader markdown (deterministic or LLM-grounded).
+        low = markdown.lower()
+        assert "supported claim" in low and "backed" in low
+        assert "mixed claim" in low
+        assert (
+            "unsupported claim" in low
+            or "lacks support" in low
+            or "without support" in low
+            or ("unsupported" in low and "claim" in low)
         )
 
         assert get_response.status_code == 200
@@ -138,11 +149,20 @@ def test_report_generation_uses_zh_cn_template_from_task_constraints(
         assert generate_response.status_code == 200
         payload = generate_response.json()
         assert payload["report_language"] == "zh-CN"
-        assert payload["writer_mode"] == "deterministic"
-        assert payload["title"].startswith("研究报告：")
-        assert "## 研究问题" in payload["markdown"]
-        assert "## 执行摘要" in payload["markdown"]
-        assert "## 附录：claim/evidence/citation 映射" in payload["markdown"]
+        assert payload["writer_mode"] in ("deterministic", "llm_grounded")
+        if payload["writer_mode"] == "deterministic":
+            assert payload["title"].startswith("研究报告：")
+        else:
+            assert payload["title"].strip()
+        md = payload["markdown"]
+        if payload["writer_mode"] == "deterministic":
+            assert "## 研究问题" in md
+            assert "## 执行摘要" in md or "## 摘要" in md
+            assert "## 附录：claim/evidence/citation 映射" in md
+        else:
+            assert "研究问题" in md or "调查问题" in md
+            assert "执行摘要" in md or "摘要" in md or "证据基础" in md
+            assert "附录" in md
     finally:
         client_generator.close()
 

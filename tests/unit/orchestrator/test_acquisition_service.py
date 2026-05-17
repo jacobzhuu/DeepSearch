@@ -30,7 +30,17 @@ from services.orchestrator.app.services.acquisition import (
     fetch_priority_metadata,
 )
 from services.orchestrator.app.services.research_tasks import create_research_task_service
+from services.orchestrator.app.settings import get_settings
 from services.orchestrator.app.storage import FilesystemSnapshotObjectStore
+
+
+@pytest.fixture(autouse=True)
+def _acquisition_service_tests_use_noop_llm_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep acquisition tests deterministic; do not call ambient LLM source-classifier APIs."""
+    monkeypatch.setenv("LLM_PROVIDER", "noop")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 class StaticResolver:

@@ -5,10 +5,45 @@ from dataclasses import dataclass
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
+from services.orchestrator.app.research_quality.readme_normalized_signals import (
+    is_raw_github_readme_url,
+)
+
 _SUBJECT_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
 _COMPACT_PATTERN = re.compile(r"[^a-z0-9]+")
 _OFF_SUBJECT_PRIORITY_SCORE = 35
 _SECONDARY_REFERENCE_PRIORITY_SCORE = 30
+_GENERIC_ARTICLE_HIGH_SIGNAL_PRIORITY_SCORE = 18
+_GENERIC_ARTICLE_NORMAL_PRIORITY_SCORE = 20
+_GENERIC_ARTICLE_LOW_SIGNAL_PRIORITY_SCORE = 55
+_GENERIC_ARTICLE_SEO_PRIORITY_SCORE = 70
+_QUERY_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "compare",
+        "does",
+        "for",
+        "how",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "versus",
+        "vs",
+        "what",
+        "with",
+        "work",
+        "works",
+    }
+)
 _SUBJECT_SENSITIVE_SOURCE_CATEGORIES = frozenset(
     {
         "official_about",
@@ -154,6 +189,7 @@ _PROJECT_OWNERSHIP: dict[str, _ProjectOwnershipProfile] = {
 class SourceIntentClassification:
     source_category: str
     source_intent: str
+    source_quality_tier: str
     source_role: str
     fetch_priority_score: int
     fetch_priority_reason: str
@@ -164,14 +200,23 @@ class SourceIntentClassification:
     downrank_reason: str | None
     source_selection_guardrail_applied: bool
     known_path_candidate: bool
+    classification_method: str = "rule"
+    classification_confidence: float | None = None
+    classification_reason: str | None = None
 
     def to_metadata(self) -> dict[str, Any]:
+        conf = (
+            self.classification_confidence
+            if self.classification_confidence is not None
+            else self.source_quality_score
+        )
         return {
             "fetch_priority_score": self.fetch_priority_score,
             "fetch_priority_reason": self.fetch_priority_reason,
             "source_quality_score": self.source_quality_score,
             "source_category": self.source_category,
             "source_intent": self.source_intent,
+            "source_quality_tier": self.source_quality_tier,
             "source_role": self.source_role,
             "source_selection_reason": self.source_selection_reason,
             "selected_reason": self.selected_reason,
@@ -180,7 +225,126 @@ class SourceIntentClassification:
             "known_path_candidate": self.known_path_candidate,
             "whether_known_path_candidate": self.known_path_candidate,
             "source_selection_guardrail_applied": self.source_selection_guardrail_applied,
+            "classification_method": self.classification_method,
+            "classification_confidence": conf,
+            "classification_reason": self.classification_reason,
         }
+
+
+_NEWS_MEDIA_PRIORITY_SCORE = 46
+_DEVELOPER_BLOG_PRIORITY_SCORE = 47
+_CHINESE_TECH_COMMUNITY_PRIORITY_SCORE = 51
+_COMMUNITY_BLOG_PRIORITY_SCORE = 53
+
+
+def _coarse_source_quality_tier(source_intent: str) -> str:
+    if source_intent.startswith("generic_article_"):
+        return "generic_article"
+    return source_intent
+
+
+def _publisher_domain_intent_override(
+    normalized_domain: str,
+    path: str,
+    title: str,
+    base: SourceIntentClassification,
+) -> tuple[str, int, float] | None:
+    if base.source_category in {"forum_social_video", "low_quality_or_blocked"}:
+        return None
+    d = normalized_domain
+    if d == "openai.com":
+        if path.startswith("/research"):
+            return ("vendor_blog", 9, 0.74)
+        if path.startswith("/blog") or path.startswith("/news"):
+            return ("vendor_blog", 9, 0.72)
+        return ("official_site", 7, 0.82)
+    if d.endswith(".openai.com"):
+        head = d.split(".")[0]
+        if head == "help":
+            return ("official_help_center", 6, 0.84)
+        if head == "developers":
+            return ("official_developer_docs", 8, 0.8)
+        if head == "platform":
+            return ("official_developer_docs", 8, 0.8)
+        if head == "cookbook":
+            return ("vendor_blog", 9, 0.72)
+        if head in {"blog", "research"}:
+            return ("vendor_blog", 9, 0.72)
+        return ("official_site", 7, 0.8)
+    if d == "techcrunch.com" or d.endswith(".techcrunch.com"):
+        return ("news_media", _NEWS_MEDIA_PRIORITY_SCORE, 0.64)
+    if d == "blog.csdn.net" or d.endswith(".blog.csdn.net"):
+        return ("chinese_tech_community", _CHINESE_TECH_COMMUNITY_PRIORITY_SCORE, 0.5)
+    if d.endswith(".csdn.net") and ("blog" in d or path.startswith("/article")):
+        return ("chinese_tech_community", _CHINESE_TECH_COMMUNITY_PRIORITY_SCORE, 0.5)
+    if "zhuanlan" in d and d.endswith("zhihu.com"):
+        return ("chinese_tech_community", _CHINESE_TECH_COMMUNITY_PRIORITY_SCORE, 0.5)
+    if d == "juejin.cn" or d.endswith(".juejin.cn"):
+        return ("chinese_tech_community", _CHINESE_TECH_COMMUNITY_PRIORITY_SCORE, 0.5)
+    if d == "medium.com" or d.endswith(".medium.com"):
+        return ("community_blog", _COMMUNITY_BLOG_PRIORITY_SCORE, 0.52)
+    if d == "dev.to" or d.endswith(".dev.to"):
+        return ("developer_blog", _DEVELOPER_BLOG_PRIORITY_SCORE, 0.6)
+    return None
+
+
+def _refine_publisher_domain_intent(
+    *,
+    canonical_url: str,
+    domain: str | None,
+    title: str | None,
+    query: str | None,
+    base: SourceIntentClassification,
+) -> SourceIntentClassification:
+    if base.fetch_priority_score == _OFF_SUBJECT_PRIORITY_SCORE:
+        return base
+    normalized_domain = (domain or "").strip().lower().removeprefix("www.")
+    path = urlsplit(canonical_url or "").path.strip().lower()
+    normalized_title = (title or "").strip().lower()
+    hint = _publisher_domain_intent_override(
+        normalized_domain,
+        path,
+        normalized_title,
+        base,
+    )
+    if hint is None:
+        return base
+    new_intent, priority_score, quality_score = hint
+    reason = _fetch_priority_reason(priority_score)
+    selected_reason = _selected_reason_for_source_category(base.source_category, priority_score)
+    role = _source_role(
+        source_category=base.source_category,
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+    )
+    if new_intent == "official_developer_docs":
+        role = "official_docs"
+    elif new_intent == "official_help_center":
+        role = "official_docs"
+    elif new_intent == "vendor_blog":
+        role = "official_blog_or_changelog"
+    elif new_intent == "official_site" and role == "generic_article":
+        role = "official_docs"
+    return SourceIntentClassification(
+        source_category=base.source_category,
+        source_intent=new_intent,
+        source_quality_tier=_coarse_source_quality_tier(new_intent),
+        source_role=role,
+        fetch_priority_score=priority_score,
+        fetch_priority_reason=reason,
+        source_quality_score=quality_score,
+        source_selection_reason=selected_reason,
+        selected_reason=selected_reason,
+        selected_by=base.selected_by,
+        downrank_reason=_downrank_reason_for_source_category(base.source_category, priority_score),
+        source_selection_guardrail_applied=base.source_selection_guardrail_applied,
+        known_path_candidate=base.known_path_candidate,
+        classification_method=base.classification_method,
+        classification_confidence=base.classification_confidence,
+        classification_reason=base.classification_reason,
+    )
 
 
 def classify_source_intent(
@@ -197,7 +361,14 @@ def classify_source_intent(
         title=title,
         query=query,
     )
-    score = source_intent_priority(category, query=query)
+    source_intent = _source_intent_for_priority(
+        source_category=category,
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+    )
+    score = source_intent_priority(source_intent, query=query)
     normalized_domain = (domain or "").strip().lower().removeprefix("www.")
     path = urlsplit(canonical_url or "").path.strip().lower()
     if _nvidia_official_domain_for_score_boost(normalized_domain, path):
@@ -209,7 +380,7 @@ def classify_source_intent(
         title=title,
         query=query,
     ):
-        score = max(score, _OFF_SUBJECT_PRIORITY_SCORE)
+        score = _OFF_SUBJECT_PRIORITY_SCORE
     if (
         category == "official_home"
         and not _is_definition_or_overview_query(query)
@@ -229,13 +400,17 @@ def classify_source_intent(
         title=title,
         query=query,
     )
-    return SourceIntentClassification(
+    base_quality = _source_quality_score_for_fetch_priority(score)
+    if category == "official_research":
+        base_quality = 0.76
+    base = SourceIntentClassification(
         source_category=category,
-        source_intent=category,
+        source_intent=source_intent,
+        source_quality_tier=_coarse_source_quality_tier(source_intent),
         source_role=role,
         fetch_priority_score=score,
         fetch_priority_reason=reason,
-        source_quality_score=_source_quality_score_for_fetch_priority(score),
+        source_quality_score=base_quality,
         source_selection_reason=selected_reason,
         selected_reason=selected_reason,
         selected_by=_selected_by(category, known_path_candidate),
@@ -248,6 +423,9 @@ def classify_source_intent(
             "wikipedia_reference",
             "official_docs_reference",
             "github_readme_or_repo",
+            "github_topic",
+            "search_or_topic_aggregate",
+            "official_research",
             "package_registry",
             "standards_or_academic",
             "secondary_reference",
@@ -256,6 +434,16 @@ def classify_source_intent(
             "official_api_dev",
         },
         known_path_candidate=known_path_candidate,
+        classification_method="rule",
+        classification_confidence=base_quality,
+        classification_reason=None,
+    )
+    return _refine_publisher_domain_intent(
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+        base=base,
     )
 
 
@@ -276,7 +464,51 @@ def source_intent_metadata(
     ).to_metadata()
 
 
+_SOURCE_INTENT_PRIORITY_ALIASES: dict[str, str] = {
+    # LLM / external labels aligned to internal priority keys
+    "official_docs": "official_docs_reference",
+    "academic_paper": "standards_or_academic",
+    "tech_media": "news_media",
+    "cloud_vendor_article": "official_docs_reference",
+    "off_topic": "generic_article",
+    "official_news": "vendor_blog",
+    "official_policy": "official_about",
+    "unsafe_or_spam": "low_quality_or_blocked",
+    "unknown": "generic_article",
+}
+
+
 def source_intent_priority(category: str, *, query: str | None = None) -> int:
+    category = _SOURCE_INTENT_PRIORITY_ALIASES.get(category, category)
+    named_priority = {
+        "official_site": 7,
+        "official_help_center": 6,
+        "official_developer_docs": 8,
+        "official_research": 10,
+        "github_topic": _SECONDARY_REFERENCE_PRIORITY_SCORE,
+        "search_or_topic_aggregate": _SECONDARY_REFERENCE_PRIORITY_SCORE,
+        "vendor_blog": 9,
+        "news_media": _NEWS_MEDIA_PRIORITY_SCORE,
+        "developer_blog": _DEVELOPER_BLOG_PRIORITY_SCORE,
+        "chinese_tech_community": _CHINESE_TECH_COMMUNITY_PRIORITY_SCORE,
+        "community_blog": _COMMUNITY_BLOG_PRIORITY_SCORE,
+        "seo_syndicated": _GENERIC_ARTICLE_SEO_PRIORITY_SCORE,
+    }
+    if category in named_priority:
+        return named_priority[category]
+    if category == "generic_article_high_signal":
+        return _GENERIC_ARTICLE_HIGH_SIGNAL_PRIORITY_SCORE
+    if category in {"generic_article", "generic_article_normal"}:
+        return (
+            _GENERIC_ARTICLE_NORMAL_PRIORITY_SCORE
+            if _is_definition_or_overview_query(query)
+            else 50
+        )
+    if category == "generic_article_low_signal":
+        return _GENERIC_ARTICLE_LOW_SIGNAL_PRIORITY_SCORE
+    if category in {"generic_article_seo", "generic_article_seo_or_syndicated", "seo_syndicated"}:
+        return _GENERIC_ARTICLE_SEO_PRIORITY_SCORE
+
     overview_query = _is_definition_or_overview_query(query)
     explicit_admin_or_setup = _query_explicitly_asks_admin_or_setup(query)
 
@@ -288,9 +520,12 @@ def source_intent_priority(category: str, *, query: str | None = None) -> int:
             "official_docs_reference": 10,
             "official_repository": 11,
             "github_readme_or_repo": 12,
+            "official_research": 10,
+            "github_topic": _SECONDARY_REFERENCE_PRIORITY_SCORE,
+            "search_or_topic_aggregate": _SECONDARY_REFERENCE_PRIORITY_SCORE,
             "package_registry": 14,
             "standards_or_academic": 15,
-            "generic_article": 20,
+            "generic_article": _GENERIC_ARTICLE_NORMAL_PRIORITY_SCORE,
             "secondary_reference": _SECONDARY_REFERENCE_PRIORITY_SCORE,
             "official_architecture_admin": 40,
             "official_installation_admin": 42,
@@ -313,6 +548,9 @@ def source_intent_priority(category: str, *, query: str | None = None) -> int:
         "official_about": 5,
         "official_docs_reference": 5,
         "official_repository": 5,
+        "official_research": 10,
+        "github_topic": _SECONDARY_REFERENCE_PRIORITY_SCORE,
+        "search_or_topic_aggregate": _SECONDARY_REFERENCE_PRIORITY_SCORE,
         "package_registry": 8,
         "standards_or_academic": 8,
         "official_home": 10,
@@ -410,11 +648,164 @@ def _source_role(
         return "official_docs"
     if source_category in {"official_installation_admin"}:
         return "official_docs"
-    if source_category in {"wikipedia_reference", "secondary_reference", "package_registry"}:
+    if source_category in {
+        "wikipedia_reference",
+        "secondary_reference",
+        "package_registry",
+        "github_topic",
+        "search_or_topic_aggregate",
+    }:
         return "high_quality_secondary_reference"
-    if source_category == "generic_article":
+    if source_category.startswith("generic_article"):
         return "generic_article"
     return source_category or "generic_article"
+
+
+def _source_intent_for_priority(
+    *,
+    source_category: str,
+    canonical_url: str,
+    domain: str | None,
+    title: str | None,
+    query: str | None,
+) -> str:
+    if source_category != "generic_article":
+        return source_category
+    tier = _generic_article_signal_tier(
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+    )
+    if tier == "seo":
+        return "seo_syndicated"
+    return f"generic_article_{tier}"
+
+
+def _generic_article_signal_tier(
+    *,
+    canonical_url: str,
+    domain: str | None,
+    title: str | None,
+    query: str | None,
+) -> str:
+    normalized_domain = (domain or "").strip().lower().removeprefix("www.")
+    parsed = urlsplit(canonical_url or "")
+    path = parsed.path.strip().lower()
+    normalized_title = (title or "").strip().lower()
+    haystack = " ".join((normalized_domain, path, normalized_title))
+    subject_terms = _query_subject_terms(query)
+    overlap = _query_overlap_ratio(haystack, query)
+    subject_match = not subject_terms or _candidate_mentions_subject(
+        domain=normalized_domain,
+        path=path,
+        title=normalized_title,
+        subject_terms=subject_terms,
+    )
+
+    if _looks_like_seo_or_syndicated_generic_article(
+        domain=normalized_domain,
+        path=path,
+        title=normalized_title,
+    ):
+        return "seo"
+    signal_count = _generic_article_signal_count(haystack)
+    if not subject_match and overlap < 0.18:
+        return "low_signal"
+    if overlap < 0.14 and signal_count == 0:
+        return "low_signal"
+    if signal_count >= 2 and overlap >= 0.24:
+        return "high_signal"
+    if signal_count >= 3 and subject_match:
+        return "high_signal"
+    return "normal"
+
+
+def _looks_like_seo_or_syndicated_generic_article(*, domain: str, path: str, title: str) -> bool:
+    haystack = " ".join((domain, path, title))
+    seo_phrases = (
+        "advertorial",
+        "affiliate",
+        "alternatives",
+        "best ",
+        "complete guide",
+        "guest post",
+        "listicle",
+        "press release",
+        "press-release",
+        "pricing",
+        "review",
+        "reviews",
+        "sponsored",
+        "syndicated",
+        "top 10",
+        "top-10",
+        "ultimate guide",
+    )
+    if any(phrase in haystack for phrase in seo_phrases):
+        return True
+    return bool(re.search(r"\b(?:best|top)\s+\d+\b", haystack))
+
+
+def _generic_article_signal_count(haystack: str) -> int:
+    signal_patterns = (
+        r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b",
+        r"\bv?\d+\.\d+(?:\.\d+)?\b",
+        r"\bapi\b",
+        r"\barxiv\b",
+        r"\bbenchmark(?:s|ing)?\b",
+        r"\bdoi\b",
+        r"\bexperiment(?:s|al)?\b",
+        r"\bpaper\b",
+        r"\brelease(?:d|s)?\b",
+        r"\breport(?:ed|s)?\b",
+        r"\bresearch\b",
+        r"\bsdk\b",
+        r"\bstudy\b",
+        r"\bversion\b",
+        r"\bofficial\b",
+        r"\baccording to\b",
+        r"\bcitation(?:s)?\b",
+        r"\bquote(?:d|s)?\b",
+    )
+    return sum(1 for pattern in signal_patterns if re.search(pattern, haystack))
+
+
+def _is_search_or_topic_directory_aggregate(domain: str, path: str, query_string: str) -> bool:
+    """Search SERPs, tag directories, and similar discovery pages (not article bodies)."""
+    path_slash = f"/{path}/" if path else "//"
+    if domain.endswith("stackoverflow.com") and "/tagged/" in path_slash:
+        return True
+    if domain.endswith("stackexchange.com") and "/questions/tagged/" in path_slash:
+        return True
+    if domain.endswith("google.com") and path.startswith("/search"):
+        return True
+    if domain == "bing.com" and path.startswith("/search"):
+        return True
+    if domain.endswith("yahoo.com") and "/search" in path:
+        return True
+    if domain == "baidu.com" and path.startswith("/s"):
+        return True
+    _ = query_string  # reserved for future path+query heuristics
+    return False
+
+
+def _query_overlap_ratio(haystack: str, query: str | None) -> float:
+    if query is None:
+        return 0.0
+    query_tokens = [
+        _compact(token)
+        for token in _SUBJECT_TOKEN_PATTERN.findall(query)
+        if len(_compact(token)) >= 3 and _compact(token) not in _QUERY_STOPWORDS
+    ]
+    if not query_tokens:
+        return 0.0
+    compact_haystack = _compact(haystack)
+    if not compact_haystack:
+        return 0.0
+    unique_tokens = tuple(dict.fromkeys(query_tokens))
+    matched = sum(1 for token in unique_tokens if token in compact_haystack)
+    return matched / len(unique_tokens)
 
 
 def _source_category(
@@ -440,9 +831,10 @@ def _source_category(
         ".developer.nvidia.com"
     ):
         return "official_docs_reference"
-    if normalized_domain in {"research.nvidia.com", "www.research.nvidia.com"} or normalized_domain.endswith(
-        ".research.nvidia.com"
-    ):
+    if normalized_domain in {
+        "research.nvidia.com",
+        "www.research.nvidia.com",
+    } or normalized_domain.endswith(".research.nvidia.com"):
         return "official_docs_reference"
 
     if normalized_domain == "huggingface.co" and path.startswith("/nvidia"):
@@ -457,6 +849,10 @@ def _source_category(
 
     if not normalized_domain or path in {"/404", "/403"}:
         return "low_quality_or_blocked"
+    if _is_search_or_topic_directory_aggregate(
+        normalized_domain, path, (parsed.query or "").lower()
+    ):
+        return "search_or_topic_aggregate"
     if _is_low_value_overview_result(
         domain=normalized_domain,
         path=path,
@@ -468,7 +864,16 @@ def _source_category(
         return "forum_social_video"
     if normalized_domain.endswith("wikipedia.org") and path.startswith("/wiki/"):
         return "wikipedia_reference"
-    if _is_anthropic_claude_vendor_domain(normalized_domain) and _anthropic_claude_official_surface_path(
+    if normalized_domain.endswith("microsoft.com") and "/research" in path:
+        return "official_research"
+    if normalized_domain == "microsoft.github.io" or normalized_domain.endswith(
+        ".microsoft.github.io"
+    ):
+        if path == "/autogen" or path.startswith("/autogen/"):
+            return "official_docs_reference"
+    if _is_anthropic_claude_vendor_domain(
+        normalized_domain
+    ) and _anthropic_claude_official_surface_path(
         domain=normalized_domain,
         path=path,
         title=normalized_title,
@@ -487,7 +892,11 @@ def _source_category(
             return "official_repository"
         if _is_official_github_project_path(path=path, subject_terms=subject_terms):
             return "github_readme_or_repo"
+        if is_raw_github_readme_url(canonical_url):
+            return "github_readme_or_repo"
     if normalized_domain == "github.com":
+        if path == "/topics" or path.startswith("/topics/"):
+            return "github_topic"
         if _is_official_deployment_repository_path(
             path=path,
             subject_terms=subject_terms,
@@ -521,7 +930,13 @@ def _source_category(
         title=normalized_title,
     ):
         return "official_api_dev"
-    if _looks_like_about_path(path, normalized_title) and official_context:
+    if (
+        _looks_like_about_path(path, normalized_title)
+        and official_context
+        and not _strict_docs_multisegment_overview_is_doc_chapter(
+            domain=normalized_domain, path=path
+        )
+    ):
         return "official_about"
     if official_context and _is_docs_like(
         domain=normalized_domain, path=path, title=normalized_title
@@ -624,8 +1039,22 @@ def _fetch_priority_reason(score: int) -> str:
         return "project_homepage"
     if score == 9:
         return "github_repository_landing_page"
-    if score == 20:
+    if score == _GENERIC_ARTICLE_HIGH_SIGNAL_PRIORITY_SCORE:
+        return "generic_article_high_signal"
+    if score == _GENERIC_ARTICLE_NORMAL_PRIORITY_SCORE:
         return "wikipedia_or_generic_article"
+    if score == _GENERIC_ARTICLE_LOW_SIGNAL_PRIORITY_SCORE:
+        return "generic_article_low_signal"
+    if score == _GENERIC_ARTICLE_SEO_PRIORITY_SCORE:
+        return "seo_syndicated"
+    if score == _NEWS_MEDIA_PRIORITY_SCORE:
+        return "news_media"
+    if score == _DEVELOPER_BLOG_PRIORITY_SCORE:
+        return "developer_blog"
+    if score == _CHINESE_TECH_COMMUNITY_PRIORITY_SCORE:
+        return "chinese_tech_community"
+    if score == _COMMUNITY_BLOG_PRIORITY_SCORE:
+        return "community_blog"
     if score == _SECONDARY_REFERENCE_PRIORITY_SCORE:
         return "secondary_reference"
     if score == _OFF_SUBJECT_PRIORITY_SCORE:
@@ -650,12 +1079,18 @@ def _source_quality_score_for_fetch_priority(score: int) -> float:
         return 0.72
     if score in {5, 8, 10, 11, 12, 14, 15}:
         return 0.72
-    if score == 20:
-        return 0.6
+    if score == _GENERIC_ARTICLE_HIGH_SIGNAL_PRIORITY_SCORE:
+        return 0.64
+    if score in {_GENERIC_ARTICLE_NORMAL_PRIORITY_SCORE, 50}:
+        return 0.55
     if score == _SECONDARY_REFERENCE_PRIORITY_SCORE:
         return 0.55
     if score == _OFF_SUBJECT_PRIORITY_SCORE:
         return 0.48
+    if score == _GENERIC_ARTICLE_LOW_SIGNAL_PRIORITY_SCORE:
+        return 0.48
+    if score == _GENERIC_ARTICLE_SEO_PRIORITY_SCORE:
+        return 0.4
     if score in {40, 42, 44}:
         return 0.5
     if score == 80:
@@ -715,6 +1150,8 @@ def _selected_by(source_category: str, known_path_candidate: bool) -> str:
         "official_repository",
         "wikipedia_reference",
         "github_readme_or_repo",
+        "github_topic",
+        "official_research",
         "package_registry",
         "standards_or_academic",
     }:
@@ -800,6 +1237,18 @@ def _looks_like_about_path(path: str, title: str) -> bool:
     return any(marker in path for marker in path_markers) or any(
         marker in f" {title}" for marker in title_markers
     )
+
+
+def _strict_docs_multisegment_overview_is_doc_chapter(*, domain: str, path: str) -> bool:
+    """``/overview`` under a deep docs tree (e.g. ``/oss/python/langgraph/overview``) is a chapter, not marketing about."""
+    normalized = (domain or "").strip().lower().removeprefix("www.")
+    if not normalized.startswith(("docs.", "reference.", "documentation.")):
+        return False
+    lowered = path.lower()
+    if "/overview" not in lowered:
+        return False
+    parts = [p for p in lowered.strip("/").split("/") if p]
+    return len(parts) >= 3
 
 
 def _looks_like_project_landing_path(*, path: str, title: str, query: str | None) -> bool:
@@ -890,7 +1339,9 @@ def _should_downrank_off_subject_source(
     normalized_domain = (domain or "").strip().lower().removeprefix("www.")
     path = urlsplit(canonical_url or "").path.strip().lower().rstrip("/")
     normalized_title = (title or "").strip().lower()
-    if _is_anthropic_claude_vendor_domain(normalized_domain) and _anthropic_claude_official_surface_path(
+    if _is_anthropic_claude_vendor_domain(
+        normalized_domain
+    ) and _anthropic_claude_official_surface_path(
         domain=normalized_domain,
         path=path,
         title=normalized_title,
@@ -937,7 +1388,8 @@ def _has_official_project_context(
     profiles = _project_profiles(subject_terms)
     if profiles:
         if any(
-            _domain_matches_owned_profile(domain, profile) and _profile_has_vendor_trust_root(profile)
+            _domain_matches_owned_profile(domain, profile)
+            and _profile_has_vendor_trust_root(profile)
             for profile in profiles
         ):
             return True
@@ -1287,7 +1739,6 @@ def _is_social_video_or_forum_domain(domain: str) -> bool:
         "facebook.com",
         "instagram.com",
         "tiktok.com",
-        "medium.com",
         "news.ycombinator.com",
         "stackoverflow.com",
         "stackexchange.com",
@@ -1325,3 +1776,75 @@ def _is_standards_or_academic_domain(domain: str) -> bool:
         "semanticscholar.org",
     )
     return any(domain == item or domain.endswith(f".{item}") for item in domains)
+
+
+_NON_CORE_REPORT_SOURCE_INTENTS: frozenset[str] = frozenset(
+    {
+        "github_topic",
+        "search_or_topic_aggregate",
+        "seo_syndicated",
+    }
+)
+
+
+def source_intent_report_core_eligible(source_intent: str | None) -> bool:
+    """True when this ``source_intent`` may anchor objective core report conclusions."""
+    if not isinstance(source_intent, str) or not source_intent.strip():
+        return True
+    normalized = source_intent.strip().lower()
+    if normalized in _NON_CORE_REPORT_SOURCE_INTENTS:
+        return False
+    if normalized.startswith("generic_article_seo"):
+        return False
+    return True
+
+
+def rebuild_classification_with_new_intent(
+    *,
+    base: SourceIntentClassification,
+    new_source_intent: str,
+    canonical_url: str,
+    domain: str | None,
+    title: str | None,
+    query: str | None,
+    classification_method: str,
+    classification_confidence: float | None,
+    classification_reason: str | None,
+) -> SourceIntentClassification:
+    """Rebuild scores and roles after an explicit ``source_intent`` (e.g. LLM override)."""
+    score = source_intent_priority(new_source_intent, query=query)
+    quality = _source_quality_score_for_fetch_priority(score)
+    reason = _fetch_priority_reason(score)
+    selected_reason = _selected_reason_for_source_category(new_source_intent, score)
+    role = _source_role(
+        source_category=new_source_intent,
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+    )
+    adjusted = SourceIntentClassification(
+        source_category=new_source_intent,
+        source_intent=new_source_intent,
+        source_quality_tier=_coarse_source_quality_tier(new_source_intent),
+        source_role=role,
+        fetch_priority_score=score,
+        fetch_priority_reason=reason,
+        source_quality_score=quality,
+        source_selection_reason=selected_reason,
+        selected_reason=selected_reason,
+        selected_by=base.selected_by,
+        downrank_reason=_downrank_reason_for_source_category(new_source_intent, score),
+        source_selection_guardrail_applied=base.source_selection_guardrail_applied,
+        known_path_candidate=base.known_path_candidate,
+        classification_method=classification_method,
+        classification_confidence=classification_confidence,
+        classification_reason=classification_reason,
+    )
+    return _refine_publisher_domain_intent(
+        canonical_url=canonical_url,
+        domain=domain,
+        title=title,
+        query=query,
+        base=adjusted,
+    )

@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from services.orchestrator.app.query_intent_signals import (
+    extract_comparison_entities,
+    query_asks_comparison,
+    query_asks_technical_explanation,
+)
+
 
 class CandidateTriageStatus(str, Enum):
     REJECT_FATAL = "reject_fatal"
@@ -330,6 +336,29 @@ _FIGURE_OR_CAPTION_PATTERN = re.compile(
     r"^(?:" r"fig\.?\s*\d+\b|" r"figure\s+\d+\b|" r"\d+\s+reference\s+architecture\b" r")",
     re.IGNORECASE,
 )
+_LEADING_VERSION_FRAGMENT_PATTERN = re.compile(
+    r"^(?:\d+(?:\.\d+)?|[a-z]?\d+(?:\.\d+)?[a-z]?)\s+"
+    r"(?:delivers|uses|supports|improves|is|are|has|was|were|will|can|does)\b",
+    re.IGNORECASE,
+)
+_CONTEXTLESS_RESULT_PATTERN = re.compile(
+    r"^(?:the|this|that|these)\s+results?\s+"
+    r"(?:is|are|shows?|demonstrates?|provides?)\b",
+    re.IGNORECASE,
+)
+_CONTEXT_DEPENDENT_DEMONSTRATIVE_PATTERN = re.compile(
+    r"\b(?:these|such)\s+(?:strengths|capabilities|results|improvements|changes)\b",
+    re.IGNORECASE,
+)
+_OPENAI_AS_MODEL_SUBJECT_PATTERN = re.compile(
+    r"^openai\s+(?:stays?|excels?|writes?|debugs?|reasons?|performs?|handles?|"
+    r"researches?|creates?|collaborates?|uses\s+tools?)\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_METHOD_FRAGMENT_PATTERN = re.compile(
+    r"^(?:we|our)\s+(?:are\s+)?(?:treating|treat|consider|define|use|report)\b",
+    re.IGNORECASE,
+)
 _DIAGRAM_OR_CONFIG_FRAGMENT_PATTERN = re.compile(
     r"(?:"
     r"\bdigraph\s+g\b|"
@@ -547,6 +576,12 @@ def classify_query_intent(query: str | None) -> QueryIntent:
     lower = normalized.lower()
     query_tokens = set(_tokenize(normalized))
     subject_terms = _extract_subject_terms(normalized)
+    if not subject_terms:
+        subject_terms = tuple(
+            token.lower()
+            for token in re.findall(r"\b[A-Z][A-Za-z0-9.-]{1,40}\b", normalized)
+            if token.lower() not in _LOW_VALUE_QUERY_TOKENS
+        )[:4]
     setup_allowed = bool(query_tokens & _SETUP_ALLOWED_QUERY_TERMS)
     contribution_allowed = bool(query_tokens & _CONTRIBUTION_ALLOWED_QUERY_TERMS)
     deployment_relevant = bool(
@@ -574,6 +609,29 @@ def classify_query_intent(query: str | None) -> QueryIntent:
             contribution_allowed=contribution_allowed,
         )
 
+    # Technical explanation + comparison should win over coarse "news" heuristics when the
+    # question is not itself a recency/changelog request.
+    if (
+        subject_terms
+        and (
+            query_asks_technical_explanation(normalized)
+            or len(extract_comparison_entities(normalized)) >= 2
+        )
+        and query_asks_comparison(normalized)
+        and not _looks_like_news_query(lower, query_tokens)
+    ):
+        expected_tm: tuple[str, ...] = ("definition", "mechanism", "privacy", "feature", "other")
+        if deployment_relevant:
+            expected_tm = (*expected_tm, "deployment/self_hosting")
+        return QueryIntent(
+            intent_name="technical_comparison",
+            expected_claim_types=expected_tm,
+            avoid_claim_types=("setup", "community", "slogan", "reference", "navigation"),
+            subject_terms=subject_terms,
+            setup_allowed=setup_allowed,
+            contribution_allowed=contribution_allowed,
+        )
+
     if _looks_like_news_query(lower, query_tokens):
         return QueryIntent(
             intent_name="news",
@@ -584,18 +642,14 @@ def classify_query_intent(query: str | None) -> QueryIntent:
             contribution_allowed=contribution_allowed,
         )
 
-    if (
-        subject_terms
-        and "what is" in lower
-        and "how" in query_tokens
-        and ("work" in query_tokens or "works" in query_tokens)
-    ):
-        expected: tuple[str, ...] = ("definition", "mechanism", "privacy", "feature")
+    if subject_terms and query_asks_technical_explanation(normalized):
+        expected_tm = ("definition", "mechanism", "privacy", "feature", "other")
         if deployment_relevant:
-            expected = (*expected, "deployment/self_hosting")
+            expected_tm = (*expected_tm, "deployment/self_hosting")
+        intent_name = "definition_mechanism"
         return QueryIntent(
-            intent_name="definition_mechanism",
-            expected_claim_types=expected,
+            intent_name=intent_name,
+            expected_claim_types=expected_tm,
             avoid_claim_types=("setup", "community", "slogan", "reference", "navigation"),
             subject_terms=subject_terms,
             setup_allowed=setup_allowed,
@@ -688,7 +742,7 @@ def score_claim_statement(
         answer_role = "non_answer"
         answer_relevant = False
     elif triage.status == CandidateTriageStatus.NEEDS_LLM_REVIEW:
-        # Soft penalty for candidates that need review so they don't dominate perfectly clean candidates
+        # Soft penalty for candidates that need review so they don't dominate clean candidates.
         claim_quality = min(claim_quality, 0.6)
         query_answer = min(query_answer, 0.6)
 
@@ -722,7 +776,7 @@ def score_claim_statement(
 
         if not answer_relevant:
             # Check for query_focus_mismatch (pronoun issues)
-            # If it's otherwise high quality and has context support, downgrade to weak instead of rejected
+            # If context support is present, keep it as recall instead of rejecting.
             if final_score >= recall_threshold and _is_contextually_relevant(
                 normalized, query, page_title
             ):
@@ -733,6 +787,8 @@ def score_claim_statement(
             tier = "supporting_candidate"
         elif final_score >= recall_threshold:
             tier = "recall_candidate"
+        if triage.reason == "possible_model_subject_misattribution" and tier == "main_candidate":
+            tier = "supporting_candidate"
 
     return ClaimCandidateScore(
         claim_category=category,
@@ -914,7 +970,12 @@ def _triage_claim_candidate(
         return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "figure_caption_or_diagram")
     deployment_evidence_statement = is_deployment_evidence_statement(normalized)
     if _looks_like_diagram_or_config_fragment(normalized) and not deployment_evidence_statement:
-        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "diagram_or_config_fragment")
+        return ClaimCandidateTriage(
+            CandidateTriageStatus.REJECT_FATAL,
+            "diagram_or_config_fragment",
+        )
+    if _looks_like_fragmented_claim(normalized):
+        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "fragmented_claim")
     if _looks_like_reference_statement(normalized, query=query):
         return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "reference_or_citation")
     
@@ -922,21 +983,41 @@ def _triage_claim_candidate(
     if normalized.endswith("!") and (
         category in {"setup", "community", "slogan"} or "run it yourself" in lower
     ):
-        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "promotional_or_imperative_exclamation")
+        return ClaimCandidateTriage(
+            CandidateTriageStatus.REJECT_FATAL,
+            "promotional_or_imperative_exclamation",
+        )
     if category == "slogan":
         return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "slogan_fragment")
     if category == "navigation":
-        return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "navigation_or_documentation_pointer")
+        return ClaimCandidateTriage(
+            CandidateTriageStatus.REJECT_FATAL,
+            "navigation_or_documentation_pointer",
+        )
     
     # Boilerplate / Cookie / Copyright rejections
-    if _contains_any(lower, ("use cookies", "cookie policy", "privacy policy", "all rights reserved", "terms of service", "copyright \u00a9", "search without being tracked", "join our community")):
+    if _contains_any(
+        lower,
+        (
+            "use cookies",
+            "cookie policy",
+            "privacy policy",
+            "all rights reserved",
+            "terms of service",
+            "copyright \u00a9",
+            "search without being tracked",
+            "join our community",
+        ),
+    ):
         return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "boilerplate_or_navigation")
         
     if category == "community" and not intent.contribution_allowed:
         return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "community_or_contribution")
     if category == "setup" and not intent.setup_allowed and _is_setup_instruction(lower):
         return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "setup_instruction")
-    if query is not None and normalize_claim_identity(normalized) == normalize_claim_identity(query):
+    if query is not None and normalize_claim_identity(normalized) == normalize_claim_identity(
+        query
+    ):
         return ClaimCandidateTriage(CandidateTriageStatus.REJECT_FATAL, "duplicates_query")
 
     # Fatal rejection for extremely short non-CJK fragments that lack substance
@@ -956,11 +1037,15 @@ def _triage_claim_candidate(
     if category == "other" and _looks_like_caption_or_heading_fragment(normalized):
         review_reasons.append("caption_or_heading_fragment")
     
-    if len(normalized) < MIN_CLAIM_STATEMENT_CHARS and not (category == "feature" and len(normalized) >= 24):
+    if len(normalized) < MIN_CLAIM_STATEMENT_CHARS and not (
+        category == "feature" and len(normalized) >= 24
+    ):
         if not has_cjk:
             review_reasons.append("too_short")
             
-    if semantic_units < MIN_CLAIM_STATEMENT_TOKENS and not (category == "feature" and semantic_units >= 3):
+    if semantic_units < MIN_CLAIM_STATEMENT_TOKENS and not (
+        category == "feature" and semantic_units >= 3
+    ):
         review_reasons.append("too_few_informative_terms")
         
     if _TERMINAL_SENTENCE_PATTERN.search(normalized) is None:
@@ -971,12 +1056,71 @@ def _triage_claim_candidate(
         
     if _IMPERATIVE_PREFIX_PATTERN.search(normalized):
         review_reasons.append("imperative_or_call_to_action")
+    if _OPENAI_AS_MODEL_SUBJECT_PATTERN.search(normalized):
+        review_reasons.append("possible_model_subject_misattribution")
 
     if review_reasons:
         return ClaimCandidateTriage(CandidateTriageStatus.NEEDS_LLM_REVIEW, review_reasons[0])
 
     # 3. ACCEPT
     return ClaimCandidateTriage(CandidateTriageStatus.ACCEPT_CANDIDATE, None)
+
+
+def _looks_like_fragmented_claim(statement: str) -> bool:
+    normalized = _normalize_quotes(_normalize_whitespace(statement))
+    if not normalized:
+        return True
+    lower = normalized.lower()
+    if _LEADING_VERSION_FRAGMENT_PATTERN.search(normalized):
+        return True
+    if _CONTEXTLESS_RESULT_PATTERN.search(normalized):
+        return True
+    if _CONTEXT_DEPENDENT_DEMONSTRATIVE_PATTERN.search(normalized):
+        return True
+    if _FIRST_PERSON_METHOD_FRAGMENT_PATTERN.search(normalized):
+        return True
+    if _looks_like_benchmark_tail_fragment(normalized):
+        return True
+    if _looks_like_footnote_or_method_note(normalized):
+        return True
+    if lower.startswith(("on gdpval", "on benchmark", "in benchmark")) and len(normalized) < 140:
+        return True
+    return False
+
+
+def _looks_like_benchmark_tail_fragment(statement: str) -> bool:
+    lower = statement.lower()
+    if not lower.startswith(("on ", "in ")):
+        return False
+    if not any(term in lower for term in ("benchmark", "eval", "gdpval", "swe-bench", "mmlu")):
+        return False
+    tail = lower.rsplit(",", maxsplit=1)[-1].strip(" .;:")
+    if not tail:
+        return False
+    model_like = bool(re.fullmatch(r"(?:gpt|claude|gemini|llama|model)[\w.-]*(?:\s+\d+)?", tail))
+    return model_like or len(statement) < 80
+
+
+def _looks_like_footnote_or_method_note(statement: str) -> bool:
+    stripped = statement.strip()
+    lower = stripped.lower()
+    if stripped.startswith(("*", "†", "‡")) and len(stripped) < 180:
+        return True
+    if re.search(r"\s[*†‡]\s*$", stripped) and any(
+        term in lower for term in ("benchmark", "eval", "score", "result")
+    ):
+        return True
+    return any(
+        phrase in lower
+        for phrase in (
+            "methodology for evaluations above",
+            "results for gpt-4o reflect",
+            "we are treating",
+            "we report results",
+            "we evaluate",
+            "we use the following",
+        )
+    )
 
 
 def is_claimable_excerpt(excerpt: str, query: str | None = None) -> bool:
@@ -1854,9 +1998,9 @@ def rewrite_claim_self_contained(
         return statement
 
     intent = classify_query_intent(query)
-    subject = (intent.subject_terms[0] if intent.subject_terms else None) or (
-        _extract_title_subject(page_title) if page_title else None
-    )
+    title_subject = _extract_title_subject(page_title) if page_title else None
+    query_subject = intent.subject_terms[0] if intent.subject_terms else None
+    subject = title_subject or query_subject
 
     if not subject:
         return normalized
@@ -1865,11 +2009,12 @@ def rewrite_claim_self_contained(
     # Handle "They", "It", "This", "The company", "The tool", etc.
     rewritten = normalized
 
+    subject_display = subject if subject.upper().startswith("GPT-") else subject.capitalize()
     pronouns = [
-        (r"^[Tt]hey\s+", f"{subject.capitalize()} "),
-        (r"^[Ii]t\s+", f"{subject.capitalize()} "),
-        (r"^[Tt]his\s+(?:tool|app|framework|model|service)\s+", f"{subject.capitalize()} "),
-        (r"^[Tt]he\s+(?:tool|app|framework|model|service)\s+", f"{subject.capitalize()} "),
+        (r"^[Tt]hey\s+", f"{subject_display} "),
+        (r"^[Ii]t\s+", f"{subject_display} "),
+        (r"^[Tt]his\s+(?:tool|app|framework|model|service)\s+", f"{subject_display} "),
+        (r"^[Tt]he\s+(?:tool|app|framework|model|service)\s+", f"{subject_display} "),
     ]
 
     for pattern, replacement in pronouns:
@@ -1907,6 +2052,12 @@ def _is_contextually_relevant(
 
 def _extract_title_subject(title: str) -> str | None:
     # Extract the first significant noun phrase from the title
+    model = re.search(r"\bGPT[\s_\-\u2011\u2010]*(\d+(?:\.\d+)?[A-Za-z]?)\b", title)
+    if model:
+        return f"GPT-{model.group(1)}"
+    signals = re.search(r"\bOpenAI\s+Signals\b", title, re.IGNORECASE)
+    if signals:
+        return "OpenAI Signals"
     cleaned = re.split(r"[-|:|?|!]", title)[0].strip()
     if cleaned.lower().startswith("what is "):
         cleaned = cleaned[7:].strip()

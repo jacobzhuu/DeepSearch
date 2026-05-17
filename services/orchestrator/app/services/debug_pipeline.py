@@ -275,6 +275,7 @@ class DebugRealPipelineRunner:
         research_loop_min_authoritative_sources: int = 1,
         research_loop_required_slot_min_status: str = "moderate",
         research_loop_allow_low_coverage_report: bool = True,
+        pptx_generation_mode: str = "manual",
     ) -> None:
         self.session = session
         self.search_service = search_service
@@ -322,6 +323,7 @@ class DebugRealPipelineRunner:
         )
         self.research_loop_required_slot_min_status = research_loop_required_slot_min_status
         self.research_loop_allow_low_coverage_report = research_loop_allow_low_coverage_report
+        self.pptx_generation_mode = str(pptx_generation_mode).strip().lower()
         self.research_strategy_calls = 0
         self.supplemental_acquisition_ran = False
         self.llm_assistance: dict[str, Any] = {}
@@ -1480,6 +1482,7 @@ class DebugRealPipelineRunner:
             planner_guardrail_warnings=list(self.research_plan.planner_guardrail_warnings),
             intent_classification=self.research_plan.intent_classification,
             extracted_entity=self.research_plan.extracted_entity,
+            report_archetype=self.research_plan.report_archetype,
             planner_diagnostics={
                 **dict(self.research_plan.planner_diagnostics),
                 "llm_query_rewriter": self.llm_assistance[result.stage],
@@ -2072,6 +2075,39 @@ class DebugRealPipelineRunner:
             raise DebugPipelinePreconditionError("report generation produced empty markdown")
         source_quality_summary = _build_source_quality_summary(self.session, task_id)
         manifest = result.artifact.manifest_json or {}
+        report_diagnostics = manifest.get("report_diagnostics")
+        if not isinstance(report_diagnostics, dict):
+            report_diagnostics = {}
+        else:
+            report_diagnostics = dict(report_diagnostics)
+
+        mode = self.pptx_generation_mode
+        if mode == "auto":
+            try:
+                pptx_delivery = self.reporting_service.auto_generate_presentation_bundle(task_id)
+            except Exception as exc:  # noqa: BLE001 — operator-facing diagnostic only
+                pptx_delivery = {
+                    "status": "failed",
+                    "reason_code": "pptx_bundle_exception",
+                    "detail": str(exc)[:1200],
+                }
+        elif mode == "disabled":
+            pptx_delivery = {
+                "status": "skipped_disabled",
+                "reason_code": "pptx_export_disabled",
+                "detail": "PPTX_GENERATION_MODE=disabled for this runner",
+            }
+        else:
+            pptx_delivery = {
+                "status": "not_generated",
+                "reason_code": "manual_mode",
+                "detail": (
+                    "Presentation export is manual; generate after the report is ready via "
+                    "POST /api/v1/research/tasks/{task_id}/artifacts/presentation"
+                ),
+            }
+        report_diagnostics["pptx_delivery"] = pptx_delivery
+
         return {
             "report_artifact_id": result.artifact.id,
             "report_version": result.artifact.version,
@@ -2090,7 +2126,7 @@ class DebugRealPipelineRunner:
             "evidence_yield_summary": manifest.get("evidence_yield_summary", {}),
             "verification_summary": manifest.get("verification_summary", {}),
             "dropped_sources": manifest.get("dropped_sources", []),
-            "report_diagnostics": manifest.get("report_diagnostics", {}),
+            "report_diagnostics": report_diagnostics,
             "report_writer": manifest.get("report_writer", {}),
             "llm_assistance": dict(self.llm_assistance),
             "warnings": source_quality_summary["warnings"],
@@ -2746,13 +2782,15 @@ def _candidate_url_summary(candidate_url: Any, *, query: str | None = None) -> d
     metadata = candidate_url.metadata_json or {}
     if not isinstance(metadata, dict):
         metadata = {}
+    source_metadata = fetch_priority_metadata(candidate_url, query=query)
     summary = {
         "candidate_url_id": str(candidate_url.id),
         "canonical_url": candidate_url.canonical_url,
         "domain": candidate_url.domain,
         "title": candidate_url.title,
         "rank": candidate_url.rank,
-        **fetch_priority_metadata(candidate_url, query=query),
+        **source_metadata,
+        **_estimated_quality_score_fields(source_metadata.get("source_quality_score")),
     }
     for key in (
         "candidate_source",
@@ -2768,6 +2806,42 @@ def _candidate_url_summary(candidate_url: Any, *, query: str | None = None) -> d
             continue
         summary[key] = value
     return summary
+
+
+def _estimated_quality_score_fields(score: object) -> dict[str, object]:
+    numeric_score = _numeric_score_or_none(score)
+    if numeric_score is None:
+        return {
+            "quality_score": None,
+            "quality_score_kind": "missing",
+            "quality_score_label": "待解析",
+        }
+    return {
+        "quality_score": numeric_score,
+        "quality_score_kind": "estimated",
+        "quality_score_label": "预估质量",
+    }
+
+
+def _parsed_quality_score_fields(score: object) -> dict[str, object]:
+    numeric_score = _numeric_score_or_none(score)
+    if numeric_score is None:
+        return {
+            "quality_score": None,
+            "quality_score_kind": "missing",
+            "quality_score_label": "待解析",
+        }
+    return {
+        "quality_score": numeric_score,
+        "quality_score_kind": "parsed",
+        "quality_score_label": "解析后质量",
+    }
+
+
+def _numeric_score_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return round(float(value), 4)
 
 
 def _known_path_fallback_summary(fallbacks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3904,6 +3978,8 @@ def _build_answer_yield_metrics(
                 "source_category": _source_document_category(source_document, query=query),
                 "source_intent": _source_document_category(source_document, query=query),
                 "source_quality_score": source_document.final_source_score,
+                "final_source_score": source_document.final_source_score,
+                **_parsed_quality_score_fields(source_document.final_source_score),
                 "extracted_text_length": extracted_text_length,
                 "chunk_count": len(chunks),
                 "eligible_chunk_count": len(eligible_chunks),
@@ -4034,6 +4110,11 @@ def _build_source_yield_summary(
             search_query,
         )
 
+        quality_fields = (
+            _parsed_quality_score_fields(source_document.final_source_score)
+            if source_document is not None
+            else _estimated_quality_score_fields(priority_metadata.get("source_quality_score"))
+        )
         rows.append(
             SourceYieldSummary(
                 source_document_id=str(source_document.id) if source_document is not None else None,
@@ -4060,7 +4141,20 @@ def _build_source_yield_summary(
                 "domain": candidate.domain,
                 "title": candidate.title,
                 "rank": candidate.rank,
+                "source_quality_score": priority_metadata.get("source_quality_score"),
+                "source_quality_tier": priority_metadata.get("source_quality_tier"),
+                "fetch_priority_score": priority_metadata.get("fetch_priority_score"),
+                "classification_method": priority_metadata.get("classification_method"),
+                "classification_confidence": priority_metadata.get("classification_confidence"),
+                "classification_reason": priority_metadata.get("classification_reason"),
+                "source_category": priority_metadata.get("source_category"),
+                "display_source_type": priority_metadata.get("display_source_type"),
+                "metadata_json": candidate.metadata_json or {},
+                "final_source_score": (
+                    source_document.final_source_score if source_document is not None else None
+                ),
                 "target_slot_ids": target_slot_ids,
+                **quality_fields,
             }
         )
         seen_urls.add(candidate.canonical_url)
@@ -4121,6 +4215,9 @@ def _build_source_yield_summary(
                 "domain": source_document.domain,
                 "title": source_document.title,
                 "rank": None,
+                "source_quality_score": None,
+                "final_source_score": source_document.final_source_score,
+                **_parsed_quality_score_fields(source_document.final_source_score),
             }
         )
     return rows
@@ -4431,7 +4528,7 @@ def _claim_counts_toward_gap_slot_coverage(
     if report_eligible is True:
         return True
     claim_score = _report_claim_score(claim, query=query)
-    if not _report_claim_answer_relevant(claim_score, query=query):
+    if not _report_claim_answer_relevant(claim, claim_score, query=query):
         return False
     if _claim_focus_required_for_report(query=query, slot_ids=slot_ids) and not (
         _claim_focus_matches_query(claim.statement, query=query)

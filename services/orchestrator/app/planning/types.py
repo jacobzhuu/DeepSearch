@@ -44,6 +44,7 @@ class ResearchPlan:
     planner_guardrail_warnings: list[str] = field(default_factory=list)
     intent_classification: str | None = None
     extracted_entity: str | None = None
+    report_archetype: str = "general"
     planner_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
@@ -66,6 +67,7 @@ class ResearchPlan:
             "planner_guardrail_warnings": list(self.planner_guardrail_warnings),
             "intent_classification": self.intent_classification,
             "extracted_entity": self.extracted_entity,
+            "report_archetype": self.report_archetype,
             "planner_diagnostics": dict(self.planner_diagnostics),
         }
 

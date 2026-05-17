@@ -165,6 +165,7 @@ class SourceQuality:
     relevance_score: float
     crawlability_score: float
     information_density_score: float
+    evidence_density_score: float
     freshness_score: float | None
     safety_score: float
     freshness_state: str
@@ -201,6 +202,7 @@ def assess_source_quality(
             relevance_score=0.1,
             crawlability_score=0.1,
             information_density_score=0.1,
+            evidence_density_score=0.0,
             freshness_score=None,
             safety_score=0.2,
             freshness_state="unknown",
@@ -222,16 +224,18 @@ def assess_source_quality(
     )
     crawlability_score = _crawlability_score(metadata)
     information_density_score = _source_information_density_score(metadata)
+    evidence_density_score = _source_evidence_density_score(metadata)
     freshness_score, freshness_state = _freshness_score(metadata)
     safety_score = _source_safety_score(normalized_domain, source_category=source_category)
     freshness_component = 0.5 if freshness_score is None else freshness_score
     final_score = (
-        (authority_score * 0.32)
-        + (relevance_score * 0.22)
-        + (crawlability_score * 0.18)
-        + (information_density_score * 0.16)
-        + (safety_score * 0.08)
+        (authority_score * 0.24)
+        + (relevance_score * 0.28)
+        + (information_density_score * 0.22)
+        + (crawlability_score * 0.12)
+        + (evidence_density_score * 0.08)
         + (freshness_component * 0.04)
+        + (safety_score * 0.02)
     )
     if primary_reason == "official_docs":
         final_score = max(final_score, 0.9)
@@ -244,6 +248,7 @@ def assess_source_quality(
         f"relevance:{relevance_score:.2f}",
         f"crawlability:{crawlability_score:.2f}",
         f"information_density:{information_density_score:.2f}",
+        f"evidence_density:{evidence_density_score:.2f}",
         f"safety:{safety_score:.2f}",
         f"freshness:{freshness_state}",
     ]
@@ -254,6 +259,7 @@ def assess_source_quality(
         relevance_score=round(relevance_score, 2),
         crawlability_score=round(crawlability_score, 2),
         information_density_score=round(information_density_score, 2),
+        evidence_density_score=round(evidence_density_score, 2),
         freshness_score=None if freshness_score is None else round(freshness_score, 2),
         safety_score=round(safety_score, 2),
         freshness_state=freshness_state,
@@ -275,6 +281,10 @@ def _authority_score(
         return 0.72, "project_homepage"
     if source_category == "github_readme_or_repo":
         return 0.72, "official_github_repository"
+    if source_category == "github_topic":
+        return 0.22, "github_topic_discovery_only"
+    if source_category == "search_or_topic_aggregate":
+        return 0.22, "search_or_topic_directory_discovery_only"
     if source_category == "secondary_reference":
         return 0.55, "secondary_reference"
     if source_category == "low_quality_or_blocked":
@@ -514,6 +524,39 @@ def _source_information_density_score(metadata: dict[str, object]) -> float:
         if extracted_text_length > 0:
             return 0.28
     return 0.5
+
+
+def _source_evidence_density_score(metadata: dict[str, object]) -> float:
+    text_value = metadata.get("parsed_text") or metadata.get("text")
+    if not isinstance(text_value, str) or not text_value.strip():
+        return 0.45
+    text = " ".join(text_value.split())
+    lower_text = text.lower()
+    signal_patterns = (
+        r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b",
+        r"\b(?:19|20)\d{2}\b",
+        r"\bv?\d+\.\d+(?:\.\d+)?\b",
+        r"\b\d+(?:\.\d+)?\s?(?:%|percent|ms|s|sec|seconds|gb|mb|tokens?|requests?)\b",
+        r"\bapi\b",
+        r"\bsdk\b",
+        r"\bbenchmark(?:s|ing)?\b",
+        r"\barxiv\b",
+        r"\bdoi\b",
+        r"\bpaper\b",
+        r"\bcitation(?:s)?\b",
+        r"\baccording to\b",
+        r"\brelease(?:d|s)?\b",
+        r"\breport(?:ed|s)?\b",
+        r"\bexperiment(?:s|al)?\b",
+        r"\bstudy\b",
+    )
+    signal_hits = sum(len(re.findall(pattern, lower_text)) for pattern in signal_patterns)
+    quote_hits = lower_text.count('"') // 2 + lower_text.count("“")
+    sentence_count = max(1, len(re.findall(r"[.!?。！？]", text)))
+    normalized_hits = min(1.0, (signal_hits + min(quote_hits, 4)) / 12)
+    sentence_density = min(1.0, sentence_count / 16)
+    score = 0.18 + (normalized_hits * 0.62) + (sentence_density * 0.2)
+    return min(1.0, max(0.05, score))
 
 
 def _source_safety_score(normalized_domain: str, *, source_category: str) -> float:

@@ -32,6 +32,13 @@ from services.orchestrator.app.planning.million_context_normalization import (
 )
 from services.orchestrator.app.planning.types import PlannedSearchQuery, ResearchPlan
 from services.orchestrator.app.research_quality import answer_slots_for_query
+from services.orchestrator.app.query_intent_signals import (
+    detect_report_archetype,
+    extract_comparison_entities,
+    query_asks_comparison,
+    query_asks_definition_mechanism_signals,
+    query_asks_technical_explanation,
+)
 from services.orchestrator.app.settings import Settings
 
 SYSTEM_PROMPT = """You plan evidence-first web research.
@@ -408,11 +415,20 @@ def build_basic_research_plan(
             answer_slots=[slot.to_payload() for slot in answer_slots_for_query(query)],
         )
 
-    if _is_technical_explanation_query(query):
-        technical_queries = _technical_explanation_query_matrix(
-            subject=subject,
-            original_query=query,
-        )[:max_search_queries]
+    if _is_technical_explanation_query(query) or (
+        query_asks_comparison(query) and len(extract_comparison_entities(query)) >= 2
+    ):
+        technical_queries = list(
+            _technical_explanation_query_matrix(
+                subject=subject,
+                original_query=query,
+            )
+        )
+        if query_asks_comparison(query):
+            technical_queries.extend(
+                _comparison_supplement_planned_queries(subject=subject, original_query=query)
+            )
+        technical_queries = technical_queries[:max_search_queries]
         return ResearchPlan(
             intent="technical_explanation",
             normalized_question=query,
@@ -629,6 +645,11 @@ def research_plan_from_serialized_payload(payload: dict[str, Any]) -> ResearchPl
     if not isinstance(source_preferences, dict):
         source_preferences = {}
     planner_diagnostics = payload.get("planner_diagnostics")
+    ra = payload.get("report_archetype")
+    if isinstance(ra, str) and ra.strip():
+        report_archetype_value = ra.strip()
+    else:
+        report_archetype_value = detect_report_archetype(normalized_question, plan_intent=intent)
     return ResearchPlan(
         intent=intent,
         normalized_question=normalized_question,
@@ -648,6 +669,7 @@ def research_plan_from_serialized_payload(payload: dict[str, Any]) -> ResearchPl
         planner_guardrail_warnings=_string_list(payload.get("planner_guardrail_warnings")),
         intent_classification=_optional_string(payload.get("intent_classification")),
         extracted_entity=_optional_string(payload.get("extracted_entity")),
+        report_archetype=report_archetype_value,
         planner_diagnostics=(
             dict(planner_diagnostics) if isinstance(planner_diagnostics, dict) else {}
         ),
@@ -799,6 +821,7 @@ def _plan_with_updates(
         planner_guardrail_warnings=list(plan.planner_guardrail_warnings),
         intent_classification=plan.intent_classification,
         extracted_entity=plan.extracted_entity,
+        report_archetype=plan.report_archetype,
         planner_diagnostics=planner_diagnostics,
     )
 
@@ -1164,10 +1187,19 @@ def _apply_research_plan_guardrails(
 
     if overview_query and extracted_entity:
         if _is_technical_explanation_query(query):
-            guardrail_queries = _technical_explanation_query_matrix(
-                subject=extracted_entity,
-                original_query=query,
+            guardrail_queries = list(
+                _technical_explanation_query_matrix(
+                    subject=extracted_entity,
+                    original_query=query,
+                )
             )
+            if query_asks_comparison(query):
+                guardrail_queries.extend(
+                    _comparison_supplement_planned_queries(
+                        subject=extracted_entity,
+                        original_query=query,
+                    )
+                )
             source_preferences = _source_preferences_with_defaults(
                 _technical_explanation_source_preferences(),
                 source_preferences,
@@ -1398,6 +1430,48 @@ def _apply_research_plan_guardrails(
     )
     warnings.extend(million_context_warnings)
 
+    report_archetype = detect_report_archetype(query, plan_intent=guarded_intent)
+    if report_archetype == "research_survey" and extracted_entity and overview_query:
+        survey_supplements = [
+            PlannedSearchQuery(
+                query_text=f"{extracted_entity} survey paper related work arxiv",
+                rationale="Broad survey / related-work discovery for literature-style synthesis.",
+                expected_source_type="reference",
+                priority=1,
+                query_source="guardrail_query",
+            ),
+            PlannedSearchQuery(
+                query_text=f"{extracted_entity} limitations future work survey review",
+                rationale="Find limitations, gaps, and future directions from stable sources.",
+                expected_source_type="official_or_reference",
+                priority=2,
+                query_source="guardrail_query",
+            ),
+        ]
+        search_queries, extra_dropped = _merge_and_rank_planned_queries(
+            survey_supplements,
+            search_queries,
+            max_search_queries=max_search_queries,
+            demote_architecture_or_setup=False,
+        )
+        dropped_or_downweighted = [*dropped_or_downweighted, *extra_dropped]
+        subquestions = _prepend_unique_strings(
+            [
+                (
+                    f"What evidence-backed method families or representative sources define "
+                    f"the scope for {extracted_entity}?"
+                ),
+                (
+                    f"What limitations, open problems, or future directions appear for "
+                    f"{extracted_entity}?"
+                ),
+            ],
+            subquestions,
+        )[:max_subquestions]
+        survey_warning = "planner_queries_supplemented_for_research_survey"
+        guardrail_warnings.append(survey_warning)
+        warnings.append(survey_warning)
+
     final_search_queries = [item.to_payload() for item in search_queries]
     dropped_or_downweighted = [
         *source_preference_diagnostics,
@@ -1420,6 +1494,7 @@ def _apply_research_plan_guardrails(
         planner_guardrail_warnings=list(dict.fromkeys(guardrail_warnings)),
         intent_classification=intent_classification,
         extracted_entity=extracted_entity,
+        report_archetype=report_archetype,
     )
 
 
@@ -1637,24 +1712,9 @@ def _technical_explanation_source_preferences() -> dict[str, Any]:
 
 
 def _is_technical_explanation_query(query: str) -> bool:
-    lower = query.lower()
     if _is_deployment_query(query):
         return False
-    if "what is" in lower and "how" in lower and "work" in lower:
-        return True
-    if "what are" in lower and "how" in lower and "work" in lower:
-        return True
-    if lower.startswith("explain ") and ("how" in lower or "architecture" in lower):
-        return True
-    return any(
-        marker in lower
-        for marker in (
-            "technical explanation",
-            "architecture and execution",
-            "execution model",
-            "how it works",
-        )
-    )
+    return query_asks_technical_explanation(query)
 
 
 def _technical_explanation_subquestions(subject: str) -> list[str]:
@@ -1891,6 +1951,53 @@ def _technical_query(
     )
 
 
+def _framework_tokens_from_query(query: str) -> list[str]:
+    return extract_comparison_entities(query, max_entities=6)
+
+
+def _comparison_supplement_planned_queries(
+    *,
+    subject: str,
+    original_query: str,
+) -> list[PlannedSearchQuery]:
+    subject_key = _compact_identifier(subject)
+    extras: list[PlannedSearchQuery] = []
+    priority = 30
+    for token in _framework_tokens_from_query(original_query):
+        if _compact_identifier(token) == subject_key:
+            continue
+        extras.append(
+            _technical_query(
+                f"{subject} vs {token} official documentation architecture comparison",
+                rationale=(
+                    f"Find official or reference material comparing {subject} and {token} "
+                    "mechanisms and positioning."
+                ),
+                expected_source_type="official_docs",
+                priority=priority,
+                target_slots=("comparison_positioning", "comparison_mechanism", "limitations"),
+                source_role="official_docs",
+                query_matrix_slot="comparison_pair",
+                query_source="guardrail_query",
+            )
+        )
+        priority += 1
+        extras.append(
+            _technical_query(
+                f"{token} official documentation core architecture execution model",
+                rationale=f"Find official mechanism documentation for {token}.",
+                expected_source_type="official_docs",
+                priority=priority,
+                target_slots=("comparison_mechanism", "core_abstractions", "execution_model"),
+                source_role="official_docs",
+                query_matrix_slot="comparison_counterparty",
+                query_source="guardrail_query",
+            )
+        )
+        priority += 1
+    return extras
+
+
 def _merge_and_rank_planned_queries(
     guardrail_queries: list[PlannedSearchQuery],
     planner_queries: list[PlannedSearchQuery],
@@ -2109,6 +2216,8 @@ def _classify_research_intent(*, query: str, intent: str) -> str:
 def _is_definition_or_overview_query(*, query: str, intent: str) -> bool:
     lower_query = query.lower()
     lower_intent = intent.lower()
+    if query_asks_definition_mechanism_signals(query):
+        return True
     if any(term in lower_intent for term in ("definition", "overview", "what", "how_it_works")):
         return True
     return (
@@ -2178,6 +2287,15 @@ def _extract_entity_from_overview_query(query: str) -> str | None:
     normalized = query.strip().strip("\"'").rstrip("?.!")
     if not normalized:
         return None
+
+    zh_entity = re.search(
+        r"(?:详细解释|请解释|解释)\s*([A-Za-z0-9_.\-]{1,60}|[\u4e00-\u9fff]{1,12})\s*(?:是什么|如何工作|如何运作)",
+        normalized,
+    )
+    if zh_entity is not None:
+        candidate = _clean_entity(zh_entity.group(1))
+        if candidate:
+            return candidate
 
     patterns = (
         r"(?i)^what\s+(?:is|are)\s+(.+?)(?:\s+and\s+how\b|\s+how\b|$)",
@@ -2338,6 +2456,18 @@ def _subject_from_query(query: str) -> str:
         if marker in lower_remainder:
             return remainder[: lower_remainder.index(marker)].strip() or normalized
         return remainder or normalized
+
+    if query_asks_comparison(normalized):
+        entities = extract_comparison_entities(normalized, max_entities=6)
+        if entities:
+            return entities[0]
+
+    m = re.search(r"\b([A-Z][A-Za-z0-9.-]{1,48})\b", normalized)
+    if m:
+        prefix = normalized[: m.start()]
+        if any(tag in prefix for tag in ("详细解释", "请解释", "解释", "介绍")):
+            return m.group(1).strip()
+
     return normalized
 
 

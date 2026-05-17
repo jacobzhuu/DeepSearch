@@ -68,6 +68,46 @@ def test_claim_quality_rules_require_complete_non_duplicate_statement() -> None:
     )
 
 
+def test_claim_quality_rejects_obvious_update_log_fragments() -> None:
+    query = "详细调查今年 GPT 的官方更新日志"
+    fragments = [
+        "5 delivers better results with fewer tokens than GPT-5.",
+        "On GDPval, GPT-5.",
+        "The result is a concrete example of GPT-5.",
+        "We are treating the biological/chemical and cybersecurity capabilities of GPT-5.",
+        "Methodology for evaluations above: Results for GPT-4o reflect the latest version.",
+    ]
+
+    for fragment in fragments:
+        score = score_claim_statement(statement=fragment, query=query)
+        assert not is_claimable_statement(fragment, query=query)
+        assert score.rejected_reason == "fragmented_claim"
+
+
+def test_claim_quality_rejects_context_dependent_demonstrative_claims() -> None:
+    query = "详细调查今年OpenAI的官方更新日志"
+    statement = "Teams at OpenAI are already using these strengths in real workflows."
+
+    score = score_claim_statement(statement=statement, query=query)
+
+    assert not is_claimable_statement(statement, query=query)
+    assert score.rejected_reason == "fragmented_claim"
+
+
+def test_claim_quality_downgrades_openai_as_model_subject() -> None:
+    query = "详细调查今年OpenAI的官方更新日志"
+    statement = (
+        "OpenAI excels at writing and debugging code, researching online, analyzing data, "
+        "creating documents and spreadsheets, and working across tools."
+    )
+
+    score = score_claim_statement(statement=statement, query=query)
+
+    assert is_claimable_statement(statement, query=query)
+    assert score.triage_status.value == "needs_llm_review"
+    assert score.candidate_tier != "main_candidate"
+
+
 def test_validate_citation_span_rejects_excerpt_mismatch() -> None:
     text = "Alpha beta gamma."
 
@@ -126,7 +166,7 @@ def test_query_intent_classifier_identifies_definition_mechanism_query() -> None
 
     assert intent.intent_name == "definition_mechanism"
     assert intent.subject_terms == ("searxng",)
-    assert intent.expected_claim_types == ("definition", "mechanism", "privacy", "feature")
+    assert intent.expected_claim_types == ("definition", "mechanism", "privacy", "feature", "other")
     assert "community" in intent.avoid_claim_types
 
 

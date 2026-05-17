@@ -246,6 +246,29 @@ come from more covered dimensions and traceable evidence rather than filler pros
 | `LLM_MAX_OUTPUT_TOKENS` | Planner response token cap | `1200` |
 | `LLM_REPORT_WRITER_ENABLED` | Enable grounded LLM report writer for final Markdown synthesis | `true` |
 | `LLM_REPORT_MAX_OUTPUT_TOKENS` | Grounded report-writer response token cap | `2400` |
+
+#### Optional structured LLM synthesis (report appendix)
+
+These switches default to **off** (`false`). When enabled with a non-`noop` LLM, the orchestrator may call an extra JSON-producing LLM pass after the normal deterministic / grounded Markdown body is built. Output is **validated and evidence-bound**, then **appended** as a second-level section titled **「LLM 辅助结构化综合（证据绑定，已校验）」** (Chinese reports) or the English equivalent. This layer **never replaces** the grounded or deterministic report body; invalid JSON, schema failures, low archetype confidence, provider errors, or empty post-validation bundles **fall back** to the original Markdown unchanged.
+
+**Recency / news-style queries** (lexical markers such as “最近”, “今年”, “官方更新”, “latest”, “changelog”, …) **skip** structured synthesis **before** any LLM call for that appendix.
+
+**Recommended rollout (gray):** (1) turn on `LLM_STRUCTURED_SYNTHESIS_ENABLED` plus `LLM_COMPARISON_TABLE_ENABLED` first for `technical_comparison` tasks; (2) add `LLM_METHOD_CARD_EXTRACTION_ENABLED` for `research_survey` when stable; (3) enable `LLM_SYNTHESIS_INSIGHTS_ENABLED` last. Turning on **all** sub-switches at once is **not** recommended. Use `LLM_REPORT_STRUCTURE_ENABLED` when you want the optional archetype-judge block inside the appendix (still subordinate to deterministic `report_archetype`).
+
+**Operator diagnostics** for this pass are attached under `report_writer["structured_llm_synthesis"]` on the prepared report (counts, `skipped_reason`, `sections_rendered`, aggregated warning types; **no** long raw LLM text).
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `LLM_STRUCTURED_SYNTHESIS_ENABLED` | Master switch for the optional structured-synthesis appendix | `false` |
+| `LLM_REPORT_STRUCTURE_ENABLED` | Include validated `archetype_judge` JSON block in the appendix when present | `false` |
+| `LLM_METHOD_CARD_EXTRACTION_ENABLED` | Include validated method/material cards (`research_survey` only) | `false` |
+| `LLM_COMPARISON_TABLE_ENABLED` | Include validated comparison table (`technical_comparison` only) | `false` |
+| `LLM_SYNTHESIS_INSIGHTS_ENABLED` | Include validated synthesis / inference insight rows | `false` |
+| `LLM_STRUCTURED_SYNTHESIS_CONFIDENCE_THRESHOLD` | Minimum LLM archetype-judge confidence when structure sub-flag is on | `0.55` |
+| `LLM_STRUCTURED_SYNTHESIS_MAX_INPUT_CHARS` | Max serialized size of the evidence bundle sent into the structured-synthesis prompt | `12000` |
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
 | `LLM_SOURCE_JUDGE_ENABLED` | Enable shadow source-judge diagnostics | `true` |
 | `LLM_SOURCE_JUDGE_ACTIVE_RERANK` | Allow bounded source-judge priority adjustments after deterministic guardrails | `true` |
 | `LLM_SOURCE_TRIAGE_ACTIVE` | Allow structured source-judge triage to prioritize `must_fetch` and skip explicit low-value candidates | `true` |

@@ -103,6 +103,8 @@ explicit coverage gaps when the verified ledger lacks a command or configuration
 required slot. For deployment code/config records, rendering prefers the complete claim statement
 or persisted full evidence excerpt over a shortened citation excerpt.
 
+After the primary Markdown path (deterministic and/or grounded LLM writer), the orchestrator may optionally **append** a separate section produced by **structured LLM synthesis**: the model returns JSON, which is validated against persisted `claim_evidence` ids and core-eligibility rules, then rendered as **「LLM 辅助结构化综合（证据绑定，已校验）」**. Defaults keep this layer off; recency/news-style query lexicon skips it without calling the appendix LLM; failures or invalid payloads leave the original report unchanged. Operator-facing counters and `skipped_reason` are recorded under `report_writer["structured_llm_synthesis"]` (see `docs/runbook.md` for env vars and rollout order).
+
 ## Layer boundaries
 
 - UI / gateway layer: `apps/web/` now provides task listing, task creation, pre-run plan confirmation, queued worker start, status-aware Run/Pause/Resume/Cancel controls, polling task detail progress/events, source, claim, and Markdown report views

@@ -339,6 +339,34 @@ class Settings(BaseSettings):
         default=2400,
         validation_alias="LLM_REPORT_MAX_OUTPUT_TOKENS",
     )
+    llm_structured_synthesis_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_STRUCTURED_SYNTHESIS_ENABLED",
+    )
+    llm_report_structure_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_REPORT_STRUCTURE_ENABLED",
+    )
+    llm_method_card_extraction_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_METHOD_CARD_EXTRACTION_ENABLED",
+    )
+    llm_comparison_table_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_COMPARISON_TABLE_ENABLED",
+    )
+    llm_synthesis_insights_enabled: bool = Field(
+        default=False,
+        validation_alias="LLM_SYNTHESIS_INSIGHTS_ENABLED",
+    )
+    llm_structured_synthesis_confidence_threshold: float = Field(
+        default=0.55,
+        validation_alias="LLM_STRUCTURED_SYNTHESIS_CONFIDENCE_THRESHOLD",
+    )
+    llm_structured_synthesis_max_input_chars: int = Field(
+        default=12000,
+        validation_alias="LLM_STRUCTURED_SYNTHESIS_MAX_INPUT_CHARS",
+    )
     report_include_ledger_debug_appendix: bool = Field(
         default=False,
         validation_alias="REPORT_INCLUDE_LEDGER_DEBUG_APPENDIX",
